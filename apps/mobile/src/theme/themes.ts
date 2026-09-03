@@ -1,0 +1,46 @@
+export const darkTheme = {
+  name: 'dark' as const,
+  bg: '#0B0E11',
+  bgElevated: '#12161C',
+  card: '#1E2329',
+  cardSoft: '#171A21',
+  text: '#FFFFFF',
+  textSecondary: '#848E9C',
+  textMuted: '#5E6673',
+  primary: '#2E65FF',
+  primarySoft: 'rgba(46,101,255,0.15)',
+  success: '#00C087',
+  danger: '#F6465D',
+  warning: '#F0B90B',
+  border: '#2B3139',
+  tabBar: '#0B0E11',
+  input: '#1E2329',
+  bannerFrom: '#1A3A8F',
+  bannerTo: '#2E65FF',
+  chip: '#2B3139',
+};
+
+export const lightTheme = {
+  name: 'light' as const,
+  bg: '#F3F7FC',
+  bgElevated: '#FFFFFF',
+  card: '#FFFFFF',
+  cardSoft: '#EAF2FB',
+  text: '#0F172A',
+  textSecondary: '#64748B',
+  textMuted: '#94A3B8',
+  primary: '#2E65FF',
+  primarySoft: 'rgba(46,101,255,0.12)',
+  success: '#00A874',
+  danger: '#E11D48',
+  warning: '#D97706',
+  border: '#D8E2EF',
+  tabBar: '#FFFFFF',
+  input: '#FFFFFF',
+  bannerFrom: '#6BA3FF',
+  bannerTo: '#2E65FF',
+  chip: '#E8F0FE',
+};
+
+export type AppTheme = typeof darkTheme | typeof lightTheme;
+export type ThemeName = 'dark' | 'light';

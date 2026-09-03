@@ -1,0 +1,35 @@
+# 依赖与构建产物
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.expo/
+*.tsbuildinfo
+
+# 密钥与本机环境（勿提交）
+.env
+.env.dev
+.env.production
+.env.*.local
+apps/api/.env
+apps/api/.env.dev
+
+# Windows 发版组装包（build.ps1 生成）
+/dist-release/
+
+# 数据库备份（含用户、交易所 Key、助记词密文）
+/backups/
+*.sql
+/floworder*.sql
+
+# 根目录临时抓取/调试文本（不要进仓库）
+/_*.txt
+
+# 日志与系统文件
+*.log
+apps/mobile/expo.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

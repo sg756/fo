@@ -1,0 +1,4 @@
+# Windows PowerShell 5 需 UTF-8 BOM；请用编辑器 charset=utf-8-bom 保存（见 scripts/.editorconfig）
+*.ps1 text eol=crlf
+*.txt text eol=crlf
+*.conf text eol=crlf

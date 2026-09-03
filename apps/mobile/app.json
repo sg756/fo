@@ -1,0 +1,56 @@
+{
+  "expo": {
+    "name": "Shake",
+    "slug": "floworder",
+    "version": "1.0.1",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/d2b03ccc-fac5-4113-aceb-584ce480013b",
+      "enabled": true,
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.floworder.app",
+      "versionCode": 3,
+      "usesCleartextTraffic": true,
+      "label": "Shake",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "@react-native-community/datetimepicker",
+      "expo-updates"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "d2b03ccc-fac5-4113-aceb-584ce480013b"
+      }
+    },
+    "owner": "78006214"
+  }
+}
