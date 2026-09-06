@@ -1,0 +1,863 @@
+// FlowOrder 跟单系统 - Prisma Schema (MySQL)
+// 覆盖: 用户/审核, 三级分销, 佣金, 点卡/充值, 提现审核+放行, 钱包归集+配置,
+//       POST日志, 交易所Key, IP代理池+调度
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ========================= 枚举 =========================
+
+enum UserStatus {
+  PENDING // 待审核
+  ACTIVE // 正常
+  REJECTED // 审核拒绝
+  DISABLED // 禁用
+}
+
+// JWT / 权限守卫用的角色已迁到代码枚举 common/auth-role.ts
+
+enum AdminStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum Exchange {
+  BINANCE
+  OKX
+  BITGET
+  BYBIT
+  GATE
+}
+
+// 跟单委托生命周期
+enum FollowOrderStatus {
+  PENDING // 准备下单
+  PLACED // 已挂单, 待成交
+  FILLED // 已成交
+  CANCELLED // 已撤单 (含过期自动撤)
+  CANCEL_FAILED // 撤单失败
+  FAILED // 下单失败
+}
+
+/// 成交形态：部分成也写仓；全成 / 撤后锁定已成量
+enum FollowFillKind {
+  NONE // 尚无成交
+  PARTIAL // 部分成交（挂单中或撤剩余后）
+  FULL // 完全成交
+}
+
+/// 跟单流水异常分类（与持仓 user_positions.abnormal 分开）
+enum FollowAbnormalKind {
+  NONE // 无异常
+  BUSINESS // 中间件业务结果（如 Unknown / 无此单）
+  SYSTEM // 抛错/超时等系统异常（硬闸：不绕过继续开新单）
+}
+
+/// 本地维护的用户持仓状态（App/管理端列表读本表，不打中间件）
+enum UserPositionStatus {
+  OPEN
+  CLOSED
+}
+
+enum PointTxType {
+  RECHARGE // 充值
+  COMMISSION // 佣金入账
+  SHARE_DEDUCT // 平仓分润扣减(从获利用户点卡扣除)
+  WITHDRAW // 提现扣减
+  WITHDRAW_REFUND // 提现驳回退回
+  TRADE_PNL // 平仓获利入账(用户点卡)
+  ADJUST // 人工调整
+}
+
+enum RechargeStatus {
+  PENDING // 待确认
+  CONFIRMED // 链上已确认
+  CREDITED // 已入账
+  FAILED
+}
+
+enum WithdrawStatus {
+  PENDING // 待审核
+  APPROVED // 审核通过(待打款)
+  REJECTED // 驳回
+  RELEASED // 兼容旧: 已放行
+  SETTLED // 已结算(管理员确认打款完成)
+  FAILED
+}
+
+enum WithdrawAuditAction {
+  APPROVE
+  REJECT
+  RELEASE
+}
+
+enum CommissionLevel {
+  DIRECT // 直推(上一级)
+  INDIRECT // 间推(上两级)
+  PLATFORM // 平台
+}
+
+enum CollectionStatus {
+  PENDING
+  SENT
+  CONFIRMED
+  FAILED
+}
+
+enum PostDirection {
+  OUTBOUND // 我方发出的请求
+  INBOUND // 回调/入站
+}
+
+// 邮箱验证码
+model EmailVerifyCode {
+  id        String   @id @default(cuid())
+  email     String
+  code      String
+  purpose   String   @default("register") // register
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([email, purpose])
+  @@index([expiresAt])
+  @@map("email_verify_codes")
+}
+
+// ========================= 普通用户（App） =========================
+
+model User {
+  id           String     @id @default(cuid())
+  /// 后台用户 ID（MySQL AUTO_INCREMENT UNIQUE），不暴露给 App；create 时可省略，由库自增填充
+  userNo       Int        @unique @default(autoincrement()) @map("user_no")
+  email        String     @unique
+  passwordHash String
+  nickname     String?
+  status       UserStatus @default(PENDING)
+
+  // 平台佣金归集账户（非真实用户，不出现在用户列表/点卡列表）
+  isPlatform Boolean @default(false)
+
+  // 分销树(级差): parent=直推上级; l1Id/l2Id 冗余缓存直推/间推(结算以 parent 链为准)
+  inviteCode String  @unique
+  parentId   String?
+  parent     User?   @relation("UserParent", fields: [parentId], references: [id])
+  children   User[]  @relation("UserParent")
+  l1Id       String? // 直推上级 id (=parentId)
+  l2Id       String? // 间推上级 id (=parent.parentId)
+
+  // 交易密码 (与登录密码分离)
+  tradePasswordHash String?
+
+  // 跟单开关: 仅审核通过且用户主动「开始交易」后才为 true
+  followEnabled   Boolean   @default(false)
+  followStartedAt DateTime?
+  followStoppedAt DateTime?
+
+  // 用户提现收款地址 (钱包 / 交易所充值地址)
+  withdrawAddress          String?
+  withdrawChain            String?   @default("ARB")
+  withdrawAddressLabel     String? // 备注: 如「币安现货」「我的 Arb 钱包」
+  withdrawAddressUpdatedAt DateTime?
+
+  // 审核信息
+  reviewedById String?
+  reviewedAt   DateTime?
+  rejectReason String?
+
+  lastLoginAt DateTime? // 最后登录时间
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  pointCard        PointCard?
+  wallets          Wallet[]
+  pointTxs         PointCardTx[]
+  rechargeOrders   RechargeOrder[]
+  withdrawRequests WithdrawRequest[]
+  exchangeKeys     ExchangeKey[]
+  followConfigs    UserFollowConfig[]
+  profitRecords    ProfitRecord[]
+  commissionEarned CommissionRecord[] @relation("CommissionEarner")
+  commissionFrom   CommissionRecord[] @relation("CommissionSource")
+  ipAssignment     IpAssignment?
+  proxyReclaims    ProxyReclaimRecord[]
+  proxyReflowLogs  ProxyReflowLog[]
+  postLogs         PostLog[]
+  signalFollows    SignalFollowLog[]
+  positions        UserPosition[]
+
+  @@index([status])
+  @@index([parentId])
+  @@index([isPlatform])
+  @@index([followEnabled, status])
+  @@map("users")
+}
+
+// ========================= 管理员（后台，与 users 分表） =========================
+
+model Admin {
+  id           String      @id @default(cuid())
+  email        String      @unique
+  passwordHash String
+  nickname     String?
+  status       AdminStatus @default(ACTIVE)
+
+  adminRoleId String?
+  adminRole   AdminRole? @relation(fields: [adminRoleId], references: [id])
+
+  /// Google Authenticator（TOTP）已启用
+  totpEnabled    Boolean   @default(false)
+  /// 加密后的 TOTP secret
+  encTotpSecret  String?   @db.Text
+  totpBoundAt     DateTime?
+
+  lastLoginAt DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([status])
+  @@index([adminRoleId])
+  @@map("admins")
+}
+
+// 后台岗位角色：系统管理员可配置，决定管理端菜单权限
+model AdminRole {
+  id          String   @id @default(cuid())
+  code        String   @unique // system / ops / finance ...
+  name        String // 显示名
+  menus       Json // string[] 菜单 key
+  isSystem    Boolean  @default(false) // 内置不可删
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  admins      Admin[]
+
+  @@map("admin_roles")
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String? // 操作者(管理员)
+  action     String // 动作标识, 如 USER_APPROVE / REBIND / COMMISSION_RULE_UPDATE
+  targetType String? // 目标类型
+  targetId   String? // 目标ID
+  detail     String?  @db.Text // JSON 明细
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+// ========================= 分销 & 佣金 =========================
+
+model CommissionRule {
+  id           String   @id @default(cuid())
+  name         String   @default("default")
+  /// 每单从正利润中抽取的比例（抽成池）；点卡只扣这一部分，余下利润归用户（交易所）
+  extractRate  Decimal  @default(1) @db.Decimal(10, 6) @map("extract_rate")
+  /// 以下三级比例相对「抽成池」；合计 ≤1，不足部分归平台
+  l1Rate       Decimal  @default(0) @db.Decimal(10, 6) // 直推分成比例（相对抽成池）
+  l2Rate       Decimal  @default(0) @db.Decimal(10, 6) // 间推分成比例（相对抽成池）
+  platformRate Decimal  @default(0) @db.Decimal(10, 6) // 平台比例（相对抽成池）
+  active        Boolean  @default(true)
+  updatedById  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("commission_rules")
+}
+
+// 平仓获利记录 (佣金计算来源)
+model ProfitRecord {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  exchange  Exchange
+  symbol    String
+  profit    Decimal  @db.Decimal(30, 10) // 平仓利润(可负)
+  closedAt  DateTime
+  settled   Boolean  @default(false) // 是否已结算佣金
+  orderId   String? // 平仓成交订单号
+  signalKey String? // 跟单信号 key (幂等溯源)
+  source    String   @default("FOLLOW") // FOLLOW 跟单成交 / MANUAL 手动录入
+  createdAt DateTime @default(now())
+
+  commissions CommissionRecord[]
+
+  @@index([userId])
+  @@index([settled])
+  @@index([signalKey])
+  @@map("profit_records")
+}
+
+model CommissionRecord {
+  id           String          @id @default(cuid())
+  earnerId     String // 获得佣金者
+  earner       User            @relation("CommissionEarner", fields: [earnerId], references: [id])
+  fromUserId   String // 产生利润的用户
+  fromUser     User            @relation("CommissionSource", fields: [fromUserId], references: [id])
+  profitId     String
+  profit       ProfitRecord    @relation(fields: [profitId], references: [id])
+  level        CommissionLevel
+  rate         Decimal         @db.Decimal(10, 6)
+  amount       Decimal         @db.Decimal(30, 10)
+  createdAt    DateTime        @default(now())
+
+  @@index([earnerId])
+  @@index([fromUserId])
+  @@index([profitId])
+  @@map("commission_records")
+}
+
+// ========================= 点卡 & 流水 =========================
+
+model PointCard {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  // 跟单点卡（充值等；不可提现）
+  balance   Decimal  @default(0) @db.Decimal(30, 10)
+  frozen    Decimal  @default(0) @db.Decimal(30, 10)
+  // 可提佣金（平仓分润入账；仅此可提现）
+  commissionBalance Decimal @default(0) @db.Decimal(30, 10)
+  commissionFrozen  Decimal @default(0) @db.Decimal(30, 10)
+  updatedAt DateTime @updatedAt
+
+  @@map("point_cards")
+}
+
+model PointCardTx {
+  id           String      @id @default(cuid())
+  userId       String
+  user         User        @relation(fields: [userId], references: [id])
+  type         PointTxType
+  amount       Decimal     @db.Decimal(30, 10) // 正入负出
+  balanceAfter Decimal     @db.Decimal(30, 10)
+  refType      String?
+  refId        String?
+  remark       String?
+  createdAt    DateTime    @default(now())
+
+  @@index([userId])
+  @@index([type])
+  @@map("point_card_txs")
+}
+
+// ========================= 钱包 & 充值 & 归集 =========================
+
+model Wallet {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  // 平台托管充值地址: 资金归平台, 仅用于识别该用户的链上转入
+  chain         String   @default("ETH")
+  address       String   @unique
+  derivIndex    Int? // HD 派生索引
+  encPrivateKey String?  @db.Text // AES-256-GCM 加密私钥 (平台保管)
+  createdAt     DateTime @default(now())
+
+  rechargeOrders    RechargeOrder[]
+  collectionRecords CollectionRecord[]
+
+  @@index([userId])
+  @@map("wallets")
+}
+
+model RechargeOrder {
+  id            String         @id @default(cuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id])
+  walletId      String
+  wallet        Wallet         @relation(fields: [walletId], references: [id])
+  chain         String         @default("ETH")
+  tokenSymbol   String         @default("USDT")
+  txHash        String         @unique
+  amount        Decimal        @db.Decimal(30, 10)
+  confirmations Int            @default(0)
+  status        RechargeStatus @default(PENDING)
+  pointTxId     String? // 入账后关联点卡流水
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@map("recharge_orders")
+}
+
+model CollectionConfig {
+  id               String   @id @default(cuid())
+  chain            String   @unique @default("ETH")
+  targetAddress    String // 当前选用的归集目标（须来自地址簿或历史配置）
+  threshold        Decimal  @default(0) @db.Decimal(30, 10) // 最小归集金额
+  gasAddress       String? // Gas 补给钱包地址（公钥）
+  encGasPrivateKey String? @db.Text // Gas 补给钱包私钥（加密，勿明文）
+  active           Boolean  @default(true)
+  updatedById      String?
+  updatedAt        DateTime @updatedAt
+
+  @@map("collection_configs")
+}
+
+// 归集目标地址簿：可增删，归集时从中选用
+model CollectionAddress {
+  id        String   @id @default(cuid())
+  chain     String   @default("ARB")
+  address   String
+  label     String?
+  createdAt DateTime @default(now())
+
+  @@unique([chain, address])
+  @@index([chain])
+  @@map("collection_addresses")
+}
+
+// 平台自持热钱包（必须自持私钥；选用后写入 CollectionConfig）
+// 主列表仅逻辑废弃；彻底删除只能在废弃列表中进行
+model CollectionGasWallet {
+  id             String    @id @default(cuid())
+  chain          String    @default("ARB")
+  address        String
+  label          String?
+  encPrivateKey  String    @db.Text
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([chain, address])
+  @@index([chain])
+  @@index([deletedAt])
+  @@map("collection_gas_wallets")
+}
+
+/// 托管热钱包（Gas 钱包）对外转出记录
+model HotWalletTransfer {
+  id           String           @id @default(cuid())
+  gasWalletId  String
+  chain        String
+  tokenSymbol  String           @default("USDT")
+  amount       Decimal          @db.Decimal(30, 18)
+  fromAddress  String
+  toAddress    String
+  txHash       String?
+  status       CollectionStatus @default(PENDING)
+  failReason   String?          @db.Text
+  actorId      String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([gasWalletId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("hot_wallet_transfers")
+}
+
+model CollectionRecord {
+  id            String           @id @default(cuid())
+  fromWalletId  String
+  fromWallet    Wallet           @relation(fields: [fromWalletId], references: [id])
+  chain         String           @default("ETH")
+  tokenSymbol   String           @default("USDT")
+  amount        Decimal          @db.Decimal(30, 10)
+  targetAddress String
+  txHash        String?
+  status        CollectionStatus @default(PENDING)
+  /// 失败真实原因（可查）
+  failReason    String?          @db.Text
+  /// 失败时预估需 Gas（ETH）
+  gasRequired   Decimal?         @db.Decimal(30, 18)
+  /// 失败时地址 ETH 余额
+  gasHave       Decimal?         @db.Decimal(30, 18)
+  /// 失败时 Gas 缺口（需 - 有，ETH）
+  gasDeficit    Decimal?         @db.Decimal(30, 18)
+  /// 本次尝试已损耗的 Gas（ETH）；未上链则为 0
+  gasLost       Decimal?         @db.Decimal(30, 18)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([status])
+  @@map("collection_records")
+}
+
+// ========================= 提现审核 & 放行 =========================
+
+model WithdrawRequest {
+  id            String         @id @default(cuid())
+  userId        String
+  user          User           @relation(fields: [userId], references: [id])
+  amount        Decimal        @db.Decimal(30, 10)
+  fee           Decimal        @default(0) @db.Decimal(30, 10)
+  chain         String         @default("ETH")
+  toAddress     String
+  status        WithdrawStatus @default(PENDING)
+  auditById     String?
+  auditedAt     DateTime?
+  auditRemark   String?
+  releaseTxHash String?
+  releasedAt    DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  auditLogs WithdrawAuditLog[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("withdraw_requests")
+}
+
+model WithdrawAuditLog {
+  id         String              @id @default(cuid())
+  withdrawId String
+  withdraw   WithdrawRequest     @relation(fields: [withdrawId], references: [id])
+  actorId    String
+  action     WithdrawAuditAction
+  remark     String?
+  createdAt  DateTime            @default(now())
+
+  @@index([withdrawId])
+  @@map("withdraw_audit_logs")
+}
+
+// ========================= 交易所 Key =========================
+
+model ExchangeKey {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  exchange      Exchange
+  label         String?
+  encApiKey     String   @db.Text
+  encApiSecret  String   @db.Text
+  encPassphrase String?  @db.Text // OKX/Bitget 需要
+  active         Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([userId, exchange, label])
+  @@index([userId])
+  @@map("exchange_keys")
+}
+
+// ========================= IP 代理池 & 调度 =========================
+
+model IpProxy {
+  id          String   @id @default(cuid())
+  name        String
+  host        String // 代理机内网/管理地址
+  port        Int
+  proxyType   String   @default("HTTP")
+  egressIp    String // 出口公网IP (交易所白名单用)
+  region      String?
+  username    String?
+  encPassword String?  @db.Text
+  weight      Int      @default(1)
+  active       Boolean  @default(true)
+  healthy     Boolean  @default(true)
+  lastCheckAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  assignments IpAssignment[]
+
+  @@index([active, healthy])
+  @@map("ip_proxies")
+}
+
+// 调度覆盖: hash 默认散列, 出问题时把某用户强制固定到另一个代理
+model IpAssignment {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  proxyId   String
+  proxy     IpProxy  @relation(fields: [proxyId], references: [id])
+  reason    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([proxyId])
+  @@map("ip_assignments")
+}
+
+/// 闲置/满仓腾挪：从代理池移除的用户（可自助回流）
+model ProxyReclaimRecord {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  prevProxyId String?
+  prevEgress  String?
+  reason      String // idle_no_fill | follow_off_stale | evacuate_no_slot | manual
+  status      String    @default("REMOVED") // REMOVED | REFLOWED
+  createdAt   DateTime  @default(now())
+  reflowedAt  DateTime?
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+  @@map("proxy_reclaim_records")
+}
+
+/// 开启跟单/回流尝试日志（含满仓失败）
+model ProxyReflowLog {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  result         String // SUCCESS | FAIL_NO_CAPACITY | FAIL_NO_PROXY
+  proxyId        String?
+  egressIp       String?
+  occupied       Int?
+  capacity       Int?
+  healthyProxies Int?
+  wasReclaim     Boolean  @default(false)
+  message        String?
+  createdAt      DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([result, createdAt])
+  @@map("proxy_reflow_logs")
+}
+
+// ========================= POST 日志 =========================
+
+model PostLog {
+  id           String        @id @default(cuid())
+  userId       String?
+  user         User?         @relation(fields: [userId], references: [id])
+  direction    PostDirection @default(OUTBOUND)
+  exchange     Exchange?
+  /// 触发功能（如下单 / 代理列表同步）
+  feature      String?
+  endpoint     String // 目标接口/方法名（不含 query）
+  /// 完整请求路径（含 query），如 mapi/GetDepth?symbol=BTC
+  path         String?
+  method       String        @default("POST")
+  proxyIp      String?
+  /// 大回包（如币安全量资产列表）需 LONGTEXT；TEXT(64KB) 会导致写日志失败、列表里「缺所」
+  requestBody  String?       @db.LongText
+  responseBody String?       @db.LongText
+  statusCode   Int?
+  latencyMs    Int?
+  success      Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+
+  @@index([userId])
+  @@index([success])
+  @@index([feature])
+  @@index([endpoint])
+  @@index([createdAt])
+  @@map("post_logs")
+}
+
+// ========================= 跟单信号幂等 =========================
+
+model SignalFollowLog {
+  id            String            @id @default(cuid())
+  /// 中间件信号 orderGID（原始值；开平可能相同）
+  orderGid      String            @default("") @map("order_gid")
+  /// 幂等键：orderGID:open|close（中间件开平可能共用 orderGID）
+  signalKey     String            @default("")
+  userId        String
+  user          User              @relation(fields: [userId], references: [id])
+  exchange      Exchange
+  status        FollowOrderStatus @default(PENDING)
+  success       Boolean           @default(false) // 兼容旧字段: 下单是否成功发出
+  orderId       String? // 交易所/中间件返回的订单号
+  clientOrderId String?
+  symbol        String?
+  side          String?
+  orderType     String?
+  accountType   String?
+  // 中间件主账户（MultiAccountList.value），信号来源 / 下单所用 GID
+  accountGid    String?
+  accountName   String?
+  // ---- 持仓/成交信息 (用于开平仓配对 + 已实现盈亏计算) ----
+  coinName       String? // 币名 BTC
+  equalCoinName  String? // 计价币/合约周期 USDT / PC
+  positionSide   String? // long / short
+  isOpen         Boolean? // true=开仓 false=平仓
+  /// 委托数量（下单 amount；比较完成用，不是成交）
+  orderAmt       Decimal   @default(0) @map("order_amt") @db.Decimal(30, 10)
+  /// 已入账成交水位（只增不减；增量 = QueryOrder.filledAmt − 本字段）
+  recordedFilledAmt Decimal @default(0) @map("recorded_filled_amt") @db.Decimal(30, 10)
+  filledAmt      Decimal?  @db.Decimal(30, 10) // 成交数量 (QueryOrder.FilledAmt 累计)
+  avgPrice       Decimal?  @db.Decimal(30, 10) // 成交均价 (QueryOrder.PriceAvg 累计)
+  tradeFee       Decimal?  @db.Decimal(30, 10) // 手续费 (QueryOrder.TradeFee, 负数为支付)
+  /// 部分成 / 全成（持仓汇总看 filledAmt；本字段供列表筛选）
+  fillKind       FollowFillKind     @default(NONE) @map("fill_kind")
+  consumedAmt    Decimal   @default(0) @db.Decimal(30, 10) // 开仓单已被平仓配对消耗数量
+  /// 平仓单：已入账利润的成交数量（部分平时按增量 FIFO 配对，不等全平）
+  profitRecordedAmt Decimal @default(0) @map("profit_recorded_amt") @db.Decimal(30, 10)
+  profitConsumed Boolean   @default(false) // 开仓单是否已被完全配对结算
+  // 挂单过期时间; 到期未成交则自动撤单
+  expiresAt     DateTime?
+  cancelledAt   DateTime?
+  /// 部成撤余：首次尝试时间 / 上次尝试 / 次数（30s 一次，10 分钟放弃）
+  remainderCancelStartedAt DateTime? @map("remainder_cancel_started_at")
+  lastCancelAttemptAt      DateTime? @map("last_cancel_attempt_at")
+  cancelAttemptCount       Int       @default(0) @map("cancel_attempt_count")
+  // EXPIRED / MANUAL / SIGNAL / REMAINDER 等
+  cancelReason  String?
+  cancelMsg     String?           @db.Text
+  /// 业务异常 / 系统异常（系统异常不可绕过继续开同向新单）
+  abnormalKind  FollowAbnormalKind @default(NONE) @map("abnormal_kind")
+  abnormalAt    DateTime?          @map("abnormal_at")
+  abnormalMsg   String?            @map("abnormal_msg") @db.Text
+  requestBody   String?           @db.Text
+  responseBody  String?           @db.Text
+  errorMsg      String?           @db.Text
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@unique([signalKey, userId])
+  @@index([orderGid])
+  @@index([signalKey])
+  @@index([createdAt])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([status, expiresAt])
+  @@index([accountGid])
+  @@index([userId, isOpen, status, profitConsumed])
+  /// 同币同向未完结开仓挂单扫描（先撤再开）
+  @@index([userId, exchange, coinName, equalCoinName, positionSide, isOpen, status], map: "sfl_same_dir_status")
+  @@index([abnormalKind, updatedAt])
+  fillSlices FollowFillSlice[]
+  @@map("signal_follow_logs")
+}
+
+/// 同一委托单的增量成交切片（查单累计 − 已入账水位）
+model FollowFillSlice {
+  id                String          @id @default(cuid())
+  followLogId       String          @map("follow_log_id")
+  followLog         SignalFollowLog @relation(fields: [followLogId], references: [id], onDelete: Cascade)
+  seq               Int
+  qty               Decimal         @db.Decimal(30, 10)
+  price             Decimal         @db.Decimal(30, 10)
+  fee               Decimal         @default(0) @db.Decimal(30, 10)
+  cumulativeFilled  Decimal         @map("cumulative_filled") @db.Decimal(30, 10)
+  cumulativeAvg     Decimal         @map("cumulative_avg") @db.Decimal(30, 10)
+  createdAt         DateTime        @default(now()) @map("created_at")
+
+  @@unique([followLogId, seq])
+  @@index([followLogId])
+  @@map("follow_fill_slices")
+}
+
+/// 用户本地持仓（由开/平成交回写维护；列表只读本表）
+model UserPosition {
+  id            String             @id @default(cuid())
+  userId        String             @map("user_id")
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exchange      Exchange
+  coinName      String             @map("coin_name")
+  equalCoinName String             @default("") @map("equal_coin_name")
+  positionSide  String             @map("position_side") // long / short
+  accountType   String?            @map("account_type")
+  accountGid    String?            @map("account_gid")
+  accountName   String?            @map("account_name")
+  qty           Decimal            @default(0) @db.Decimal(30, 10)
+  entryPrice    Decimal            @default(0) @db.Decimal(30, 10) @map("entry_price")
+  leverage      Decimal?           @db.Decimal(10, 4)
+  /// QueryPosition 预估强平价；0 / 空则列表用标记价*(风险率/1.1)
+  liqPrice      Decimal?           @map("liq_price") @db.Decimal(30, 10)
+  /// QueryPosition 风险率
+  risk          Decimal?           @db.Decimal(20, 10)
+  status        UserPositionStatus @default(OPEN)
+  /// 平仓连续失败次数（成功不归零，另记 lastCloseOk*）
+  closeFailCount Int               @default(0) @map("close_fail_count")
+  lastCloseFailAt DateTime?        @map("last_close_fail_at")
+  lastCloseFailAmt Decimal?        @map("last_close_fail_amt") @db.Decimal(30, 10)
+  lastCloseFailMsg String?         @map("last_close_fail_msg") @db.Text
+  /// 最近一次平仓成功（不覆盖失败痕迹，用来对照「先失败后成功」）
+  lastCloseOkAt DateTime?          @map("last_close_ok_at")
+  lastCloseOkAmt Decimal?          @map("last_close_ok_amt") @db.Decimal(30, 10)
+  /// 失败达阈值后标记为异常持仓（仅异常可「清除本地」）
+  abnormal      Boolean            @default(false)
+  abnormalAt    DateTime?          @map("abnormal_at")
+  /// 异常仓自动重试截止时间；之后只保留列表供人工清除
+  closeRetryStopAt DateTime?       @map("close_retry_stop_at")
+  /// CLOSED 时：NORMAL=真实成交平仓；DISCARD_LOCAL=异常仓删除为死仓（不计利润、不重试）
+  closeKind     String?            @map("close_kind")
+  openedAt      DateTime?          @map("opened_at")
+  closedAt      DateTime?          @map("closed_at")
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  @@unique([userId, exchange, coinName, equalCoinName, positionSide], name: "user_pos_uniq")
+  @@index([userId, status])
+  @@index([status])
+  @@index([status, abnormal])
+  @@index([status, closeKind])
+  @@index([exchange])
+  @@index([coinName])
+  @@index([accountGid])
+  @@index([openedAt])
+  @@map("user_positions")
+}
+
+// ========================= 跟单模板 =========================
+
+/// 跟单下单模板：关联中间件交易账户；maxPrincipal 为开仓比例基准本金
+model FollowTemplate {
+  id           String   @id @default(cuid())
+  name         String // 模板名
+  exchange     Exchange
+  /// 中间件 MultiAccountList 账户 GUID（value）
+  accountGid   String   @default("") @map("account_gid")
+  /// 中间件账户名称（name，展示用）
+  accountName  String?  @map("account_name")
+  /// 单笔最小金额（名义金额下限，低于则跳过开仓）
+  unitAmount   Decimal  @db.Decimal(30, 10) @map("unit_amount")
+  /// 比例基准本金：用户声明投入 / 本值 = 开仓数量比例
+  maxPrincipal Decimal  @db.Decimal(30, 10) @map("max_principal")
+  /// 最少投入总本金：用户声明投入不得低于此值（0=不限制）
+  minInvestAmount Decimal @default(0) @db.Decimal(30, 10) @map("min_invest_amount")
+  active       Boolean  @default(true)
+  remark       String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  userConfigs UserFollowConfig[]
+
+  @@index([exchange])
+  @@index([active])
+  @@index([accountGid])
+  @@map("follow_templates")
+}
+
+/// 用户按交易所的跟单配置：每所最多 1 个模板；投入本金仅本地声明，用于开仓比例，不校验交易所余额
+model UserFollowConfig {
+  id           String         @id @default(cuid())
+  userId       String         @map("user_id")
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exchange     Exchange
+  templateId   String         @map("template_id")
+  template     FollowTemplate @relation(fields: [templateId], references: [id])
+  /// 用户声明的投入总本金（仅算开仓比例，不校验余额）
+  investAmount Decimal        @db.Decimal(30, 10) @map("invest_amount")
+  /// 限价跟单过期撤单且未成交时，是否按原方向市价追一笔
+  chaseOnExpire Boolean       @default(false) @map("chase_on_expire")
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@unique([userId, exchange])
+  @@index([templateId])
+  @@index([exchange])
+  @@map("user_follow_configs")
+}
+
+// ========================= 系统配置 (KV) =========================
+
+model SystemConfig {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String   @db.Text
+  remark    String?
+  updatedAt DateTime @updatedAt
+
+  @@map("system_configs")
+}
