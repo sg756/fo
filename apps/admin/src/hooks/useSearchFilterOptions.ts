@@ -65,7 +65,11 @@ export function useCoinOptions() {
   return options;
 }
 
-export function useUserOptions(text: string, selectedId: string) {
+export function useUserOptions(
+  text: string,
+  selectedId: string,
+  opts?: { includePlatform?: boolean },
+) {
   const [options, setOptions] = useState<SearchSelectOption[]>([]);
   const [loading, setLoading] = useState(false);
   useEffect(() => {
@@ -76,7 +80,7 @@ export function useUserOptions(text: string, selectedId: string) {
     }
     const t = window.setTimeout(() => {
       setLoading(true);
-      AdminApi.users({ q: kw, take: 20 })
+      AdminApi.users({ q: kw, take: 20, includePlatform: opts?.includePlatform })
         .then((r) => {
           setOptions(
             (r.items || []).map((u: any) => ({
@@ -96,7 +100,7 @@ export function useUserOptions(text: string, selectedId: string) {
         .finally(() => setLoading(false));
     }, 280);
     return () => window.clearTimeout(t);
-  }, [text, selectedId]);
+  }, [text, selectedId, opts?.includePlatform]);
   return { options, loading };
 }
 

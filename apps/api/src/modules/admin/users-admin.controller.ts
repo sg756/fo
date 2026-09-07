@@ -83,8 +83,12 @@ export class UsersAdminController {
     @Query('to') to?: string,
     @Query('skip') skip = '0',
     @Query('take') take = '50',
+    @Query('includePlatform') includePlatform?: string,
   ) {
-    const where: any = { isPlatform: false };
+    const where: any = {};
+    if (!/^(1|true|yes)$/i.test(String(includePlatform || ''))) {
+      where.isPlatform = false;
+    }
     if (status) where.status = status;
 
     if (from || to) {

@@ -264,6 +264,7 @@ export const AdminApi = {
     to?: string;
     skip?: number;
     take?: number;
+    includePlatform?: boolean;
   }) => {
     const p = new URLSearchParams();
     if (params?.q) p.set('q', params.q);
@@ -274,6 +275,7 @@ export const AdminApi = {
     if (params?.to) p.set('to', params.to);
     if (params?.skip != null) p.set('skip', String(params.skip));
     if (params?.take != null) p.set('take', String(params.take));
+    if (params?.includePlatform) p.set('includePlatform', '1');
     const qs = p.toString();
     return api<{ items: any[]; total: number }>(`/admin/users${qs ? `?${qs}` : ''}`);
   },

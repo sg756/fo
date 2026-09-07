@@ -135,6 +135,7 @@ export class CommissionService {
     const buildUserFilter = (raw?: string): Prisma.UserWhereInput | undefined => {
       const s = raw?.trim();
       if (!s) return undefined;
+      if (/^平台(账户)?$/i.test(s) || /^platform$/i.test(s)) return { isPlatform: true };
       if (/^\d+$/.test(s)) return { userNo: Number(s) };
       return {
         OR: [

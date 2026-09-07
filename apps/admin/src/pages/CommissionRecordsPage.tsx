@@ -63,7 +63,9 @@ export function CommissionRecordsPage() {
   const [to, setTo] = useState('');
   const [applied, setApplied] = useState({
     earnerId: '',
+    earnerText: '',
     fromUserId: '',
+    fromUserText: '',
     from: '',
     to: '',
   });
@@ -72,7 +74,7 @@ export function CommissionRecordsPage() {
   const [sourceErr, setSourceErr] = useState('');
   const [summary, setSummary] = useState<{ profitSum: string; amount: string } | null>(null);
   const pager = usePager(20);
-  const earnerOpts = useUserOptions(earnerText, earnerId);
+  const earnerOpts = useUserOptions(earnerText, earnerId, { includePlatform: true });
   const fromUserOpts = useUserOptions(fromUserText, fromUserId);
 
   const load = useCallback(
@@ -84,7 +86,8 @@ export function CommissionRecordsPage() {
       try {
         const rec = await AdminApi.commissionRecords({
           earnerId: applied.earnerId || undefined,
-          fromUser: applied.fromUserId || undefined,
+          earner: !applied.earnerId && applied.earnerText ? applied.earnerText : undefined,
+          fromUser: applied.fromUserId || applied.fromUserText || undefined,
           from: applied.from || undefined,
           to: applied.to || undefined,
           skip: (p - 1) * size,
@@ -109,7 +112,9 @@ export function CommissionRecordsPage() {
   function search() {
     setApplied({
       earnerId: earnerId.trim(),
+      earnerText: earnerText.trim(),
       fromUserId: fromUserId.trim(),
+      fromUserText: fromUserText.trim(),
       from,
       to,
     });
@@ -127,7 +132,7 @@ export function CommissionRecordsPage() {
     setFromUserId('');
     setFrom('');
     setTo('');
-    setApplied({ earnerId: '', fromUserId: '', from: '', to: '' });
+    setApplied({ earnerId: '', earnerText: '', fromUserId: '', fromUserText: '', from: '', to: '' });
     pager.goFirst();
   }
 
@@ -168,7 +173,7 @@ export function CommissionRecordsPage() {
             options={earnerOpts.options}
             loading={earnerOpts.loading}
             remote
-            placeholder={USER_FILTER_PLACEHOLDER}
+            placeholder="用户ID、昵称或平台"
             width={200}
             emptyHint={USER_FILTER_EMPTY_HINT}
           />
