@@ -14,6 +14,11 @@ dist/
 apps/api/.env
 apps/api/.env.dev
 
+# 本机 App / 编译路径与 Expo 账号（从同目录 *.example 复制）
+apps/mobile/app.json
+scripts/mobile/mobile.conf
+scripts/deploy-windows/build.conf
+
 # Windows 发版组装包（build.ps1 生成）
 /dist-release/
 

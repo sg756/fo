@@ -78,6 +78,8 @@
    再执行一次.\build.ps1 选3确定就行 ，如果有交互然后一路yes确认.
 
    改应用名 / 包名 / 图标（都在 apps\mobile）
+   没有 app.json 时，把 app.json.example 复制为 app.json（打包脚本也会自动复制）。
+   app.json 只留在本机，不要提交（含 Expo 账号、应用名、包名）。
    打开 apps\mobile\app.json，改完必须重新打 APK（热更新改不了名字、包名、图标）。
 
    应用程序名（手机桌面上看到的名字）：
@@ -178,7 +180,7 @@
 | 本地开发 API | `apps/api/.env.dev`（Nest 非 production 读取；从 `.env.example` 复制） |
 | 服务器 API | `apps/api/.env`（configure 生成/改写；发布包勿带本机密文） |
 | Windows 本机 | `deploy-windows/build.conf` |
-| App | `mobile/mobile.conf` |
+| App | `mobile/mobile.conf`（本机，从 `mobile.conf.example` 复制） |
 | 本机开发 | `scripts/dev/dev.conf` |
 
 ## 执行前必改配置

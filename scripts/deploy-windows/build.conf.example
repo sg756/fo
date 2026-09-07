@@ -2,6 +2,7 @@
 # users-manager · Windows 构建配置（只改本文件）
 # 被谁读取：同目录 build.ps1
 # 详细流程：同目录 README.txt
+# 本机：复制本文件为 build.conf 再改（build.conf 不进 Git）
 #
 # 路径对照（不要和 Linux 的 APP_ROOT 搞混）：
 #   SOURCE_ROOT  = 本机「源码根」（编译输入：apps\admin、apps\api）
@@ -14,20 +15,14 @@
 # 作用：本机源码根目录（下面应有 apps\admin、apps\api）。这是编译「输入」。
 # 空：自动用本仓库根目录（scripts 的上两级）。
 # 注意：除非 SKIP_CONFIRM=true，否则编译前仍会弹窗让你确认/改路径。
-# 示例：SOURCE_ROOT=D:\project\FlowOrder
 # -----------------------------------------------------------------------------
-SOURCE_ROOT=D:\project\FlowOrder
+SOURCE_ROOT=
 
 # -----------------------------------------------------------------------------
 # RELEASE_DIR
 # 作用：编译完成后组装的「上传包」目录（这是编译「输出」）。
 # 目录内相对路径与 Linux APP_ROOT 一致，上传时原样覆盖，无需改名。
 # 空：默认 SOURCE_ROOT\dist-release
-# 内容：
-#   dist-release\apps\admin\dist\
-#   dist-release\apps\api\dist\
-#   dist-release\apps\api\package.json / package-lock.json / prisma\
-# 上传：把 RELEASE_DIR「里面的内容」盖到服务器 APP_ROOT（勿传 node_modules）
 # -----------------------------------------------------------------------------
 RELEASE_DIR=
 
@@ -37,10 +32,8 @@ RELEASE_DIR=
 # 何时用：本机没有 Node 20+（或版本不够）时，脚本下载官方 zip 解压到此目录。
 # 本机已有合格 Node：不会下载，也不会改这个目录。
 # 可用环境变量，如 %LOCALAPPDATA%、%USERPROFILE%。
-# 一般无需管理员；不要填系统 Program Files，除非你有意为之。
-# 示例：NODE_HOME=D:\tools\node
 # -----------------------------------------------------------------------------
-NODE_HOME=D:\tools\node
+NODE_HOME=%LOCALAPPDATA%\users-manager-build\node
 
 # -----------------------------------------------------------------------------
 # PRISMA_MODE

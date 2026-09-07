@@ -8,7 +8,8 @@ App（Expo）打包脚本总说明
   - 需要：能跑 Node（可自动下便携版）+ Expo 账号登录 + 能上网
 
 目录：
-  mobile.conf     ← B/C 共用配置（只改这个）
+  mobile.conf.example ← 模板（进 Git）
+  mobile.conf         ← 本机复制后改（不进 Git；没有时脚本会自动复制）
   common.ps1      ← 公共逻辑（勿直接跑）
   B/              ← 方案 B：分步脚本（login / build-android / update / export-web）
   C/              ← 方案 C：一个菜单入口（小白推荐）
@@ -27,7 +28,7 @@ App（Expo）打包脚本总说明
 
 
 首次注意
-  1. apps/mobile 已配置 EAS（app.json 里 owner / projectId，eas.json 有 profile）
+  1. 复制 apps/mobile/app.json.example → app.json，再 eas-cli init（会写入 owner / projectId）
   2. 有 Expo 账号且对该项目有权限
   3. 先登录，再构建
   4. 构建完成后在 Expo 网页下载 APK/AAB

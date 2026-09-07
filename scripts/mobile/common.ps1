@@ -8,6 +8,11 @@ if (-not $MobileRoot) {
 }
 
 $ConfFile = Join-Path $MobileRoot "mobile.conf"
+$ConfExample = Join-Path $MobileRoot "mobile.conf.example"
+if (-not (Test-Path -LiteralPath $ConfFile) -and (Test-Path -LiteralPath $ConfExample)) {
+  Copy-Item -LiteralPath $ConfExample -Destination $ConfFile
+  Write-Host "==> 已从 mobile.conf.example 复制 mobile.conf，请按需修改"
+}
 
 function Read-MobileConf {
   param([string]$Path)
@@ -178,6 +183,12 @@ function Resolve-AppRoot {
   $mobilePath = Join-Path $resolved $mobileRel
   if (-not (Test-Path (Join-Path $mobilePath "package.json"))) {
     Write-Error "找不到 mobile 工程: $mobilePath"
+  }
+  $appJson = Join-Path $mobilePath "app.json"
+  $appExample = Join-Path $mobilePath "app.json.example"
+  if (-not (Test-Path -LiteralPath $appJson) -and (Test-Path -LiteralPath $appExample)) {
+    Copy-Item -LiteralPath $appExample -Destination $appJson
+    Write-Host "==> 已从 app.json.example 复制 app.json，请改应用名/包名并运行 npx eas-cli init"
   }
   if (-not (Test-Path (Join-Path $mobilePath "eas.json"))) {
     Write-Error "找不到 eas.json: $mobilePath （需已配置 EAS 项目）"

@@ -12,6 +12,11 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfFile = Join-Path $ScriptDir "build.conf"
+$ConfExample = Join-Path $ScriptDir "build.conf.example"
+if (-not (Test-Path -LiteralPath $ConfFile) -and (Test-Path -LiteralPath $ConfExample)) {
+  Copy-Item -LiteralPath $ConfExample -Destination $ConfFile
+  Write-Host "==> 已从 build.conf.example 复制 build.conf，请按需修改"
+}
 
 function Read-BuildConf {
   param([string]$Path)

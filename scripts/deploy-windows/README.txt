@@ -12,7 +12,7 @@ Linux 上应用产物 = ../install-env/apply-dist.sh（与 install / floworder.c
   【服务器】编辑 ../install-env/floworder.conf
     APP_ROOT、PORT、DB_PASS 等
 
-  【本机 Windows】编辑 build.conf
+  【本机 Windows】没有 build.conf 时从 build.conf.example 复制（脚本会自动复制；build.conf 不进 Git）
     SOURCE_ROOT  本机源码根（编译输入；空=仓库根）
     RELEASE_DIR  上传包输出（编译输出；空=SOURCE_ROOT\dist-release）
     NODE_HOME    便携 Node 目录
