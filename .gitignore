@@ -19,6 +19,9 @@ apps/mobile/app.json
 scripts/mobile/mobile.conf
 scripts/deploy-windows/build.conf
 
+# 含本机号码等约定，不进 GitHub
+.cursor/rules/no-personal-git.mdc
+
 # Windows 发版组装包（build.ps1 生成）
 /dist-release/
 

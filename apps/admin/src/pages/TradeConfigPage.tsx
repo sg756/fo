@@ -10,6 +10,7 @@ export function TradeConfigPage() {
   const [openMinPoint, setOpenMinPoint] = useState('0');
   const [qpIntervalMin, setQpIntervalMin] = useState('5');
   const [chaseOnExpire, setChaseOnExpire] = useState(false);
+  const [marketOpenClose, setMarketOpenClose] = useState(false);
   const [followHalted, setFollowHalted] = useState(false);
   const [err, setErr] = useState('');
 
@@ -24,6 +25,7 @@ export function TradeConfigPage() {
       setOpenMinPoint(String(c.openMinPointBalance ?? 0));
       setQpIntervalMin(String(c.queryPositionIntervalMin ?? 5));
       setChaseOnExpire(!!c.chaseOnExpire);
+      setMarketOpenClose(!!c.marketOpenClose);
       setFollowHalted(!!c.followHalted);
     } catch (e: any) {
       setErr(e.message);
@@ -43,7 +45,16 @@ export function TradeConfigPage() {
       await AdminApi.setOpenMinPoint(Number(openMinPoint));
       const qpMin = Math.max(2, Math.floor(Number(qpIntervalMin) || 5));
       await AdminApi.setQueryPositionInterval(qpMin);
-      await AdminApi.setChaseOnExpire(chaseOnExpire);
+      if (marketOpenClose) {
+        await AdminApi.setChaseOnExpire(false);
+        await AdminApi.setMarketOpenClose(true);
+      } else if (chaseOnExpire) {
+        await AdminApi.setMarketOpenClose(false);
+        await AdminApi.setChaseOnExpire(true);
+      } else {
+        await AdminApi.setChaseOnExpire(false);
+        await AdminApi.setMarketOpenClose(false);
+      }
       await AdminApi.setFollowHalted(followHalted);
       toast('配置已保存', 'ok');
       load();
@@ -127,7 +138,11 @@ export function TradeConfigPage() {
             <input
               type="checkbox"
               checked={chaseOnExpire}
-              onChange={(e) => setChaseOnExpire(e.target.checked)}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setChaseOnExpire(on);
+                if (on) setMarketOpenClose(false);
+              }}
               style={{ marginTop: 2, width: 16, height: 16, flexShrink: 0 }}
             />
             <span style={{ flex: 1, minWidth: 0 }}>
@@ -135,8 +150,48 @@ export function TradeConfigPage() {
                 价未到则现价追入
               </span>
               <span className="hint" style={{ display: 'block', marginTop: 4 }}>
-                仅系统因「挂单过期」自动撤单且未成交时，若开启则按原方向立刻市价追一笔。
-                用户手动撤、运营后台撤均不追。全站开关，默认关闭。
+                限价跟单：仅系统因「挂单过期」自动撤单且未成交时，按原方向立刻市价追一笔。
+                用户手动撤、运营后台撤均不追。与「市价开和平」互斥，可两个都不选。默认关闭。
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div
+          style={{
+            marginTop: 14,
+            padding: '12px 14px',
+            border: '1px solid var(--border)',
+            borderRadius: 8,
+            background: 'var(--hover)',
+          }}
+        >
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 10,
+              cursor: 'pointer',
+              margin: 0,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={marketOpenClose}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setMarketOpenClose(on);
+                if (on) setChaseOnExpire(false);
+              }}
+              style={{ marginTop: 2, width: 16, height: 16, flexShrink: 0 }}
+            />
+            <span style={{ flex: 1, minWidth: 0 }}>
+              <span style={{ display: 'block', fontWeight: 650, fontSize: 14, color: 'var(--text)' }}>
+                市价开和平
+              </span>
+              <span className="hint" style={{ display: 'block', marginTop: 4 }}>
+                信号一到立刻市价开仓；平仓信号立刻市价平。不再挂限价、也不走过期追入。
+                与「价未到则现价追入」互斥，可两个都不选（限价跟）。默认关闭。
               </span>
             </span>
           </label>
@@ -152,7 +207,8 @@ export function TradeConfigPage() {
             当前生效：轮询 {cfg.pollMs}ms · 信号超时{' '}
             {cfg.signalTimeoutMs ?? Math.round((cfg.signalTimeoutSec ?? 60) * 1000)}ms · 挂单过期{' '}
             {cfg.orderExpireSec}s · 开仓最低点卡 {cfg.openMinPointBalance ?? 0} · 关闭跟单{' '}
-            {cfg.followHalted ? '是' : '否'} · 现价追入 {cfg.chaseOnExpire ? '开' : '关'} · Worker{' '}
+            {cfg.followHalted ? '是' : '否'} · 现价追入 {cfg.chaseOnExpire ? '开' : '关'} · 市价开和平{' '}
+            {cfg.marketOpenClose ? '开' : '关'} · Worker{' '}
             {String(cfg.enabled)}
             {cfg.queryPositionIntervalMin != null
               ? ` · 持仓对齐 ${cfg.queryPositionIntervalMin}分钟`

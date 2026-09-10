@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { AdminApi } from '../api';
 import { ListLoading } from '../components/ListLoading';
 import { Pagination } from '../components/Pagination';
 import { SearchSelect } from '../components/SearchSelect';
-import { usePager } from '../hooks/usePager';
+import { normalizePaged, usePager } from '../hooks/usePager';
 import {
   useUserOptions,
   USER_FILTER_PLACEHOLDER,
@@ -50,33 +50,42 @@ export function FollowersPage() {
   const [loading, setLoading] = useState(false);
   const pager = usePager(20);
   const userOpts = useUserOptions(userText, userId);
+  const pagerRef = useRef({ page: 1, size: 20 });
+  pagerRef.current = { page: pager.page, size: pager.pageSize };
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setErr('');
-    try {
-      const res = await AdminApi.followers({
-        exchange: applied.exchange || undefined,
-        readyOnly: applied.readyOnly,
-        q: !applied.userId && applied.q ? applied.q : undefined,
-        userId: applied.userId || undefined,
-      });
-      const items = Array.isArray(res.items) ? res.items : [];
-      setRows(items);
-      setOpenMin(res.openMinPointBalance ?? 0);
-      pager.setTotal(items.length);
-      pager.goFirst();
-    } catch (e: any) {
-      setErr(e.message);
-      setRows([]);
-      pager.setTotal(0);
-    } finally {
-      setLoading(false);
-    }
-  }, [applied]);
+  const load = useCallback(
+    async (opts?: { page?: number; pageSize?: number }) => {
+      const p = opts?.page ?? pagerRef.current.page;
+      const size = opts?.pageSize ?? pagerRef.current.size;
+      setLoading(true);
+      setErr('');
+      try {
+        const res = await AdminApi.followers({
+          exchange: applied.exchange || undefined,
+          readyOnly: applied.readyOnly,
+          q: !applied.userId && applied.q ? applied.q : undefined,
+          userId: applied.userId || undefined,
+          skip: (p - 1) * size,
+          take: size,
+        });
+        const { items, total } = normalizePaged(res);
+        setRows(items);
+        setOpenMin(res.openMinPointBalance ?? 0);
+        pager.setTotal(total);
+      } catch (e: any) {
+        setErr(e.message);
+        setRows([]);
+        pager.setTotal(0);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [applied],
+  );
 
   useEffect(() => {
-    load();
+    pager.goFirst();
+    void load({ page: 1 });
   }, [load]);
 
   useEffect(() => {
@@ -95,6 +104,7 @@ export function FollowersPage() {
 
   function search() {
     writeReadyOnlyParam(readyOnly);
+    pager.goFirst();
     setApplied({
       exchange,
       readyOnly,
@@ -109,10 +119,9 @@ export function FollowersPage() {
     setReadyOnly(true);
     setUserText('');
     setUserId('');
+    pager.goFirst();
     setApplied({ exchange: '', readyOnly: true, q: '', userId: '' });
   }
-
-  const pageRows = rows.slice((pager.page - 1) * pager.pageSize, pager.page * pager.pageSize);
 
   return (
     <div className="page-list">
@@ -190,7 +199,7 @@ export function FollowersPage() {
               </tr>
             </thead>
             <tbody>
-              {pageRows.map((r) => (
+              {rows.map((r) => (
                 <tr key={`${r.userId}-${r.exchange}`}>
                   <td style={{ fontFamily: 'monospace' }}>
                     {r.userNo != null ? `#${r.userNo}` : '—'}
@@ -244,7 +253,10 @@ export function FollowersPage() {
           pageSize={pager.pageSize}
           pageSizes={[10, 20, 50, 100]}
           disabled={loading}
-          onChange={(p, s) => pager.onPageChange(p, s)}
+          onChange={(p, s) => {
+            pager.onPageChange(p, s);
+            void load({ page: p, pageSize: s });
+          }}
         />
       </div>
     </div>

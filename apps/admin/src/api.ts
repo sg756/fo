@@ -350,6 +350,8 @@ export const AdminApi = {
     api('/admin/trade/follower/order-expire', { method: 'POST', body: { seconds } }),
   setChaseOnExpire: (enabled: boolean) =>
     api('/admin/trade/follower/chase-on-expire', { method: 'POST', body: { enabled } }),
+  setMarketOpenClose: (enabled: boolean) =>
+    api('/admin/trade/follower/market-open-close', { method: 'POST', body: { enabled } }),
   setFollowHalted: (halted: boolean) =>
     api('/admin/trade/follower/follow-halted', { method: 'POST', body: { halted } }),
   setOpenMinPoint: (amount: number) =>
@@ -437,12 +439,16 @@ export const AdminApi = {
     q?: string;
     userId?: string;
     readyOnly?: boolean;
+    skip?: number;
+    take?: number;
   }) => {
     const p = new URLSearchParams();
     if (params?.exchange) p.set('exchange', params.exchange);
     if (params?.q) p.set('q', params.q);
     if (params?.userId) p.set('userId', params.userId);
     if (params?.readyOnly != null) p.set('readyOnly', params.readyOnly ? '1' : '0');
+    if (params?.skip != null) p.set('skip', String(params.skip));
+    if (params?.take != null) p.set('take', String(params.take));
     const qs = p.toString();
     return api<{
       items: any[];
@@ -467,6 +473,8 @@ export const AdminApi = {
     recordId?: string;
     from?: string;
     to?: string;
+    skip?: number;
+    take?: number;
   }) => {
     const p = new URLSearchParams();
     if (params?.userId) p.set('userId', params.userId);
@@ -483,6 +491,8 @@ export const AdminApi = {
     else if (params?.abnormal === 'all') p.set('abnormal', 'all');
     if (params?.from) p.set('from', params.from);
     if (params?.to) p.set('to', params.to);
+    if (params?.skip != null) p.set('skip', String(params.skip));
+    if (params?.take != null) p.set('take', String(params.take));
     const qs = p.toString();
     return api<{
       items: any[];
@@ -490,6 +500,7 @@ export const AdminApi = {
       scannedUsers: number;
       total: number;
       status?: string;
+      summary?: { pnlSum?: number; counted?: number; scope?: 'all' | 'page' };
     }>(`/admin/trade/positions${qs ? `?${qs}` : ''}`);
   },
   /** 点币名按需：订单号 + 最近跟单摘要 */

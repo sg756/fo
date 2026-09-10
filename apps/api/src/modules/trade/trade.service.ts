@@ -2149,7 +2149,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             qty: 0,
             closedAt: now,
             closeKind: 'DISCARD_LOCAL',
-            lastCloseFailMsg: '交易所已无该仓，本地废弃（QueryPosition）',
+            lastCloseFailMsg: '交易所已无该仓，本地废弃',
             lastCloseOkAt: null,
             lastCloseOkAmt: null,
             abnormal: false,
@@ -2338,7 +2338,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       liquidationPrice,
       margin: '—',
       pnl,
-      /** 已实现盈亏（CLOSED 时由 attachClosedExtras 补齐） */
+      /** 已实现盈亏（CLOSED 利润行在 listAdminClosedPositions 填） */
       realizedPnl: null as string | null,
       openTime,
       closeTime,
@@ -2351,7 +2351,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         r.lastCloseFailAmt != null && Number(r.lastCloseFailAmt) > 0
           ? Number(r.lastCloseFailAmt)
           : null,
-      lastCloseFailMsg: r.lastCloseFailMsg || null,
+      lastCloseFailMsg: this.stripQueryPositionLabel(r.lastCloseFailMsg),
       lastCloseOkAt: r.lastCloseOkAt ? r.lastCloseOkAt.toISOString() : null,
       lastCloseOkAmt:
         r.lastCloseOkAmt != null && Number(r.lastCloseOkAmt) > 0
@@ -2599,216 +2599,23 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * 已平仓列表：补齐平仓订单号、平仓数量、开仓均价、已实现盈亏（ProfitRecord）。
-   * 异常清除本地（closeKind=DISCARD_LOCAL）不计/不展示利润。
+   * 已平仓列表：异常清除行不计利润、不展示订单号。
+   * 利润行的数量/均价/盈亏在 listAdminClosedPositions 按每条 profit_records 填，这里不再用「该币最新一笔平仓」覆盖。
    */
-  private async attachClosedExtras(
+  private attachClosedExtras(
     items: Array<{
-      userId?: string;
-      exchange: Exchange | string;
-      coinName?: string | null;
-      equalCoinName?: string | null;
-      symbol?: string | null;
-      side?: string;
-      amount?: string;
-      entryPrice?: number | null;
+      realizedPnl?: string | null;
       orderId?: string | null;
       orderIds?: string[];
-      realizedPnl?: string | null;
-      closeTime?: string;
       closeKind?: string | null;
       discardedLocal?: boolean;
-      lastFollowSignal?: ReturnType<TradeService['parseFollowSignalFromLog']> | null;
     }>,
   ) {
-    if (!items.length) return;
-    const userIds = [
-      ...new Set(
-        items
-          .filter((i) => !i.discardedLocal && i.closeKind !== 'DISCARD_LOCAL')
-          .map((i) => i.userId)
-          .filter(Boolean),
-      ),
-    ] as string[];
-
     for (const item of items) {
       if (item.discardedLocal || item.closeKind === 'DISCARD_LOCAL') {
         item.realizedPnl = null;
         item.orderId = null;
         item.orderIds = [];
-      }
-    }
-
-    if (!userIds.length) return;
-
-    const [closeLogs, profits, openLots] = await Promise.all([
-      this.prisma.signalFollowLog.findMany({
-        where: {
-          userId: { in: userIds },
-          status: 'FILLED',
-          isOpen: false,
-          orderId: { not: null },
-        },
-        select: {
-          userId: true,
-          exchange: true,
-          coinName: true,
-          equalCoinName: true,
-          positionSide: true,
-          orderId: true,
-          filledAmt: true,
-          avgPrice: true,
-          isOpen: true,
-          requestBody: true,
-          createdAt: true,
-        },
-        orderBy: { createdAt: 'desc' },
-      }),
-      this.prisma.profitRecord.findMany({
-        where: { userId: { in: userIds } },
-        select: {
-          userId: true,
-          exchange: true,
-          symbol: true,
-          profit: true,
-          orderId: true,
-          closedAt: true,
-        },
-        orderBy: { closedAt: 'desc' },
-        take: 5000,
-      }),
-      this.prisma.signalFollowLog.findMany({
-        where: {
-          userId: { in: userIds },
-          isOpen: true,
-          OR: [
-            { status: 'FILLED' },
-            { status: 'CANCELLED', filledAmt: { gt: 0 } },
-            { status: 'PLACED', filledAmt: { gt: 0 } },
-            { status: 'CANCEL_FAILED', filledAmt: { gt: 0 } },
-          ],
-        },
-        select: {
-          userId: true,
-          exchange: true,
-          coinName: true,
-          equalCoinName: true,
-          positionSide: true,
-          filledAmt: true,
-          avgPrice: true,
-        },
-      }),
-    ]);
-
-    const closeByKey = new Map<
-      string,
-      {
-        orderIds: string[];
-        filledAmt: number;
-        createdAt: Date;
-        signal: ReturnType<TradeService['parseFollowSignalFromLog']>;
-      }
-    >();
-    for (const log of closeLogs) {
-      if (!log.orderId) continue;
-      const side = String(log.positionSide || 'long').toLowerCase().includes('short')
-        ? 'short'
-        : 'long';
-      const key = [
-        log.userId,
-        log.exchange,
-        String(log.coinName || '').toUpperCase(),
-        String(log.equalCoinName || '').toUpperCase(),
-        side,
-      ].join('|');
-      const cur = closeByKey.get(key);
-      if (!cur) {
-        closeByKey.set(key, {
-          orderIds: [log.orderId],
-          filledAmt: Number(log.filledAmt ?? 0) || 0,
-          createdAt: log.createdAt,
-          signal: this.parseFollowSignalFromLog(log),
-        });
-      } else if (!cur.orderIds.includes(log.orderId)) {
-        cur.orderIds.push(log.orderId);
-      }
-    }
-
-    const profitByKey = new Map<string, { profit: string; orderId: string | null; closedAt: Date }[]>();
-    for (const p of profits) {
-      const key = `${p.userId}|${p.exchange}|${String(p.symbol || '').toUpperCase()}`;
-      const arr = profitByKey.get(key) || [];
-      arr.push({
-        profit: String(p.profit),
-        orderId: p.orderId,
-        closedAt: p.closedAt,
-      });
-      profitByKey.set(key, arr);
-    }
-
-    const entryByKey = new Map<string, { qty: number; cost: number }>();
-    for (const o of openLots) {
-      const filled = Number(o.filledAmt ?? 0);
-      const px = Number(o.avgPrice ?? 0);
-      if (!(filled > 1e-12) || !(Number.isFinite(px) && px > 0)) continue;
-      const side = String(o.positionSide || 'long').toLowerCase().includes('short') ? 'short' : 'long';
-      const key = [
-        o.userId,
-        o.exchange,
-        String(o.coinName || '').toUpperCase(),
-        String(o.equalCoinName || '').toUpperCase(),
-        side,
-      ].join('|');
-      const cur = entryByKey.get(key) || { qty: 0, cost: 0 };
-      cur.qty += filled;
-      cur.cost += filled * px;
-      entryByKey.set(key, cur);
-    }
-
-    for (const item of items) {
-      if (!item.userId) continue;
-      if (item.discardedLocal || item.closeKind === 'DISCARD_LOCAL') continue;
-      const side = String(item.side || 'long').toLowerCase().includes('short') ? 'short' : 'long';
-      const eq = String(item.equalCoinName || '').toUpperCase();
-      const coin = String(item.coinName || '').toUpperCase();
-      const posKey = [item.userId, item.exchange, coin, eq, side].join('|');
-      const close = closeByKey.get(posKey);
-      if (close?.orderIds?.length) {
-        item.orderIds = close.orderIds;
-        item.orderId = close.orderIds[0] ?? null;
-        if (close.filledAmt > 1e-12) {
-          item.amount = String(Math.round(close.filledAmt * 1e10) / 1e10);
-        }
-        item.lastFollowSignal = close.signal;
-      }
-      if (!(Number(item.entryPrice) > 0)) {
-        const lot = entryByKey.get(posKey);
-        if (lot && lot.qty > 1e-12 && lot.cost > 0) {
-          item.entryPrice = Math.round((lot.cost / lot.qty) * 1e8) / 1e8;
-        }
-      }
-
-      const symbol = String(item.symbol || (eq ? `${coin}/${eq}` : coin)).toUpperCase();
-      const candidates = profitByKey.get(`${item.userId}|${item.exchange}|${symbol}`) || [];
-      if (!candidates.length) continue;
-      const closeMs = item.closeTime ? Date.parse(item.closeTime) : NaN;
-      let best = candidates[0];
-      if (Number.isFinite(closeMs)) {
-        let bestDiff = Infinity;
-        for (const c of candidates) {
-          const d = Math.abs(c.closedAt.getTime() - closeMs);
-          if (d < bestDiff) {
-            bestDiff = d;
-            best = c;
-          }
-        }
-      }
-      item.realizedPnl = best.profit;
-      // 列表字段 pnl 在已平仓语义下也用已实现，避免前端回退读到未实现
-      (item as any).pnl = best.profit;
-      if (!item.orderId && best.orderId) {
-        item.orderId = best.orderId;
-        item.orderIds = [best.orderId];
       }
     }
   }
@@ -4699,8 +4506,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     q?: string;
     userId?: string;
     readyOnly?: boolean;
+    skip?: number;
+    take?: number;
   }) {
     const readyOnly = opts?.readyOnly !== false;
+    const { skip, take } = this.clampAdminPage(opts?.skip, opts?.take);
     const openMin = await this.getOpenMinPointBalance();
     const where: any = {
       isPlatform: false,
@@ -4844,9 +4654,10 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
+    const total = items.length;
     return {
-      items,
-      total: items.length,
+      items: items.slice(skip, skip + take),
+      total,
       openMinPointBalance: openMin,
       readyOnly,
     };
@@ -5495,7 +5306,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
 
     let remain = delta;
     let totalPnl = 0;
+    let feeSum = 0;
     let matchedQty = 0;
+    let openCost = 0;
     let multiplier = 1;
     try {
       const spec = await this.resolveSymbolSpec(exchange, {
@@ -5545,6 +5358,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           multiplier,
         });
         totalPnl += lot.profit;
+        feeSum += lot.fee;
+        openCost += openAvg * qty;
       }
       matchedQty += qty;
       remain -= qty;
@@ -5570,6 +5385,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
 
     const profit = Math.round(totalPnl * 1e8) / 1e8;
+    const fee = Math.round(feeSum * 1e10) / 1e10;
+    const weightedOpenAvg =
+      matchedQty > FILL_EPS && openCost > 0
+        ? Math.round((openCost / matchedQty) * 1e10) / 1e10
+        : null;
     const rawKey = String(signalKey || '');
     const orderGid = rawKey.replace(/:(open|close)(:.*)?$/i, '') || rawKey;
     const profitSignalKey = `${orderGid}:close:${orderId}:${String(newRecorded).replace('.', '_')}`;
@@ -5580,6 +5400,10 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           exchange,
           symbol: symbol || '—',
           profit,
+          qty: matchedQty,
+          openAvg: weightedOpenAvg,
+          closeAvg,
+          fee,
           closedAt: new Date(),
           orderId,
           signalKey: profitSignalKey,
@@ -6281,6 +6105,21 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     return String(side || 'long').toLowerCase().includes('short') ? 'short' : 'long';
   }
 
+  private clampAdminPage(skip?: number, take?: number) {
+    const takeN = Math.min(100, Math.max(1, Number(take) || 20));
+    const skipN = Math.max(0, Number.isFinite(Number(skip)) ? Number(skip) : 0);
+    return { skip: skipN, take: takeN };
+  }
+
+  /** 死仓原因对外不展示内部接口名 */
+  private stripQueryPositionLabel(msg?: string | null): string | null {
+    const s = String(msg || '')
+      .replace(/（QueryPosition）/gi, '')
+      .replace(/\(QueryPosition\)/gi, '')
+      .trim();
+    return s || null;
+  }
+
   private buildPosMatchKey(parts: {
     userId: string;
     exchange: string;
@@ -6320,7 +6159,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName?: string;
     period?: string;
     accountGid?: string;
-    /** all=利润明细+异常清除；partial|full=仅对应利润；discard=仅异常清除 */
+    /** all=仅利润明细（不含死仓）；partial|full=仅对应利润；discard=仅死仓 */
     closedKind?: string;
     /** 兼容旧参数：true→discard；false→利润明细；all→全部 */
     abnormal?: string | boolean;
@@ -6328,6 +6167,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     recordId?: string;
     from?: string;
     to?: string;
+    skip?: number;
+    take?: number;
   }) {
     let kind = String(opts.closedKind || '').toLowerCase();
     if (!kind) {
@@ -6337,7 +6178,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       else kind = 'all';
     }
 
-    const includeDiscard = kind === 'all' || kind === 'discard';
+    const includeDiscard = kind === 'discard';
     const includeProfit = kind !== 'discard';
 
     const profitWhere: Prisma.ProfitRecordWhereInput = {};
@@ -6370,62 +6211,159 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
     if (Object.keys(userWhere).length) profitWhere.user = userWhere;
 
-    const [profits, discardRows] = await Promise.all([
-      includeProfit
-        ? this.prisma.profitRecord.findMany({
+    const { skip, take } = this.clampAdminPage(opts.skip, opts.take);
+    const period = String(opts.period || '').toLowerCase();
+    const accountGidFilter = opts.accountGid?.trim() || '';
+    const needsPostFilter =
+      !!period || !!accountGidFilter || kind === 'partial' || kind === 'full';
+
+    type ClosedProfitRow = Prisma.ProfitRecordGetPayload<{
+      include: { user: { select: { id: true; email: true; nickname: true; userNo: true } } };
+    }>;
+    type ClosedDiscardRow = Prisma.UserPositionGetPayload<{
+      include: { user: { select: { id: true; email: true; nickname: true; userNo: true } } };
+    }>;
+    const userSel = { select: { id: true, email: true, nickname: true, userNo: true } } as const;
+    const discardWhere: Prisma.UserPositionWhereInput = {
+      status: UserPositionStatus.CLOSED,
+      closeKind: 'DISCARD_LOCAL',
+      ...(recordId ? { id: recordId } : {}),
+      ...(opts.exchange ? { exchange: opts.exchange as Exchange } : {}),
+      ...(opts.accountGid?.trim() ? { accountGid: opts.accountGid.trim() } : {}),
+      ...(opts.coinName?.trim()
+        ? { coinName: { contains: opts.coinName.trim().toUpperCase() } }
+        : {}),
+      ...(fromMs != null || toMs != null
+        ? {
+            closedAt: {
+              ...(fromMs != null ? { gte: new Date(fromMs) } : {}),
+              ...(toMs != null ? { lte: new Date(toMs) } : {}),
+            },
+          }
+        : {}),
+      ...(Object.keys(userWhere).length ? { user: userWhere } : {}),
+    };
+
+    let profits: ClosedProfitRow[] = [];
+    let discardRows: ClosedDiscardRow[] = [];
+    let total = 0;
+    let pnlSum = 0;
+    let pnlCounted = 0;
+    let listOrder: string[] | null = null;
+    let pagedAtDb = false;
+
+    if (!needsPostFilter) {
+      pagedAtDb = true;
+      if (includeProfit && includeDiscard) {
+        const [profitHeads, discardHeads, agg] = await Promise.all([
+          this.prisma.profitRecord.findMany({
+            where: profitWhere,
+            select: { id: true, closedAt: true },
+            orderBy: { closedAt: 'desc' },
+          }),
+          this.prisma.userPosition.findMany({
+            where: discardWhere,
+            select: { id: true, closedAt: true },
+            orderBy: { closedAt: 'desc' },
+          }),
+          this.prisma.profitRecord.aggregate({
+            where: profitWhere,
+            _sum: { profit: true },
+            _count: true,
+          }),
+        ]);
+        const merged = [
+          ...profitHeads.map((p) => ({
+            id: p.id,
+            ts: p.closedAt?.getTime() ?? 0,
+            k: 'P' as const,
+          })),
+          ...discardHeads.map((d) => ({
+            id: d.id,
+            ts: d.closedAt?.getTime() ?? 0,
+            k: 'D' as const,
+          })),
+        ].sort((a, b) => b.ts - a.ts);
+        total = merged.length;
+        pnlSum = Number(agg._sum.profit || 0);
+        pnlCounted = Number(agg._count || 0);
+        const page = merged.slice(skip, skip + take);
+        listOrder = page.map((x) => x.id);
+        const pids = page.filter((x) => x.k === 'P').map((x) => x.id);
+        const dids = page.filter((x) => x.k === 'D').map((x) => x.id);
+        const [pRows, dRows] = await Promise.all([
+          pids.length
+            ? this.prisma.profitRecord.findMany({
+                where: { id: { in: pids } },
+                include: { user: userSel },
+              })
+            : Promise.resolve([] as ClosedProfitRow[]),
+          dids.length
+            ? this.prisma.userPosition.findMany({
+                where: { id: { in: dids } },
+                include: { user: userSel },
+              })
+            : Promise.resolve([] as ClosedDiscardRow[]),
+        ]);
+        const pMap = new Map(pRows.map((r) => [r.id, r]));
+        const dMap = new Map(dRows.map((r) => [r.id, r]));
+        profits = pids.map((id) => pMap.get(id)).filter(Boolean) as ClosedProfitRow[];
+        discardRows = dids.map((id) => dMap.get(id)).filter(Boolean) as ClosedDiscardRow[];
+      } else if (includeProfit) {
+        const [pRows, cnt, agg] = await Promise.all([
+          this.prisma.profitRecord.findMany({
             where: profitWhere,
             orderBy: { closedAt: 'desc' },
-            include: {
-              user: { select: { id: true, email: true, nickname: true, userNo: true } },
-            },
-            take: 2000,
-          })
-        : Promise.resolve(
-            [] as Array<
-              Prisma.ProfitRecordGetPayload<{
-                include: {
-                  user: { select: { id: true; email: true; nickname: true; userNo: true } };
-                };
-              }>
-            >,
-          ),
-      includeDiscard
-        ? this.prisma.userPosition.findMany({
-            where: {
-              status: UserPositionStatus.CLOSED,
-              closeKind: 'DISCARD_LOCAL',
-              ...(recordId ? { id: recordId } : {}),
-              ...(opts.exchange ? { exchange: opts.exchange as Exchange } : {}),
-              ...(opts.accountGid?.trim() ? { accountGid: opts.accountGid.trim() } : {}),
-              ...(opts.coinName?.trim()
-                ? { coinName: { contains: opts.coinName.trim().toUpperCase() } }
-                : {}),
-              ...(fromMs != null || toMs != null
-                ? {
-                    closedAt: {
-                      ...(fromMs != null ? { gte: new Date(fromMs) } : {}),
-                      ...(toMs != null ? { lte: new Date(toMs) } : {}),
-                    },
-                  }
-                : {}),
-              ...(Object.keys(userWhere).length ? { user: userWhere } : {}),
-            },
+            include: { user: userSel },
+            skip,
+            take,
+          }),
+          this.prisma.profitRecord.count({ where: profitWhere }),
+          this.prisma.profitRecord.aggregate({
+            where: profitWhere,
+            _sum: { profit: true },
+          }),
+        ]);
+        profits = pRows;
+        total = cnt;
+        pnlSum = Number(agg._sum.profit || 0);
+        pnlCounted = cnt;
+      } else {
+        const [dRows, cnt] = await Promise.all([
+          this.prisma.userPosition.findMany({
+            where: discardWhere,
             orderBy: { closedAt: 'desc' },
-            include: {
-              user: { select: { id: true, email: true, nickname: true, userNo: true } },
-            },
-            take: 500,
-          })
-        : Promise.resolve(
-            [] as Array<
-              Prisma.UserPositionGetPayload<{
-                include: {
-                  user: { select: { id: true; email: true; nickname: true; userNo: true } };
-                };
-              }>
-            >,
-          ),
-    ]);
+            include: { user: userSel },
+            skip,
+            take,
+          }),
+          this.prisma.userPosition.count({ where: discardWhere }),
+        ]);
+        discardRows = dRows;
+        total = cnt;
+      }
+    } else {
+      const [pRows, dRows] = await Promise.all([
+        includeProfit
+          ? this.prisma.profitRecord.findMany({
+              where: profitWhere,
+              orderBy: { closedAt: 'desc' },
+              include: { user: userSel },
+              take: 2000,
+            })
+          : Promise.resolve([] as ClosedProfitRow[]),
+        includeDiscard
+          ? this.prisma.userPosition.findMany({
+              where: discardWhere,
+              orderBy: { closedAt: 'desc' },
+              include: { user: userSel },
+              take: 500,
+            })
+          : Promise.resolve([] as ClosedDiscardRow[]),
+      ]);
+      profits = pRows;
+      discardRows = dRows;
+    }
 
     const orderIds = [
       ...new Set(profits.map((p) => p.orderId).filter(Boolean)),
@@ -6444,6 +6382,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       accountName: string | null;
       filledAmt: Prisma.Decimal | null;
       avgPrice: Prisma.Decimal | null;
+      tradeFee: Prisma.Decimal | null;
       isOpen: boolean | null;
       requestBody: string | null;
       createdAt: Date;
@@ -6463,10 +6402,10 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       closedAt: Date | null;
     };
 
-    const [closeLogs, positions] = await Promise.all([
+    const [closeLogs, positions, watermarkProfits] = await Promise.all([
       orderIds.length
         ? this.prisma.signalFollowLog.findMany({
-            where: { orderId: { in: orderIds }, isOpen: false },
+            where: { orderId: { in: orderIds } },
             select: {
               orderId: true,
               userId: true,
@@ -6479,6 +6418,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
               accountName: true,
               filledAmt: true,
               avgPrice: true,
+              tradeFee: true,
               isOpen: true,
               requestBody: true,
               createdAt: true,
@@ -6504,11 +6444,29 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             },
           })
         : Promise.resolve([] as AdminPosMetaPick[]),
+      orderIds.length
+        ? this.prisma.profitRecord.findMany({
+            where: { orderId: { in: orderIds } },
+            select: { id: true, orderId: true, signalKey: true, closedAt: true },
+          })
+        : Promise.resolve(
+            [] as Array<{
+              id: string;
+              orderId: string | null;
+              signalKey: string | null;
+              closedAt: Date;
+            }>,
+          ),
     ]);
 
     const closeLogByOrderId = new Map<string, AdminCloseLogPick>();
     for (const l of closeLogs) {
-      if (l.orderId) closeLogByOrderId.set(String(l.orderId), l);
+      if (!l.orderId) continue;
+      const oid = String(l.orderId);
+      const prev = closeLogByOrderId.get(oid);
+      if (!prev || (l.isOpen === false && prev.isOpen !== false)) {
+        closeLogByOrderId.set(oid, l);
+      }
     }
     const closedPosByKey = new Map<string, { closedAt: Date | null }>();
     const posMetaByKey = new Map<
@@ -6583,8 +6541,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       if (bestDiff <= 120_000) fullProfitIdByPosKey.set(posKey, best.id);
     }
 
-    const profitsByOrderId = new Map<string, typeof profits>();
-    for (const p of profits) {
+    const profitsByOrderId = new Map<string, typeof watermarkProfits>();
+    for (const p of watermarkProfits) {
       if (!p.orderId) continue;
       const oid = String(p.orderId);
       const arr = profitsByOrderId.get(oid) || [];
@@ -6603,8 +6561,6 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    const period = String(opts.period || '').toLowerCase();
-    const accountGidFilter = opts.accountGid?.trim() || '';
     const profitItems: Array<ReturnType<TradeService['mapUserPositionRow']> & {
       userId: string;
       user: (typeof profits)[0]['user'];
@@ -6637,22 +6593,63 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       if (kind === 'partial' && closeKind !== 'PARTIAL') continue;
       if (kind === 'full' && closeKind !== 'FULL') continue;
 
-      const closeQty = profitQtyById.get(p.id);
+      const storedQty = p.qty != null ? Number(p.qty) : NaN;
+      const watermarkQty = profitQtyById.get(p.id);
+      const logQty = log?.filledAmt != null ? Number(log.filledAmt) : NaN;
+      const closeQty =
+        Number.isFinite(storedQty) && storedQty > 0
+          ? storedQty
+          : watermarkQty != null && watermarkQty > 0
+            ? watermarkQty
+            : Number.isFinite(logQty) && logQty > 0
+              ? logQty
+              : null;
       const at = String(accountType || '').toLowerCase();
       const mode =
         at === 'spot' ? '现货' : eq === 'PC' || !eq ? '永续合约' : '交割合约';
       const symbol = eq ? `${coin}/${eq}` : coin;
-      const closeAvg = log?.avgPrice != null ? Number(log.avgPrice) : null;
-      const entryRaw = meta?.entryPrice != null ? Number(meta.entryPrice) : NaN;
+      const spec = this.symbols.peek(
+        toApiCode(p.exchange, at === 'spot' ? 'spot' : 'future'),
+        coin,
+        eq || (at === 'spot' ? 'USDT' : 'PC'),
+      );
+      const storedOpen = p.openAvg != null ? Number(p.openAvg) : NaN;
+      const storedClose = p.closeAvg != null ? Number(p.closeAvg) : NaN;
+      const logClose = log?.avgPrice != null ? Number(log.avgPrice) : NaN;
+      const closeAvg =
+        Number.isFinite(storedClose) && storedClose > 0
+          ? storedClose
+          : Number.isFinite(logClose) && logClose > 0
+            ? logClose
+            : null;
+      const fmtPx = (n: number) => {
+        const s = formatDisplayPrice(n, spec);
+        if (s) return s;
+        return String(Math.round(n * 1e10) / 1e10);
+      };
+      const entryRaw = Number.isFinite(storedOpen) && storedOpen > 0 ? storedOpen : NaN;
       const entryPrice =
-        Number.isFinite(entryRaw) && entryRaw > 0
-          ? Number(
-              formatDisplayPrice(entryRaw, this.symbols.peek(
-                toApiCode(p.exchange, at === 'spot' ? 'spot' : 'future'),
-                coin,
-                eq || (at === 'spot' ? 'USDT' : 'PC'),
-              )) || entryRaw,
-            )
+        Number.isFinite(entryRaw) && entryRaw > 0 ? fmtPx(entryRaw) : null;
+      const closeAvgPrice =
+        closeAvg != null && Number.isFinite(closeAvg) && closeAvg > 0 ? fmtPx(closeAvg) : null;
+      const storedFee = p.fee != null ? Number(p.fee) : NaN;
+      const logFee = log?.tradeFee != null ? Number(log.tradeFee) : NaN;
+      let feeNum: number | null = null;
+      if (Number.isFinite(storedFee)) {
+        feeNum = storedFee;
+      } else if (Number.isFinite(logFee)) {
+        feeNum =
+          closeQty != null &&
+          Number.isFinite(logQty) &&
+          logQty > 0 &&
+          closeQty > 0 &&
+          closeQty + 1e-12 < logQty
+            ? logFee * (closeQty / logQty)
+            : logFee;
+      }
+      const tradeFee =
+        feeNum != null && Number.isFinite(feeNum)
+          ? String(Math.round(feeNum * 1e10) / 1e10)
           : null;
 
       profitItems.push({
@@ -6697,9 +6694,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         lastFollowSignal: log ? this.parseFollowSignalFromLog(log) : null,
         userId: p.userId,
         user: p.user,
-        ...(closeAvg != null && Number.isFinite(closeAvg) && closeAvg > 0
-          ? { closeAvgPrice: closeAvg }
-          : {}),
+        closeAvgPrice,
+        tradeFee,
       } as any);
     }
 
@@ -6731,21 +6727,38 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    const items = [...profitItems, ...discardItems].sort((a, b) => {
+    let items = [...profitItems, ...discardItems].sort((a, b) => {
       const ta = Date.parse(String(a.closeTime || '')) || 0;
       const tb = Date.parse(String(b.closeTime || '')) || 0;
       return tb - ta;
     });
 
-    // 利润行缺开仓均价时：用开仓查单均价加权补齐（平仓查单均价在 closeAvgPrice）
-    await this.attachClosedExtras(items as any);
+    this.attachClosedExtras(items as any);
+
+    if (listOrder?.length) {
+      const byId = new Map(items.map((i) => [i.id, i]));
+      items = listOrder.map((id) => byId.get(id)).filter(Boolean) as typeof items;
+    } else if (!pagedAtDb) {
+      total = items.length;
+      pnlSum = 0;
+      pnlCounted = 0;
+      for (const it of items) {
+        if (it.closeKind === 'DISCARD_LOCAL' || (it as any).discardedLocal) continue;
+        const n = Number((it as any).realizedPnl);
+        if (!Number.isFinite(n)) continue;
+        pnlSum += n;
+        pnlCounted += 1;
+      }
+      items = items.slice(skip, skip + take);
+    }
 
     return {
       items,
       errors: [] as { userId?: string; email?: string; exchange?: string; message: string }[],
       scannedUsers: new Set(items.map((i) => i.userId)).size,
-      total: items.length,
+      total,
       status: 'CLOSED',
+      summary: { pnlSum, counted: pnlCounted, scope: 'all' as const },
     };
   }
 
@@ -6769,6 +6782,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     from?: string;
     /** 开仓/平仓时间止 YYYY-MM-DD */
     to?: string;
+    skip?: number;
+    take?: number;
   }) {
     const closed =
       String(opts.status || 'OPEN').toUpperCase() === UserPositionStatus.CLOSED;
@@ -6833,14 +6848,19 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       where.user = userWhere;
     }
 
-    const rows = await this.prisma.userPosition.findMany({
-      where,
-      orderBy: { openedAt: 'desc' },
-      include: {
-        user: { select: { id: true, email: true, nickname: true, userNo: true } },
-      },
-      take: 2000,
-    });
+    const { skip, take } = this.clampAdminPage(opts.skip, opts.take);
+    const [rows, total] = await Promise.all([
+      this.prisma.userPosition.findMany({
+        where,
+        orderBy: { openedAt: 'desc' },
+        include: {
+          user: { select: { id: true, email: true, nickname: true, userNo: true } },
+        },
+        skip,
+        take,
+      }),
+      this.prisma.userPosition.count({ where }),
+    ]);
 
     this.kickoffPositionMarkPrices(rows);
 
@@ -6849,13 +6869,22 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       userId: r.userId,
       user: r.user,
     }));
+    let pnlSum = 0;
+    let counted = 0;
+    for (const it of items) {
+      const n = Number(it.pnl);
+      if (!Number.isFinite(n)) continue;
+      pnlSum += n;
+      counted += 1;
+    }
 
     return {
       items,
       errors: [] as { userId?: string; email?: string; exchange?: string; message: string }[],
       scannedUsers: new Set(rows.map((r) => r.userId)).size,
-      total: items.length,
+      total,
       status: 'OPEN',
+      summary: { pnlSum, counted, scope: 'page' as const },
     };
   }
 

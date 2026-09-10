@@ -8,7 +8,7 @@ import { SearchSelect } from '../components/SearchSelect';
 import { confirmDialog } from '../components/ConfirmDialog';
 import { toast } from '../components/Toast';
 import { CopyMonoCell } from '../components/CopyMonoCell';
-import { usePager } from '../hooks/usePager';
+import { normalizePaged, usePager } from '../hooks/usePager';
 import {
   useCoinOptions,
   useUserOptions,
@@ -70,17 +70,26 @@ function fmtSignalTime(sig: { signalAtMs?: number | null; createdAt?: string | n
   }
 }
 
+function stripQueryPositionLabel(msg?: string | null) {
+  const s = String(msg || '')
+    .replace(/（QueryPosition）/gi, '')
+    .replace(/\(QueryPosition\)/gi, '')
+    .trim();
+  return s || '';
+}
+
 function closedKindBadge(r: {
   closeKind?: string | null;
   discardedLocal?: boolean;
   lastCloseFailMsg?: string | null;
 }): { text: string; bg: string; title?: string } {
+  const failMsg = stripQueryPositionLabel(r.lastCloseFailMsg);
   if (r.discardedLocal || r.closeKind === 'DISCARD_LOCAL') {
     return {
       text: '死仓删除',
       bg: '#b45309',
-      title: r.lastCloseFailMsg
-        ? `异常死仓，不计利润。原因：${r.lastCloseFailMsg}`
+      title: failMsg
+        ? `异常死仓，不计利润。原因：${failMsg}`
         : '异常仓删除为死仓，不计利润、不参与重试',
     };
   }
@@ -140,6 +149,14 @@ export function PositionsPage() {
   const [closedKind, setClosedKind] = useState<'all' | 'partial' | 'full' | 'discard'>('all');
   const pager = usePager(20);
   const loadInflight = useRef(false);
+  const pagerRef = useRef({ page: 1, size: 20 });
+  pagerRef.current = { page: pager.page, size: pager.pageSize };
+  const [pnlStats, setPnlStats] = useState({
+    sum: 0,
+    counted: 0,
+    total: 0,
+    scope: 'all' as 'all' | 'page',
+  });
   const coinOpts = useCoinOptions();
   const userOpts = useUserOptions(userText, userId);
   const mwAccounts = useMiddlewareAccounts();
@@ -147,8 +164,10 @@ export function PositionsPage() {
   const isAbnormalTab = tab === 'ABNORMAL';
   const canDiscardLocal = isAbnormalTab;
 
-  const load = useCallback(async (opts?: { silent?: boolean }) => {
+  const load = useCallback(async (opts?: { silent?: boolean; page?: number; pageSize?: number }) => {
     const silent = !!opts?.silent;
+    const page = opts?.page ?? pagerRef.current.page;
+    const size = opts?.pageSize ?? pagerRef.current.size;
     if (silent && loadInflight.current) return;
     loadInflight.current = true;
     if (!silent) {
@@ -177,19 +196,27 @@ export function PositionsPage() {
         from: applied.from || undefined,
         to: applied.to || undefined,
         recordId: applied.recordId || undefined,
+        skip: (page - 1) * size,
+        take: size,
       });
-      const items = Array.isArray(res.items) ? res.items : [];
+      const { items, total } = normalizePaged(res);
       setRows(items);
+      pager.setTotal(total);
+      setPnlStats({
+        sum: Number(res.summary?.pnlSum ?? 0) || 0,
+        counted: Number(res.summary?.counted ?? items.length) || 0,
+        total,
+        scope: res.summary?.scope === 'page' ? 'page' : 'all',
+      });
       if (!silent) setSelected(new Set());
       setErrors(Array.isArray(res.errors) ? res.errors : []);
-      pager.setTotal(items.length);
-      if (!silent) pager.goFirst();
     } catch (e: any) {
       if (!silent) {
         setErr(e.message);
         setRows([]);
         setErrors([]);
         pager.setTotal(0);
+        setPnlStats({ sum: 0, counted: 0, total: 0, scope: 'all' });
       }
     } finally {
       loadInflight.current = false;
@@ -198,7 +225,8 @@ export function PositionsPage() {
   }, [applied, closedKind]);
 
   useEffect(() => {
-    void load();
+    pager.goFirst();
+    void load({ page: 1 });
     // 未实现盈亏依赖最新价：仅当前/异常持仓约每 5 秒静默刷新
     if (applied.status !== 'OPEN') return;
     const id = setInterval(() => void load({ silent: true }), 5000);
@@ -211,6 +239,7 @@ export function PositionsPage() {
     setSelected(new Set());
     setRows([]);
     setErrors([]);
+    pager.goFirst();
     pager.setTotal(0);
     if (next === 'CLOSED') {
       setClosedKind('all');
@@ -299,6 +328,7 @@ export function PositionsPage() {
   }
 
   function search() {
+    pager.goFirst();
     setApplied({
       status: tab === 'CLOSED' ? 'CLOSED' : 'OPEN',
       abnormal: tab === 'ABNORMAL',
@@ -326,6 +356,7 @@ export function PositionsPage() {
     setTo('');
     setRecordId('');
     if (tab === 'CLOSED') setClosedKind('all');
+    pager.goFirst();
     setApplied({
       status: tab === 'CLOSED' ? 'CLOSED' : 'OPEN',
       abnormal: tab === 'CLOSED' ? 'all' : tab === 'ABNORMAL',
@@ -371,27 +402,7 @@ export function PositionsPage() {
     }
   }
 
-  const pageRows = useMemo(
-    () => rows.slice((pager.page - 1) * pager.pageSize, pager.page * pager.pageSize),
-    [rows, pager.page, pager.pageSize],
-  );
-
-  /** 当前筛选结果的盈亏合计（未实现 / 已实现） */
-  const pnlStats = useMemo(() => {
-    let sum = 0;
-    let counted = 0;
-    for (const r of rows) {
-      if (isClosed && r.closeKind === 'DISCARD_LOCAL') continue;
-      // 已平仓只用 realizedPnl，禁止回退到 pnl（未实现），避免切 tab 时被旧数据覆盖
-      const raw = isClosed ? r.realizedPnl : r.pnl;
-      const n = Number(raw);
-      if (!Number.isFinite(n)) continue;
-      sum += n;
-      counted += 1;
-    }
-    return { sum, counted, total: rows.length };
-  }, [rows, isClosed]);
-
+  const pageRows = rows;
 
   const pageIds = useMemo(
     () => pageRows.map((r) => r.id).filter(Boolean) as string[],
@@ -613,7 +624,7 @@ export function PositionsPage() {
               onChange={(e) =>
                 setClosedKind(e.target.value as 'all' | 'partial' | 'full' | 'discard')
               }
-              title="平仓类型"
+              title="默认不含死仓，选「死仓删除」才查"
             >
               <option value="all">全部平仓类型</option>
               <option value="partial">部分平仓</option>
@@ -694,8 +705,10 @@ export function PositionsPage() {
               </span>
             </span>
             <span className="hint" style={{ margin: 0 }}>
-              计入 {pnlStats.counted} / {pnlStats.total} 笔
-              {isClosed ? '' : '（当前筛选结果）'}
+              {pnlStats.scope === 'page'
+                ? `本页计入 ${pnlStats.counted} 笔，共 ${pnlStats.total} 笔`
+                : `计入 ${pnlStats.counted} / ${pnlStats.total} 笔`}
+              {isClosed ? '' : pnlStats.scope === 'page' ? '' : '（当前筛选结果）'}
             </span>
           </div>
         ) : null}
@@ -734,12 +747,25 @@ export function PositionsPage() {
               <th style={{ width: 120 }}>类型</th>
               <th style={{ width: 56 }}>方向</th>
               <th style={{ width: 88 }}>数量</th>
-              <th style={{ width: 96 }}>开仓均价</th>
+              <th style={{ width: 96 }} title={isClosed ? '本次平仓配对用的开仓均价，不是当前剩余仓' : undefined}>
+                开仓均价
+              </th>
+              {isClosed ? (
+                <th style={{ width: 96 }} title="本次平仓成交均价（查单 PriceAvg）">
+                  平仓价格
+                </th>
+              ) : null}
               {!isClosed ? <th style={{ width: 96 }}>标记价格</th> : null}
               {isClosed ? (
                 <>
                   <th style={{ width: 88 }}>平仓类型</th>
                   <th style={{ width: 100 }}>已实现盈亏</th>
+                  <th
+                    style={{ width: 110 }}
+                    title="开仓分摊 + 平仓 TradeFee；负数为支付。旧记录没有入库时按平仓查单手续费分摊"
+                  >
+                    手续费
+                  </th>
                   <th style={{ width: 160 }}>平仓时间</th>
                 </>
               ) : (
@@ -836,7 +862,9 @@ export function PositionsPage() {
                           {r.closeRetryStopped ? '已停重试' : '异常'}
                         </span>
                       </td>
-                      <td title={r.lastCloseFailMsg || undefined}>{r.closeFailCount ?? 0}</td>
+                      <td title={stripQueryPositionLabel(r.lastCloseFailMsg) || undefined}>
+                        {r.closeFailCount ?? 0}
+                      </td>
                       <td style={{ fontSize: 12 }}>
                         {fmtTime(r.lastCloseFailAt)}
                         {r.lastCloseFailAmt != null && Number(r.lastCloseFailAmt) > 0 ? (
@@ -860,9 +888,9 @@ export function PositionsPage() {
                       </td>
                       <td
                         style={{ fontSize: 12, whiteSpace: 'normal', wordBreak: 'break-word' }}
-                        title={r.lastCloseFailMsg || undefined}
+                        title={stripQueryPositionLabel(r.lastCloseFailMsg) || undefined}
                       >
-                        {r.lastCloseFailMsg || '—'}
+                        {stripQueryPositionLabel(r.lastCloseFailMsg) || '—'}
                       </td>
                     </>
                   ) : null}
@@ -887,6 +915,13 @@ export function PositionsPage() {
                   <td style={{ fontFamily: 'monospace' }}>
                     {r.entryPrice != null && r.entryPrice !== '' ? String(r.entryPrice) : '—'}
                   </td>
+                  {isClosed ? (
+                    <td style={{ fontFamily: 'monospace' }}>
+                      {r.closeAvgPrice != null && r.closeAvgPrice !== ''
+                        ? String(r.closeAvgPrice)
+                        : '—'}
+                    </td>
+                  ) : null}
                   {!isClosed ? (
                     <td style={{ fontFamily: 'monospace' }}>
                       {r.markPrice != null && r.markPrice !== '' ? String(r.markPrice) : '—'}
@@ -912,7 +947,7 @@ export function PositionsPage() {
                               {closeBadge.text}
                             </span>
                             {(r.discardedLocal || r.closeKind === 'DISCARD_LOCAL') &&
-                            r.lastCloseFailMsg ? (
+                            stripQueryPositionLabel(r.lastCloseFailMsg) ? (
                               <div
                                 className="hint"
                                 style={{
@@ -922,9 +957,9 @@ export function PositionsPage() {
                                   wordBreak: 'break-word',
                                   maxWidth: 220,
                                 }}
-                                title={r.lastCloseFailMsg}
+                                title={stripQueryPositionLabel(r.lastCloseFailMsg)}
                               >
-                                {r.lastCloseFailMsg}
+                                {stripQueryPositionLabel(r.lastCloseFailMsg)}
                               </div>
                             ) : null}
                           </>
@@ -946,6 +981,13 @@ export function PositionsPage() {
                           ? '—'
                           : closedPnl != null && closedPnl !== ''
                             ? String(closedPnl)
+                            : '—'}
+                      </td>
+                      <td style={{ fontFamily: 'monospace' }}>
+                        {r.discardedLocal || r.closeKind === 'DISCARD_LOCAL'
+                          ? '—'
+                          : r.tradeFee != null && r.tradeFee !== ''
+                            ? String(r.tradeFee)
                             : '—'}
                       </td>
                       <td>{fmtTime(r.closeTime)}</td>
@@ -1012,7 +1054,10 @@ export function PositionsPage() {
           pageSize={pager.pageSize}
           pageSizes={[10, 20, 50, 100]}
           disabled={loading}
-          onChange={(p, s) => pager.onPageChange(p, s)}
+          onChange={(p, s) => {
+            pager.onPageChange(p, s);
+            void load({ page: p, pageSize: s });
+          }}
         />
       </div>
 

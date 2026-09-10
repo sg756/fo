@@ -68,6 +68,10 @@ class ChaseOnExpireDto {
   @IsBoolean() enabled: boolean;
 }
 
+class MarketOpenCloseDto {
+  @IsBoolean() enabled: boolean;
+}
+
 class FollowHaltedDto {
   @IsBoolean() halted: boolean;
 }
@@ -474,6 +478,18 @@ export class TradeAdminController {
     return res;
   }
 
+  /** 信号一到即市价开/平（与 chase-on-expire 互斥） */
+  @Post('follower/market-open-close')
+  async setMarketOpenClose(@Body() dto: MarketOpenCloseDto, @CurrentUser('sub') actorId: string) {
+    const res = await this.follower.setMarketOpenClose(!!dto.enabled);
+    await this.audit.log({
+      actorId,
+      action: 'MARKET_OPEN_CLOSE_UPDATE',
+      detail: res,
+    });
+    return res;
+  }
+
   /** 关闭跟单：勾选后自动跟单不再开任何新单 */
   @Post('follower/follow-halted')
   async setFollowHalted(@Body() dto: FollowHaltedDto, @CurrentUser('sub') actorId: string) {
@@ -668,6 +684,8 @@ export class TradeAdminController {
     @Query('q') q?: string,
     @Query('userId') userId?: string,
     @Query('readyOnly') readyOnly?: string,
+    @Query('skip') skip?: string,
+    @Query('take') take?: string,
   ) {
     const ready =
       readyOnly == null || readyOnly === ''
@@ -678,6 +696,8 @@ export class TradeAdminController {
       q,
       userId,
       readyOnly: ready,
+      skip: skip != null && skip !== '' ? Number(skip) : undefined,
+      take: take != null && take !== '' ? Number(take) : undefined,
     });
   }
 
@@ -742,6 +762,8 @@ export class TradeAdminController {
     @Query('recordId') recordId?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
+    @Query('skip') skip?: string,
+    @Query('take') take?: string,
   ) {
     return this.trade.listAdminPositions({
       userId,
@@ -756,6 +778,8 @@ export class TradeAdminController {
       recordId,
       from,
       to,
+      skip: skip != null && skip !== '' ? Number(skip) : undefined,
+      take: take != null && take !== '' ? Number(take) : undefined,
     });
   }
 

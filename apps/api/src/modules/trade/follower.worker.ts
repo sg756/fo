@@ -12,6 +12,8 @@ const CFG_SIGNAL_TIMEOUT_MS = 'signal_timeout_ms'; // 新：毫秒
 const CFG_POLL_MS = 'follower_poll_ms';
 const CFG_ORDER_EXPIRE = 'order_expire_seconds';
 const CFG_CHASE_ON_EXPIRE = 'chase_on_expire';
+/** 信号一到即市价开/平；与 chase_on_expire 互斥 */
+const CFG_MARKET_OPEN_CLOSE = 'market_open_close';
 /** 管理端「关闭跟单」：勾选后自动跟单不再下任何新单（含开/平/追入） */
 const CFG_FOLLOW_HALTED = 'follow_halted';
 
@@ -236,6 +238,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
     user?: { email?: string | null };
   }): Promise<boolean> {
     if (await this.getFollowHalted()) return false;
+    if (await this.getMarketOpenClose()) return false;
     if (!(await this.getChaseOnExpire())) return false;
 
     let meta: any = {};
@@ -395,6 +398,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       signalTimeoutSec: signalTimeoutMs / 1000,
       orderExpireSec: await this.getOrderExpireSec(),
       chaseOnExpire: await this.getChaseOnExpire(),
+      marketOpenClose: await this.getMarketOpenClose(),
       followHalted: await this.getFollowHalted(),
       placeOrderTimeoutMs: Number(process.env.TRADE_REQUEST_TIMEOUT_MS || 15000),
       enabled: this.enabled(),
@@ -620,7 +624,35 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       },
       update: { value: on ? 'true' : 'false' },
     });
-    return { chaseOnExpire: on };
+    if (on) await this.setMarketOpenClose(false, { skipMutex: true });
+    return { chaseOnExpire: on, marketOpenClose: on ? false : await this.getMarketOpenClose() };
+  }
+
+  /** 信号一到即市价开仓/平仓（管理端开关，默认关；与 chaseOnExpire 互斥） */
+  async getMarketOpenClose(): Promise<boolean> {
+    const fromDb = await this.prisma.systemConfig.findUnique({
+      where: { key: CFG_MARKET_OPEN_CLOSE },
+    });
+    if (fromDb) {
+      const v = String(fromDb.value || '').trim().toLowerCase();
+      return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+    }
+    return (process.env.MARKET_OPEN_CLOSE || 'false').toLowerCase() === 'true';
+  }
+
+  async setMarketOpenClose(enabled: boolean, opts?: { skipMutex?: boolean }) {
+    const on = !!enabled;
+    await this.prisma.systemConfig.upsert({
+      where: { key: CFG_MARKET_OPEN_CLOSE },
+      create: {
+        key: CFG_MARKET_OPEN_CLOSE,
+        value: on ? 'true' : 'false',
+        remark: '信号一到即市价开/平；与价未到现价追入互斥',
+      },
+      update: { value: on ? 'true' : 'false' },
+    });
+    if (on && !opts?.skipMutex) await this.setChaseOnExpire(false);
+    return { marketOpenClose: on, chaseOnExpire: on ? false : await this.getChaseOnExpire() };
   }
 
   /** 管理端关闭跟单：勾选后自动跟单不再下新单（默认关=照常跟） */
@@ -1387,6 +1419,9 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
     });
     if (followers.length === 0) return 0;
 
+    const marketOpenClose = await this.getMarketOpenClose();
+    const followOrderType = marketOpenClose ? 'market' : signal.orderType;
+
     const openMin = signal.isOpen ? await this.trade.getOpenMinPointBalance() : 0;
     let pointBal = new Map<string, number>();
     if (signal.isOpen && openMin > 0) {
@@ -1604,7 +1639,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
             success: false,
             symbol: signal.symbol,
             side: signal.orderSide,
-            orderType: signal.orderType,
+            orderType: followOrderType,
             accountType: signal.accountType,
             accountGid: accountGid || undefined,
             accountName: accountName || undefined,
@@ -1626,6 +1661,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
               accountName,
               orderGID: signal.orderGID,
               signalKey,
+              followMode: marketOpenClose ? 'market_open_close' : 'limit',
               ...sizingMeta,
             }),
           },
@@ -1647,9 +1683,9 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
           exchange: signal.exchange,
           symbol: signal.symbol,
           side: signal.orderSide,
-          orderType: signal.orderType,
+          orderType: followOrderType,
           accountType: signal.accountType,
-          price: signal.price,
+          ...(marketOpenClose ? {} : { price: signal.price }),
           amount: followAmount,
           positionSide: signal.positionSide,
           ...(placeLev ? { leverage: placeLev } : {}),
@@ -1671,7 +1707,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
             clientOrderId,
             symbol: signal.symbol,
             side: signal.orderSide,
-            orderType: signal.orderType,
+            orderType: followOrderType,
             accountType: signal.accountType,
             accountGid: accountGid || undefined,
             accountName: accountName || undefined,
@@ -1680,7 +1716,9 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
             positionSide: signal.positionSide,
             isOpen: signal.isOpen,
             orderAmt: followAmount,
-            expiresAt: new Date(placedAt.getTime() + expireSec * 1000),
+            expiresAt: marketOpenClose
+              ? null
+              : new Date(placedAt.getTime() + expireSec * 1000),
             responseBody: JSON.stringify(result?.data ?? result),
             requestBody: JSON.stringify({
               apiCode: signal.apiCode,

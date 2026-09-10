@@ -283,6 +283,14 @@ model ProfitRecord {
   exchange  Exchange
   symbol    String
   profit    Decimal  @db.Decimal(30, 10) // 平仓利润(可负)
+  /// 本次配对数量（FIFO 切片，不是当前剩余仓）
+  qty       Decimal? @db.Decimal(30, 10)
+  /// 本次配对用的开仓均价（加权，不是当前剩余仓均价）
+  openAvg   Decimal? @map("open_avg") @db.Decimal(30, 10)
+  /// 本次平仓成交均价
+  closeAvg  Decimal? @map("close_avg") @db.Decimal(30, 10)
+  /// 计入本笔盈亏的手续费（开仓分摊 + 平仓 TradeFee；负数为支付）
+  fee       Decimal? @db.Decimal(30, 10)
   closedAt  DateTime
   settled   Boolean  @default(false) // 是否已结算佣金
   orderId   String? // 平仓成交订单号
