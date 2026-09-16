@@ -2,7 +2,8 @@
  * 已实现盈亏公式 (基于 QueryOrder 成交字段 + 开仓均价配对)
  *
  * 输入 (平仓单 QueryOrder):
- *   Status=2 完全成交, FilledAmt, PriceAvg, TradeFee
+ *   Status=2 完全成交, FilledAmt, PriceAvg
+ *   TradeFee 不读中间件，按各所公开默认 maker/taker × 成交额自算
  * 输入 (配对开仓单已落库):
  *   avgPrice, filledAmt, tradeFee, positionSide
  *

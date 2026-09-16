@@ -42,6 +42,7 @@ import {
   mapDocStatus,
 } from './mapi.types';
 import { calcRealizedPnl, contractMultiplier } from './pnl.util';
+import { ExchangeFeeService } from './exchange-fee.service';
 import {
   formatDisplayPrice,
   isAtLeastOneContract,
@@ -55,15 +56,11 @@ import { MapiRequestError } from './mapi.client';
 import {
   FILL_COMPLETE_EPS,
   FILL_EPS,
-  canAttemptRemainderCancel,
-  fillDelta,
   fillWatermarkOf,
-  hasLiveRemainder,
-  isOrderFillComplete,
   isQueryFillUsable,
   orderAmtOf,
-  sliceFillFee,
-  sliceFillPrice,
+  planFillFromQuery,
+  closeKindFromFillLog,
   type FillSnapshot,
 } from './order-fill.util';
 import {
@@ -145,6 +142,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     private market: MarketService,
     private commission: CommissionService,
     private symbols: SymbolService,
+    private exchangeFee: ExchangeFeeService,
   ) {}
 
   async onModuleInit() {
@@ -1102,6 +1100,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         clientOrderId: orderCtx.clientOrderId,
         positionSide: orderCtx.positionSide || undefined,
         isOpen: orderCtx.isOpen ?? undefined,
+        orderType: log?.orderType || meta.orderType || undefined,
       });
       if (verify.state === 'open' || verify.state === 'partial') {
         // 部分成：先回写已成量并写仓，再记撤失败（仍挂单）
@@ -1840,6 +1839,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       positionSide?: string;
       placedAt?: Date;
       isOpen?: boolean;
+      orderType?: string;
     },
   ): Promise<{
     state: 'open' | 'partial' | 'filled' | 'cancelled' | 'unknown';
@@ -1867,11 +1867,20 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       if (st === '' && opts?.placedAt && Date.now() - opts.placedAt.getTime() < 2500) {
         return { ...empty, errorMsg: res?.errorMsg };
       }
+      const filledAmt = Number(res?.filledAmt ?? 0) || 0;
+      const priceAvg = Number(res?.priceAvg ?? 0) || 0;
       return {
         state: mapDocStatus(st),
-        filledAmt: Number(res?.filledAmt ?? 0) || 0,
-        priceAvg: Number(res?.priceAvg ?? 0) || 0,
-        tradeFee: Number(res?.tradeFee ?? 0) || 0,
+        filledAmt,
+        priceAvg,
+        tradeFee: this.exchangeFee.feeForFill({
+          exchange,
+          filledAmt,
+          priceAvg,
+          accountType: opts?.accountType,
+          equalCoinName: opts?.equalCoinName,
+          orderType: opts?.orderType,
+        }),
         errorMsg: res?.errorMsg,
       };
     } catch (e: any) {
@@ -2221,6 +2230,37 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  /** 未实现盈亏：与列表单行同一公式（标记价 − 开仓均价）× 数量，空反向。无标记价则不算。 */
+  private unrealizedPnlNum(r: {
+    coinName: string;
+    exchange: Exchange;
+    accountType?: string | null;
+    positionSide?: string | null;
+    qty: Prisma.Decimal | number;
+    entryPrice: Prisma.Decimal | number;
+  }): number | null {
+    const qty = Number(r.qty);
+    const entry = Number(r.entryPrice);
+    const at = String(r.accountType || '').toLowerCase();
+    const market: 'spot' | 'future' = at === 'spot' ? 'spot' : 'future';
+    const mark = this.market.getPrice(r.coinName, r.exchange, { market });
+    if (
+      !(
+        mark != null &&
+        mark > 0 &&
+        Number.isFinite(mark) &&
+        Number.isFinite(entry) &&
+        entry > 0 &&
+        qty > 0
+      )
+    ) {
+      return null;
+    }
+    const short = String(r.positionSide || '').toLowerCase().includes('short');
+    const raw = short ? (entry - mark) * qty : (mark - entry) * qty;
+    return Math.round(raw * 1e8) / 1e8;
+  }
+
   /** 将本地持仓行映射为 App / 管理端列表结构 */
   private mapUserPositionRow(r: {
     id: string;
@@ -2275,19 +2315,17 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     );
     const markText =
       !isClosed && mark != null && mark > 0 ? formatDisplayPrice(mark, spec) : '';
-    let pnl: string | undefined;
-    if (
-      !isClosed &&
-      mark != null &&
-      mark > 0 &&
-      Number.isFinite(mark) &&
-      Number.isFinite(entry) &&
-      entry > 0 &&
-      qty > 0
-    ) {
-      const raw = side === 'short' ? (entry - mark) * qty : (mark - entry) * qty;
-      pnl = String(Math.round(raw * 1e8) / 1e8);
-    }
+    const pnlNum = isClosed
+      ? null
+      : this.unrealizedPnlNum({
+          coinName: r.coinName,
+          exchange: r.exchange,
+          accountType: r.accountType,
+          positionSide: r.positionSide,
+          qty: r.qty,
+          entryPrice: r.entryPrice,
+        });
+    const pnl = pnlNum != null ? String(pnlNum) : undefined;
     // 库里多为空：跟单下单曾默认 5 倍，有落库杠杆则用落库值
     const notional =
       Number.isFinite(entry) && entry > 0 && qty > 0 ? Math.abs(qty * entry) : null;
@@ -5032,27 +5070,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   calcRealizedPnl = calcRealizedPnl;
 
   /**
-   * 本次新增成交量对应的边际平仓均价（避免用整单累计均价误算早先部分平）
-   */
-  private marginalCloseAvg(params: {
-    totalFilled: number;
-    totalAvg: number;
-    prevRecorded: number;
-    prevAvg: number;
-    delta: number;
-  }): number {
-    const { totalFilled, totalAvg, prevRecorded, prevAvg, delta } = params;
-    if (!(delta > 0)) return 0;
-    if (prevRecorded > 1e-12 && prevAvg > 0 && totalFilled > prevRecorded + 1e-12) {
-      const marginal = (totalFilled * totalAvg - prevRecorded * prevAvg) / delta;
-      if (Number.isFinite(marginal) && marginal > 0) return marginal;
-    }
-    return totalAvg;
-  }
-
-  /**
-   * 查单累计成交 → 增量切片入账。
-   * 开仓：更新 filledAmt 后按剩余量汇总持仓；平仓：Δqty 扣开仓 consumedAmt（无均价也减仓）。
+   * 查单累计覆盖原记录。不切片。部成等撤余；撤过/终态则本地完全成交。
+   * logOnly：补记只改日志，不改持仓、不记利润。
    */
   async applyFillFromQuery(
     log: {
@@ -5076,8 +5095,10 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       tradeFee?: any;
       recordedFilledAmt?: any;
       profitRecordedAmt?: any;
+      orderType?: string | null;
     },
     fill: FillSnapshot & { finalFill?: boolean },
+    opts?: { forceSettle?: boolean; logOnly?: boolean },
   ): Promise<{
     booked: boolean;
     delta: number;
@@ -5116,113 +5137,108 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     const watermark = fillWatermarkOf(log, looksClose);
     const totalFilled = Number(fill.filledAmt) || 0;
     const totalAvg = Number(fill.priceAvg) || 0;
-    const totalFee = Number(fill.tradeFee) || 0;
-    const prevAvg = Number(log.avgPrice ?? 0) || 0;
-    const prevFee = Number(log.tradeFee ?? 0) || 0;
-    const delta = fillDelta(totalFilled, watermark);
+    const followMode = String(meta.followMode || '').trim() || null;
+    const totalFee = this.exchangeFee.feeForFill({
+      exchange: log.exchange,
+      filledAmt: totalFilled,
+      priceAvg: totalAvg,
+      accountType: log.accountType,
+      equalCoinName,
+      orderType: log.orderType || meta.orderType || null,
+      followMode,
+    });
+    const firstSettle = watermark <= FILL_EPS;
+    const plan = planFillFromQuery({
+      fill,
+      finalFill: fill.finalFill,
+      forceSettle: opts?.forceSettle,
+      orderAmt,
+      looksClose,
+      watermark,
+    });
+    const { complete, remainder } = plan;
+    const fillKind =
+      plan.fillKind === 'FULL'
+        ? FollowFillKind.FULL
+        : plan.fillKind === 'PARTIAL'
+          ? FollowFillKind.PARTIAL
+          : FollowFillKind.NONE;
 
-    let slicePx = 0;
-    let sliceFee = 0;
-    if (delta > FILL_EPS) {
-      slicePx = sliceFillPrice({
-        totalFilled,
-        totalAvg,
-        prevFilled: watermark,
-        prevAvg,
-        delta,
-      });
-      sliceFee = sliceFillFee(totalFee, prevFee, delta, totalFilled);
+    await this.prisma.signalFollowLog.update({
+      where: { id: log.id },
+      data: {
+        filledAmt: totalFilled,
+        avgPrice: totalAvg > 0 ? totalAvg : undefined,
+        tradeFee: Number.isFinite(totalFee) ? totalFee : undefined,
+        fillKind,
+        coinName: coinName || undefined,
+        equalCoinName: equalCoinName || undefined,
+        positionSide,
+        isOpen: isOpen != null ? isOpen : undefined,
+      },
+    });
 
-      const lastSlice = await this.prisma.followFillSlice.findFirst({
-        where: { followLogId: log.id },
-        orderBy: { seq: 'desc' },
-        select: { seq: true },
-      });
-      const seq = (lastSlice?.seq ?? 0) + 1;
-      await this.prisma.followFillSlice.create({
-        data: {
-          followLogId: log.id,
-          seq,
-          qty: delta,
-          price: slicePx,
-          fee: sliceFee,
-          cumulativeFilled: totalFilled,
-          cumulativeAvg: totalAvg,
-        },
-      });
-
-      const fillKind = looksClose
-        ? fill.finalFill || fill.state === 'filled' || fill.state === 'cancelled'
-          ? FollowFillKind.FULL
-          : FollowFillKind.PARTIAL
-        : fill.finalFill || fill.state === 'filled'
-          ? FollowFillKind.FULL
-          : FollowFillKind.PARTIAL;
-
-      await this.prisma.signalFollowLog.update({
-        where: { id: log.id },
-        data: {
-          filledAmt: totalFilled,
-          avgPrice: totalAvg > 0 ? totalAvg : undefined,
-          tradeFee: Number.isFinite(totalFee) ? totalFee : undefined,
-          recordedFilledAmt: watermark + delta,
-          fillKind,
-          coinName: coinName || undefined,
-          equalCoinName: equalCoinName || undefined,
-          positionSide,
-          isOpen: isOpen != null ? isOpen : undefined,
-        },
-      });
-
-      if (looksClose) {
-        await this.consumeCloseDelta({
-          userId: log.userId,
-          exchange: log.exchange,
-          orderId: log.orderId,
-          symbol: log.symbol,
-          accountType: log.accountType || 'future',
-          signalKey: log.signalKey,
-          coinName,
-          equalCoinName,
-          positionSide,
-          meta,
-          delta,
-          closeAvg: slicePx,
-          feeDelta: sliceFee,
-          closeLogId: log.id,
-          prevRecorded: watermark,
-        });
-      }
+    if (!complete) {
+      return {
+        booked: false,
+        delta: 0,
+        complete: false,
+        remainder,
+        recorded: false,
+        reason: plan.reason,
+      };
     }
 
-    const recordedFilled = watermark + delta;
-    const complete =
-      !!fill.finalFill ||
-      isOrderFillComplete({ fill, orderAmt, recordedFilled });
-    const remainder = hasLiveRemainder({ fill, orderAmt, recordedFilled });
+    const status = fill.state === 'cancelled' ? 'CANCELLED' : 'FILLED';
+    await this.prisma.signalFollowLog.update({
+      where: { id: log.id },
+      data: {
+        status,
+        fillKind: totalFilled > FILL_EPS ? FollowFillKind.FULL : FollowFillKind.NONE,
+        cancelledAt: status === 'CANCELLED' ? new Date() : undefined,
+        filledAmt: totalFilled,
+        avgPrice: totalAvg > 0 ? totalAvg : undefined,
+        tradeFee: Number.isFinite(totalFee) ? totalFee : undefined,
+        recordedFilledAmt: totalFilled,
+      },
+    });
 
-    if (complete) {
-      const filledAmt = Math.max(totalFilled, recordedFilled);
-      await this.prisma.signalFollowLog.update({
-        where: { id: log.id },
-        data: {
-          status: fill.state === 'cancelled' ? 'CANCELLED' : 'FILLED',
-          fillKind:
-            filledAmt > FILL_EPS
-              ? fill.state === 'filled' ||
-                (orderAmt > FILL_EPS && recordedFilled + FILL_COMPLETE_EPS >= orderAmt)
-                ? FollowFillKind.FULL
-                : FollowFillKind.PARTIAL
-              : FollowFillKind.NONE,
-          cancelledAt: fill.state === 'cancelled' ? new Date() : undefined,
-          filledAmt: filledAmt > 0 ? filledAmt : undefined,
-          avgPrice: totalAvg > 0 ? totalAvg : undefined,
-          recordedFilledAmt: recordedFilled,
-        },
-      });
+    if (opts?.logOnly) {
+      return {
+        booked: true,
+        delta: 0,
+        complete: true,
+        remainder: false,
+        recorded: false,
+        reason: 'log-overwrite',
+      };
     }
 
-    if (delta > FILL_EPS || (complete && recordedFilled > FILL_EPS)) {
+    let recorded = false;
+    let profit: number | undefined;
+    if (looksClose && firstSettle && totalFilled > FILL_EPS && plan.book) {
+      const r = await this.consumeCloseDelta({
+        userId: log.userId,
+        exchange: log.exchange,
+        orderId: log.orderId,
+        symbol: log.symbol,
+        accountType: log.accountType || 'future',
+        signalKey: log.signalKey,
+        coinName,
+        equalCoinName,
+        positionSide,
+        meta,
+        delta: totalFilled,
+        closeAvg: totalAvg,
+        feeDelta: totalFee,
+        closeLogId: log.id,
+        prevRecorded: 0,
+      });
+      recorded = true;
+      profit = r.profit;
+    }
+
+    if (firstSettle && totalFilled > FILL_EPS) {
       try {
         await this.syncUserPositionFromLots({
           userId: log.userId,
@@ -5239,12 +5255,13 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
 
     return {
-      booked: delta > FILL_EPS,
-      delta,
-      complete,
-      remainder,
-      recorded: delta > FILL_EPS && looksClose,
-      reason: delta > FILL_EPS ? (looksClose ? 'close-slice' : 'open-slice') : 'no-delta',
+      booked: true,
+      delta: totalFilled,
+      complete: true,
+      remainder: false,
+      recorded,
+      profit,
+      reason: plan.reason,
     };
   }
 
@@ -5428,7 +5445,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   /**
    * 跟单挂单成交后: 用 QueryOrder 的 FilledAmt/PriceAvg/TradeFee 入库成交信息;
    * 若为平仓, 与未消耗开仓单 FIFO 配对算出已实现盈亏 → ProfitRecord → 佣金结算。
-   * 部分平仓按每次新增成交量即时配对（不等全平），避免后续加仓改变开仓均价后重算出错。
+   * 部分成交按每次新增成交量即时配对（不等该单完全成交），避免后续加仓改变开仓均价后重算出错。
    *
    * 公式见 pnl.util.ts:
    *   多: (平仓均价−开仓均价)×数量×乘数 + 开仓手续费份额 + 平仓手续费份额
@@ -5466,25 +5483,37 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     let filledAmt = Number(log.filledAmt);
     let priceAvg = Number(log.priceAvg);
     let tradeFee = Number(log.tradeFee);
-    if (!Number.isFinite(filledAmt) || filledAmt < 0) {
-      const q = await this.inspectOrderFill(log.userId, log.exchange, log.orderId, {
-        symbol: log.symbol || row.symbol || undefined,
-        accountType: log.accountType || row.accountType || 'future',
-        coinName: row.coinName || undefined,
-        equalCoinName: row.equalCoinName || undefined,
-        clientOrderId: row.clientOrderId || undefined,
-        isOpen: row.isOpen ?? false,
-      });
+    let state: FillSnapshot['state'] = log.finalFill ? 'filled' : 'unknown';
+    const q = await this.inspectOrderFill(log.userId, log.exchange, log.orderId, {
+      symbol: log.symbol || row.symbol || undefined,
+      accountType: log.accountType || row.accountType || 'future',
+      coinName: row.coinName || undefined,
+      equalCoinName: row.equalCoinName || undefined,
+      clientOrderId: row.clientOrderId || undefined,
+      isOpen: row.isOpen ?? false,
+      orderType: row.orderType || undefined,
+    });
+    if (isQueryFillUsable(q)) {
+      if (!log.finalFill) state = q.state;
       filledAmt = q.filledAmt;
-      priceAvg = q.priceAvg;
-      tradeFee = q.tradeFee;
+      if (q.priceAvg > 0) priceAvg = q.priceAvg;
+      if (Number.isFinite(q.tradeFee)) tradeFee = q.tradeFee;
+      if (q.state === 'filled' || q.state === 'cancelled') state = q.state;
+    } else if (state === 'unknown') {
+      const amt = orderAmtOf(row);
+      if (Number.isFinite(filledAmt) && filledAmt > FILL_EPS) {
+        state =
+          amt > FILL_EPS && filledAmt + FILL_COMPLETE_EPS >= amt ? 'filled' : 'partial';
+      } else {
+        state = 'open';
+      }
     }
     const r = await this.applyFillFromQuery(row, {
-      state: log.finalFill ? 'filled' : filledAmt > 0 ? 'partial' : 'open',
+      state,
       filledAmt: Number.isFinite(filledAmt) ? filledAmt : 0,
       priceAvg: Number.isFinite(priceAvg) ? priceAvg : 0,
       tradeFee: Number.isFinite(tradeFee) ? tradeFee : 0,
-      finalFill: !!log.finalFill,
+      finalFill: !!log.finalFill || state === 'filled' || state === 'cancelled',
     });
     return { recorded: r.recorded, profit: r.profit, reason: r.reason };
   }
@@ -6101,6 +6130,15 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     return Number.isFinite(n) ? n : null;
   }
 
+  /** 按同一订单号的查单/流水终态：完全成交或撤余结束=FULL；仍挂单且已有成交=PARTIAL。与仓位是否减完无关。 */
+  private closeKindFromFillLog(log?: {
+    fillKind?: FollowFillKind | string | null;
+    status?: string | null;
+    filledAmt?: unknown;
+  } | null): 'FULL' | 'PARTIAL' {
+    return closeKindFromFillLog(log);
+  }
+
   private positionSideKey(side: string | null | undefined): 'long' | 'short' {
     return String(side || 'long').toLowerCase().includes('short') ? 'short' : 'long';
   }
@@ -6383,6 +6421,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       filledAmt: Prisma.Decimal | null;
       avgPrice: Prisma.Decimal | null;
       tradeFee: Prisma.Decimal | null;
+      status: string | null;
+      fillKind: FollowFillKind | null;
       isOpen: boolean | null;
       requestBody: string | null;
       createdAt: Date;
@@ -6419,6 +6459,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
               filledAmt: true,
               avgPrice: true,
               tradeFee: true,
+              status: true,
+              fillKind: true,
               isOpen: true,
               requestBody: true,
               createdAt: true,
@@ -6468,7 +6510,6 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         closeLogByOrderId.set(oid, l);
       }
     }
-    const closedPosByKey = new Map<string, { closedAt: Date | null }>();
     const posMetaByKey = new Map<
       string,
       {
@@ -6495,50 +6536,6 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         leverage: pos.leverage != null ? Number(pos.leverage) : null,
         entryPrice: Number.isFinite(ep) && ep > 0 ? ep : null,
       });
-      if (pos.status === UserPositionStatus.CLOSED) {
-        const cur = closedPosByKey.get(key);
-        const ca = pos.closedAt?.getTime() ?? 0;
-        const prev = cur?.closedAt?.getTime() ?? 0;
-        if (!cur || ca >= prev) closedPosByKey.set(key, { closedAt: pos.closedAt });
-      }
-    }
-
-    const profitsByPosKey = new Map<string, typeof profits>();
-    for (const p of profits) {
-      const log = p.orderId ? closeLogByOrderId.get(String(p.orderId)) : undefined;
-      const parsed = this.parseSymbolParts(p.symbol || '');
-      const coin = String(log?.coinName || parsed.coin || '').toUpperCase();
-      const eq = String(log?.equalCoinName || parsed.equalCoin || '').toUpperCase();
-      const side = this.positionSideKey(log?.positionSide);
-      const posKey = this.buildPosMatchKey({
-        userId: p.userId,
-        exchange: p.exchange,
-        coinName: coin,
-        equalCoinName: eq,
-        positionSide: side,
-      });
-      const arr = profitsByPosKey.get(posKey) || [];
-      arr.push(p);
-      profitsByPosKey.set(posKey, arr);
-    }
-    for (const arr of profitsByPosKey.values()) {
-      arr.sort((a, b) => a.closedAt.getTime() - b.closedAt.getTime());
-    }
-
-    const fullProfitIdByPosKey = new Map<string, string>();
-    for (const [posKey, arr] of profitsByPosKey) {
-      const closedPos = closedPosByKey.get(posKey);
-      if (!closedPos?.closedAt || !arr.length) continue;
-      let best = arr[0];
-      let bestDiff = Math.abs(arr[0].closedAt.getTime() - closedPos.closedAt.getTime());
-      for (const p of arr) {
-        const d = Math.abs(p.closedAt.getTime() - closedPos.closedAt.getTime());
-        if (d < bestDiff) {
-          bestDiff = d;
-          best = p;
-        }
-      }
-      if (bestDiff <= 120_000) fullProfitIdByPosKey.set(posKey, best.id);
     }
 
     const profitsByOrderId = new Map<string, typeof watermarkProfits>();
@@ -6588,8 +6585,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       if (period && !this.matchMarketPeriod(period, accountType, eq)) continue;
       if (accountGidFilter && String(accountGid || '') !== accountGidFilter) continue;
 
-      const closeKind =
-        fullProfitIdByPosKey.get(posKey) === p.id ? 'FULL' : 'PARTIAL';
+      // 部分成交 = 同一订单号尚未完结（status=1），后续还可能成交。
+      // 减仓只要查单/流水是完全成交（status=2 / FILLED / fillKind=FULL）就是完全成交，与是否还有剩余持仓无关。
+      const closeKind = this.closeKindFromFillLog(log);
       if (kind === 'partial' && closeKind !== 'PARTIAL') continue;
       if (kind === 'full' && closeKind !== 'FULL') continue;
 
@@ -6635,7 +6633,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       const storedFee = p.fee != null ? Number(p.fee) : NaN;
       const logFee = log?.tradeFee != null ? Number(log.tradeFee) : NaN;
       let feeNum: number | null = null;
-      if (Number.isFinite(storedFee)) {
+      if (closeKind === 'FULL' && Number.isFinite(logFee)) {
+        feeNum = logFee;
+      } else if (Number.isFinite(storedFee)) {
         feeNum = storedFee;
       } else if (Number.isFinite(logFee)) {
         feeNum =
@@ -6849,7 +6849,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
 
     const { skip, take } = this.clampAdminPage(opts.skip, opts.take);
-    const [rows, total] = await Promise.all([
+    const [rows, total, allForPnl] = await Promise.all([
       this.prisma.userPosition.findMany({
         where,
         orderBy: { openedAt: 'desc' },
@@ -6860,9 +6860,19 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         take,
       }),
       this.prisma.userPosition.count({ where }),
+      this.prisma.userPosition.findMany({
+        where,
+        select: {
+          coinName: true,
+          exchange: true,
+          accountType: true,
+          positionSide: true,
+          qty: true,
+          entryPrice: true,
+        },
+      }),
     ]);
-
-    this.kickoffPositionMarkPrices(rows);
+    this.kickoffPositionMarkPrices(allForPnl);
 
     const items = rows.map((r) => ({
       ...this.mapUserPositionRow(r),
@@ -6871,9 +6881,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }));
     let pnlSum = 0;
     let counted = 0;
-    for (const it of items) {
-      const n = Number(it.pnl);
-      if (!Number.isFinite(n)) continue;
+    for (const r of allForPnl) {
+      const n = this.unrealizedPnlNum(r);
+      if (n == null) continue;
       pnlSum += n;
       counted += 1;
     }
@@ -6884,7 +6894,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       scannedUsers: new Set(rows.map((r) => r.userId)).size,
       total,
       status: 'OPEN',
-      summary: { pnlSum, counted, scope: 'page' as const },
+      summary: { pnlSum, counted, scope: 'all' as const },
     };
   }
 
@@ -7073,6 +7083,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       coinName,
       equalCoinName: equal,
       isOpen: false,
+      orderType: 'market',
     });
     const applied = await this.applyFillFromQuery(log, q);
     let profitResult: { recorded: boolean; profit?: number; reason?: string } = {

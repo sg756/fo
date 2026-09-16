@@ -220,7 +220,7 @@ export function TradeConfigPage() {
       <div className="card">
         <h3>交易所持仓对齐</h3>
         <p className="hint">
-          定时用 QueryPosition 把本地 OPEN 合约仓与交易所对齐。按代理串行，每个用户间隔 5
+          定时把本地未平仓合约与交易所持仓对齐。按代理串行，每个用户间隔 5
           秒；列表刷新不查交易所。保存后线程按新间隔执行。
         </p>
         <div className="row">

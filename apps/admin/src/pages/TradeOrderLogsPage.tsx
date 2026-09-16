@@ -639,9 +639,9 @@ export function TradeOrderLogsPage() {
                   </td>
                   <td className="nowrap">
                     {r.fillKind === 'PARTIAL'
-                      ? '部分成'
+                      ? '部分成交'
                       : r.fillKind === 'FULL'
-                        ? '全成'
+                        ? '完全成交'
                         : '—'}
                   </td>
                   <td

@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   NavLink,
   Navigate,
-  Outlet,
   Route,
   Routes,
   useLocation,
@@ -56,7 +55,8 @@ import { CollectionRecordsPage } from './pages/CollectionRecordsPage';
 import { ConfirmHost } from './components/ConfirmDialog';
 import { ToastHost } from './components/Toast';
 import { SessionExpiredHost } from './components/SessionExpiredHost';
-import { VisitedTabs } from './components/VisitedTabs';
+import { VisitedTabs, VisitedTabsProvider, useVisitedTabs } from './components/VisitedTabs';
+import { KeepAliveOutlet } from './components/KeepAliveOutlet';
 import {
   clearVisitedTabs,
   loadNavOpen,
@@ -65,8 +65,14 @@ import {
   saveNavOpen,
   type NavChild,
   type NavGroup,
+  type VisitedTab,
 } from './nav';
 import './styles.css';
+
+function tabTo(path: string, tabs: VisitedTab[]) {
+  const t = tabs.find((x) => x.path === path);
+  return t ? `${t.path}${t.search || ''}` : path;
+}
 
 function useAllowedMenus() {
   const [menus, setMenus] = useState<string[]>(() => getAdminMenus());
@@ -109,6 +115,7 @@ function Sidebar() {
   const location = useLocation();
   const menus = useAllowedMenus();
   const groups = useMemo(() => filterNav(menus), [menus]);
+  const { tabs } = useVisitedTabs();
 
   const activeGroupKey = useMemo(() => {
     const g = groups.find((grp) => grp.children.some((c) => matchChild(location.pathname, c)));
@@ -173,7 +180,7 @@ function Sidebar() {
                   {g.children.map((c) => (
                     <NavLink
                       key={c.to}
-                      to={c.to}
+                      to={tabTo(c.to, tabs)}
                       end={c.end}
                       className={({ isActive }) => (isActive ? 'active' : '')}
                     >
@@ -303,6 +310,7 @@ function Topbar() {
   const menus = getAdminMenus();
   const groups = useMemo(() => filterNav(menus), [menus]);
   const [groupOpen, setGroupOpen] = useState(false);
+  const { tabs } = useVisitedTabs();
 
   const crumb = useMemo(() => {
     const homeTo = groups.find((x) => x.key === 'overview')?.children[0]?.to || '/';
@@ -370,7 +378,7 @@ function Topbar() {
                       className={`crumb-menu-item${matchChild(location.pathname, c) ? ' active' : ''}`}
                       onClick={() => {
                         setGroupOpen(false);
-                        navigate(c.to);
+                        navigate(tabTo(c.to, tabs));
                       }}
                     >
                       {c.label}
@@ -405,20 +413,29 @@ function Topbar() {
   );
 }
 
+function ShellMain() {
+  const { cacheKeys } = useVisitedTabs();
+  return (
+    <main className="main">
+      <KeepAliveOutlet cacheKeys={cacheKeys} />
+    </main>
+  );
+}
+
 function Shell() {
   return (
-    <div className="layout">
-      <Sidebar />
-      <div className="main-wrap">
-        <Topbar />
-        <VisitedTabs />
-        <main className="main">
-          <Outlet />
-        </main>
+    <VisitedTabsProvider>
+      <div className="layout">
+        <Sidebar />
+        <div className="main-wrap">
+          <Topbar />
+          <VisitedTabs />
+          <ShellMain />
+        </div>
+        <ToastHost />
+        <ConfirmHost />
       </div>
-      <ToastHost />
-      <ConfirmHost />
-    </div>
+    </VisitedTabsProvider>
   );
 }
 

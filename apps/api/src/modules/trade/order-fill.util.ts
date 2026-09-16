@@ -1,9 +1,11 @@
-/** 查单增量入账 / 部成撤余：纯函数，供 TradeService 与单测共用 */
+/** 查单累计入账 / 部成撤余：纯函数，供 TradeService 与单测共用 */
 
 export const FILL_EPS = 1e-12;
 export const FILL_COMPLETE_EPS = 1e-8;
 export const REMAINDER_CANCEL_INTERVAL_MS = 30_000;
 export const REMAINDER_CANCEL_GIVE_UP_MS = 10 * 60 * 1000;
+/** 撤余后本地已结束，仍查同一订单号补累计日志的窗口 */
+export const FILL_CATCH_UP_MS = 15 * 60 * 1000;
 
 export type FillSnapshot = {
   state: 'open' | 'partial' | 'filled' | 'cancelled' | 'unknown';
@@ -39,8 +41,8 @@ export function orderAmtOf(log: {
 }
 
 /**
- * 已入账水位。开仓：可用 filledAmt 兜底（持仓由 filledAmt 汇总，避免重复加仓）。
- * 平仓：只用 recordedFilledAmt / profitRecordedAmt，避免「流水有量、仓没减」被跳过。
+ * 已入账水位：只用 recordedFilledAmt（平仓还可兜底 profitRecordedAmt）。
+ * 部成只写 filledAmt 快照，不能把快照当成已入账，否则撤后再查会只记差额。
  */
 export function fillWatermarkOf(
   log: {
@@ -57,8 +59,7 @@ export function fillWatermarkOf(
     const pnl = Number(log.profitRecordedAmt ?? 0);
     return Number.isFinite(pnl) && pnl > FILL_EPS ? pnl : 0;
   }
-  const filled = Number(log.filledAmt ?? 0);
-  return Number.isFinite(filled) && filled > FILL_EPS ? filled : 0;
+  return 0;
 }
 
 /** Δqty = 查单累计 − 水位；水位只增，回退视为 0。 */
@@ -140,4 +141,106 @@ export function canAttemptRemainderCancel(params: {
     return { allowed: false, giveUp: false };
   }
   return { allowed: true, giveUp: false };
+}
+
+export type FillKindLabel = 'FULL' | 'PARTIAL' | 'NONE';
+
+export type FillBookPlan = {
+  qty: number;
+  avg: number;
+  /** 查单累计 TradeFee；仅首次入账整笔带上，避免同一单再拆 */
+  fee: number;
+};
+
+export type FillApplyPlan = {
+  complete: boolean;
+  remainder: boolean;
+  fillKind: FillKindLabel;
+  book: FillBookPlan | null;
+  reason: string;
+};
+
+export function isFillCatchUpActive(params: {
+  now: number;
+  lastCancelAttemptAt?: Date | null;
+  catchUpMs?: number;
+}): boolean {
+  const last = params.lastCancelAttemptAt?.getTime() ?? 0;
+  if (!(last > 0)) return false;
+  return params.now - last <= (params.catchUpMs ?? FILL_CATCH_UP_MS);
+}
+
+/**
+ * 查单汇总怎么写入原记录：部成等撤余；撤过或查单终态则按累计整笔覆盖，不切片。
+ */
+export function planFillFromQuery(params: {
+  fill: FillSnapshot;
+  finalFill?: boolean;
+  forceSettle?: boolean;
+  orderAmt: number;
+  looksClose: boolean;
+  watermark: number;
+}): FillApplyPlan {
+  const totalFilled = Number(params.fill.filledAmt) || 0;
+  const totalAvg = Number(params.fill.priceAvg) || 0;
+  const totalFee = Number(params.fill.tradeFee) || 0;
+  const recordedGuess = Math.max(params.watermark, totalFilled);
+  const complete =
+    !!params.forceSettle ||
+    !!params.finalFill ||
+    isOrderFillComplete({
+      fill: params.fill,
+      orderAmt: params.orderAmt,
+      recordedFilled: recordedGuess,
+    });
+  const remainder = hasLiveRemainder({
+    fill: params.fill,
+    orderAmt: params.orderAmt,
+    recordedFilled: recordedGuess,
+  });
+  const fillKind: FillKindLabel = complete
+    ? totalFilled > FILL_EPS
+      ? 'FULL'
+      : 'NONE'
+    : totalFilled > FILL_EPS
+      ? 'PARTIAL'
+      : 'NONE';
+
+  if (!complete) {
+    return {
+      complete: false,
+      remainder,
+      fillKind,
+      book: null,
+      reason: remainder ? 'partial-wait-cancel' : 'snapshot',
+    };
+  }
+
+  return {
+    complete: true,
+    remainder: false,
+    fillKind,
+    book: {
+      qty: totalFilled,
+      avg: totalAvg,
+      fee: totalFee,
+    },
+    reason: params.watermark > FILL_EPS ? 'log-overwrite' : params.looksClose ? 'close-cumulative' : 'open-cumulative',
+  };
+}
+
+/** 持仓列表：按同一订单号终态，与仓位是否减完无关。 */
+export function closeKindFromFillLog(log?: {
+  fillKind?: string | null;
+  status?: string | null;
+  filledAmt?: unknown;
+} | null): 'FULL' | 'PARTIAL' {
+  if (!log) return 'FULL';
+  if (String(log.fillKind || '').toUpperCase() === 'FULL') return 'FULL';
+  const st = String(log.status || '').toUpperCase();
+  if (st === 'FILLED' || st === 'CANCELLED') return 'FULL';
+  if (st === 'PLACED' || st === 'CANCEL_FAILED') {
+    return Number(log.filledAmt) > FILL_EPS ? 'PARTIAL' : 'FULL';
+  }
+  return String(log.fillKind || '').toUpperCase() === 'PARTIAL' ? 'PARTIAL' : 'FULL';
 }

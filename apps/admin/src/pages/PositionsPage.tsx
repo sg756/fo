@@ -94,10 +94,10 @@ function closedKindBadge(r: {
     };
   }
   if (r.closeKind === 'PARTIAL') {
-    return { text: '部分平仓', bg: '#2563eb', title: '本次平仓后仍有剩余持仓' };
+    return { text: '部分成交', bg: '#2563eb', title: '同一订单号尚未完全成交，撤余后再查单累计' };
   }
   if (r.closeKind === 'FULL') {
-    return { text: '全平', bg: '#15803d', title: '本次平仓后整仓清零' };
+    return { text: '完全成交', bg: '#15803d', title: '该订单号已完全成交或撤余结束，按查单累计记账' };
   }
   return { text: '正常平仓', bg: '#15803d' };
 }
@@ -145,7 +145,7 @@ export function PositionsPage() {
     loading?: boolean;
     error?: string | null;
   } | null>(null);
-  /** 已平仓子筛：全部 / 部分平 / 全平 / 死仓删除 */
+  /** 已平仓子筛：全部 / 部分成交 / 完全成交 / 死仓删除 */
   const [closedKind, setClosedKind] = useState<'all' | 'partial' | 'full' | 'discard'>('all');
   const pager = usePager(20);
   const loadInflight = useRef(false);
@@ -390,7 +390,7 @@ export function PositionsPage() {
         parts.length
           ? `已提交对齐（不堵当前页）：${parts.join('，')}。按代理每 5 秒打 1 人，稍后刷新列表。`
           : res.noOpen
-            ? '没有可对齐的本地 OPEN 合约仓'
+            ? '没有可对齐的本地未平仓合约'
             : '没有新的对齐任务',
         parts.length ? 'ok' : 'info',
       );
@@ -627,8 +627,8 @@ export function PositionsPage() {
               title="默认不含死仓，选「死仓删除」才查"
             >
               <option value="all">全部平仓类型</option>
-              <option value="partial">部分平仓</option>
-              <option value="full">全平</option>
+              <option value="partial">部分成交</option>
+              <option value="full">完全成交</option>
               <option value="discard">死仓删除</option>
             </select>
           ) : null}
@@ -646,7 +646,7 @@ export function PositionsPage() {
               className="ghost"
               onClick={() => void enqueueAlign()}
               disabled={aligning || loading}
-              title="加入对齐队列，由独立线程按代理串行查询 QueryPosition，不堵当前页"
+              title="加入对齐队列，由独立线程按代理串行查询交易所持仓，不堵当前页"
             >
               {aligning
                 ? '入队中…'
@@ -705,10 +705,7 @@ export function PositionsPage() {
               </span>
             </span>
             <span className="hint" style={{ margin: 0 }}>
-              {pnlStats.scope === 'page'
-                ? `本页计入 ${pnlStats.counted} 笔，共 ${pnlStats.total} 笔`
-                : `计入 ${pnlStats.counted} / ${pnlStats.total} 笔`}
-              {isClosed ? '' : pnlStats.scope === 'page' ? '' : '（当前筛选结果）'}
+              {`计入 ${pnlStats.counted} / ${pnlStats.total} 笔（当前筛选全部）`}
             </span>
           </div>
         ) : null}
@@ -762,7 +759,7 @@ export function PositionsPage() {
                   <th style={{ width: 100 }}>已实现盈亏</th>
                   <th
                     style={{ width: 110 }}
-                    title="开仓分摊 + 平仓 TradeFee；负数为支付。旧记录没有入库时按平仓查单手续费分摊"
+                    title="完全成交：该订单号查单累计 TradeFee。部分成交：按已成切片。负数为支付。"
                   >
                     手续费
                   </th>

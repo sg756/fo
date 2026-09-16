@@ -6,6 +6,7 @@ import { IpPoolModule } from '../ippool/ippool.module';
 import { MapiClient } from './mapi.client';
 import { SymbolService } from './symbol.service';
 import { TradeService } from './trade.service';
+import { ExchangeFeeService } from './exchange-fee.service';
 import { TradeAdminController, TradeController } from './trade.controller';
 import { FollowerWorker } from './follower.worker';
 import { QueryPositionWorker } from './query-position.worker';
@@ -17,6 +18,7 @@ import { QueryPositionWorker } from './query-position.worker';
     AuditService,
     MapiClient,
     SymbolService,
+    ExchangeFeeService,
     TradeService,
     FollowerWorker,
     QueryPositionWorker,

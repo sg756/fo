@@ -101,7 +101,7 @@ export class QueryPositionWorker implements OnModuleInit, OnModuleDestroy {
       create: {
         key: CFG_INTERVAL_MIN,
         value: String(v),
-        remark: 'QueryPosition 持仓对齐间隔(分钟)，最少 2',
+        remark: '交易所持仓对齐间隔(分钟)，最少 2',
       },
       update: { value: String(v) },
     });

@@ -96,7 +96,7 @@ export function resolveVisitedTab(pathname: string): { path: string; label: stri
   return null;
 }
 
-export type VisitedTab = { path: string; label: string };
+export type VisitedTab = { path: string; label: string; search?: string };
 
 export function defaultVisitedTabs(): VisitedTab[] {
   return [{ path: HOME_PATH, label: HOME_LABEL }];

@@ -171,14 +171,14 @@ export function mapDocStatus(
   status: string | number,
 ): 'open' | 'partial' | 'filled' | 'cancelled' | 'unknown' {
   const s = String(status).trim();
+  if (s === '2' || s === '完全成交') return 'filled';
+  if (s === '1' || s === '部分成交') return 'partial';
   switch (s) {
-    case '2':
-      return 'filled';
-    case '1':
-      return 'partial';
     case '0':
+    case '未成交':
       return 'open';
     case '-1':
+    case '已撤销':
       return 'cancelled';
     case '99':
     case '':

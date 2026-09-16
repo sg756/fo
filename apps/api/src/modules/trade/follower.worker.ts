@@ -5,7 +5,7 @@ import { formatTradeError, extractPlaceOrderId } from '../../common/trade-error'
 import { TradeService } from './trade.service';
 import { MapiClient } from './mapi.client';
 import { fromApiCode, accountTypeFromEqualCoin } from './exchange-codes';
-import { canAttemptRemainderCancel, isQueryFillUsable } from './order-fill.util';
+import { FILL_CATCH_UP_MS, isQueryFillUsable } from './order-fill.util';
 
 const CFG_SIGNAL_TIMEOUT = 'signal_timeout_seconds'; // 旧：秒
 const CFG_SIGNAL_TIMEOUT_MS = 'signal_timeout_ms'; // 新：毫秒
@@ -746,10 +746,18 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
    * 同一 orderId 串行。99/空串不记账不撤单。
    */
   async syncPlacedOrderFills() {
+    const catchUpAfter = new Date(Date.now() - FILL_CATCH_UP_MS);
     const rows = await this.prisma.signalFollowLog.findMany({
       where: {
-        status: { in: ['PLACED', 'CANCEL_FAILED'] },
         orderId: { not: null },
+        OR: [
+          { status: { in: ['PLACED', 'CANCEL_FAILED'] } },
+          {
+            status: { in: ['FILLED', 'CANCELLED'] },
+            remainderCancelStartedAt: { not: null },
+            lastCancelAttemptAt: { gte: catchUpAfter },
+          },
+        ],
       },
       take: 80,
       orderBy: { createdAt: 'asc' },
@@ -796,6 +804,8 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
     remainderCancelStartedAt: Date | null;
     lastCancelAttemptAt: Date | null;
     cancelAttemptCount: number;
+    status: string;
+    orderType?: string | null;
     user: { email: string };
   }): Promise<'filled' | 'cancelled' | 'open'> {
     let meta: any = {};
@@ -816,47 +826,48 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       positionSide: row.positionSide || meta.positionSide || undefined,
       placedAt: row.createdAt,
       isOpen,
+      orderType: row.orderType || meta.orderType || undefined,
     };
 
     const queryOnce = async () =>
       this.trade.inspectOrderFill(row.userId, row.exchange, row.orderId!, inspectOpts);
 
-    const apply = async (fill: Awaited<ReturnType<TradeService['inspectOrderFill']>>) => {
+    const apply = async (
+      fill: Awaited<ReturnType<TradeService['inspectOrderFill']>>,
+      opts?: { forceSettle?: boolean; logOnly?: boolean },
+    ) => {
       const fresh = await this.prisma.signalFollowLog.findUnique({ where: { id: row.id } });
       if (!fresh) return { booked: false, complete: false, remainder: false, delta: 0, recorded: false };
-      return this.trade.applyFillFromQuery(fresh, fill);
+      return this.trade.applyFillFromQuery(fresh, fill, opts);
+    };
+
+    const finish = (
+      fill: Awaited<ReturnType<TradeService['inspectOrderFill']>>,
+      complete: boolean,
+    ): 'filled' | 'cancelled' | 'open' => {
+      if (!complete) return 'open';
+      return fill.state === 'cancelled' ? 'cancelled' : 'filled';
     };
 
     let fill = await queryOnce();
     if (!isQueryFillUsable(fill)) return 'open';
 
-    let applied = await apply(fill);
-    if (applied.complete) {
-      return fill.state === 'cancelled' ? 'cancelled' : 'filled';
+    const alreadySettled = row.status === 'FILLED' || row.status === 'CANCELLED';
+    if (alreadySettled) {
+      const applied = await apply(fill, { logOnly: true });
+      return finish(fill, applied.complete);
     }
-    if (!applied.remainder) return 'open';
 
-    const now = Date.now();
-    const attempt = canAttemptRemainderCancel({
-      now,
-      startedAt: row.remainderCancelStartedAt,
-      lastAttemptAt: row.lastCancelAttemptAt,
-    });
-    if (attempt.giveUp) {
-      await this.prisma.signalFollowLog.update({
-        where: { id: row.id },
-        data: {
-          abnormalKind: 'BUSINESS',
-          abnormalAt: new Date(),
-          abnormalMsg: '部成撤余超过10分钟仍未完成，停止自动撤单，继续查单',
-        },
-      });
-      this.logger.warn(
-        `部成撤余放弃 user=${row.user.email} orderId=${row.orderId}`,
-      );
-      return 'open';
+    const alreadyTriedCancel =
+      row.cancelAttemptCount > 0 || !!row.remainderCancelStartedAt;
+    if (alreadyTriedCancel) {
+      const applied = await apply(fill, { forceSettle: true });
+      return finish(fill, applied.complete);
     }
-    if (!attempt.allowed) return 'open';
+
+    let applied = await apply(fill);
+    if (applied.complete) return finish(fill, true);
+    if (!applied.remainder) return 'open';
 
     await this.prisma.signalFollowLog.update({
       where: { id: row.id },
@@ -889,11 +900,8 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
 
     fill = await queryOnce();
     if (!isQueryFillUsable(fill)) return 'open';
-    applied = await apply(fill);
-    if (applied.complete) {
-      return fill.state === 'cancelled' ? 'cancelled' : 'filled';
-    }
-    return 'open';
+    applied = await apply(fill, { forceSettle: true });
+    return finish(fill, applied.complete);
   }
 
   /** 到期未成交的挂单 → CancelOrder → 写入撤单记录 (成功 CANCELLED / 失败 CANCEL_FAILED) */

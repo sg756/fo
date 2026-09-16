@@ -427,7 +427,29 @@ th { color: var(--muted); font-weight: 600; }
   display: flex;
   flex-direction: column;
 }
-.main:has(.page-list) {
+.main:has(.page-list),
+.main:has(.keep-alive-pane.active .page-list) {
+  overflow: hidden;
+}
+
+.keep-alive-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.keep-alive-pane {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  overflow: auto;
+}
+.keep-alive-pane.active {
+  display: flex;
+}
+.keep-alive-pane.active:has(.page-list) {
   overflow: hidden;
 }
 
@@ -886,7 +908,8 @@ th { color: var(--muted); font-weight: 600; }
 }
 
 /* 佣金页：允许标题气泡溢出，不被 page-list / main 裁切 */
-.main:has(.commission-page) {
+.main:has(.commission-page),
+.main:has(.keep-alive-pane.active .commission-page) {
   overflow: auto;
 }
 .commission-page.page-list {
