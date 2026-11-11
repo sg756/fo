@@ -1,9 +1,10 @@
-import { EXCHANGES } from '../api/exchanges';
+import { exchangeName } from '../api/exchanges';
 import type { TradePosition } from '../api/endpoints';
+import { positionProductLabel } from './positionQuote';
 
 export function exchangeLabel(code: string) {
   const c = String(code || '').trim().toUpperCase();
-  return EXCHANGES.find((e) => e.exchange === c)?.name || c || '—';
+  return c ? exchangeName(c) : '—';
 }
 
 export function exchangesInPositions(items: TradePosition[]) {
@@ -21,7 +22,7 @@ export function exchangesInPositions(items: TradePosition[]) {
 export function matchPositionCoin(p: TradePosition, q: string) {
   const s = q.trim().toLowerCase();
   if (!s) return true;
-  const hay = [p.coinName, p.pair, p.symbol, p.equalCoinName]
+  const hay = [p.coinName, p.pair, p.symbol, p.equalCoinName, p.apiCode, positionProductLabel(p)]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();

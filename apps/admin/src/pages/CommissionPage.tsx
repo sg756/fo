@@ -3,6 +3,7 @@ import { AdminApi } from '../api';
 import { confirmDialog } from '../components/ConfirmDialog';
 import { Pagination } from '../components/Pagination';
 import { usePager } from '../hooks/usePager';
+import { EXCHANGES } from '../exchanges';
 
 /** 改为 true 可重新显示「已实现盈亏公式试算」 */
 const SHOW_PNL_PREVIEW = false;
@@ -368,7 +369,7 @@ export function CommissionPage() {
         <div className="row">
           <label>交易所</label>
           <select value={mpExchange} onChange={(e) => setMpExchange(e.target.value)}>
-            {['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'].map((x) => (
+            {EXCHANGES.map((x) => (
               <option key={x} value={x}>
                 {x}
               </option>

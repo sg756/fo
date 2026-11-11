@@ -150,6 +150,7 @@ DEPOSIT_MIN_AMOUNT=10
 # CHAIN_ARB_RPC=https://arb1.arbitrum.io/rpc
 # CHAIN_BASE_RPC=https://mainnet.base.org
 # CHAIN_ETH_RPC=https://ethereum.publicnode.com
+# CHAIN_BSC_RPC=https://rpc-bnb.blockmachine.io
 
 # ===== 初始平台管理员 (seed) =====
 ADMIN_EMAIL="admin"

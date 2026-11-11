@@ -231,6 +231,8 @@ function Publish-ReleaseBundle {
   $apiPkg = Join-Path $SourceRoot "apps\api\package.json"
   $apiLock = Join-Path $SourceRoot "apps\api\package-lock.json"
   $apiPrisma = Join-Path $SourceRoot "apps\api\prisma"
+  $apiFixUserNo = Join-Path $SourceRoot "apps\api\scripts\fix-user-no.js"
+  $apiPosKey = Join-Path $SourceRoot "apps\api\scripts\backfill-position-api-code.js"
 
   $adminDst = Join-Path $OutDir "apps\admin\dist"
   $apiDst = Join-Path $OutDir "apps\api"
@@ -250,18 +252,32 @@ function Publish-ReleaseBundle {
   } else {
     Write-Error "缺少 apps\api\prisma"
   }
+  if (-not (Test-Path -LiteralPath $apiFixUserNo)) {
+    Write-Error "缺少 apps\api\scripts\fix-user-no.js（服务器 PRISMA_MODE=push 时 apply-dist 会执行它）"
+  }
+  if (-not (Test-Path -LiteralPath $apiPosKey)) {
+    Write-Error "缺少 apps\api\scripts\backfill-position-api-code.js（服务器 PRISMA_MODE=push 时 apply-dist 会执行它）"
+  }
+  $apiScriptsDst = Join-Path $apiDst "scripts"
+  New-Item -ItemType Directory -Path $apiScriptsDst -Force | Out-Null
+  Copy-Item -Path $apiFixUserNo -Destination (Join-Path $apiScriptsDst "fix-user-no.js") -Force
+  Copy-Item -Path $apiPosKey -Destination (Join-Path $apiScriptsDst "backfill-position-api-code.js") -Force
 
   $okAdmin = Test-Path (Join-Path $adminDst "index.html")
   $okApi = Test-Path (Join-Path $apiDst "dist\main.js")
   $okLock = Test-Path (Join-Path $apiDst "package-lock.json")
-  if (-not $okAdmin -or -not $okApi -or -not $okLock) {
-    Write-Error "发布包校验失败（需 admin/dist/index.html、api/dist/main.js、api/package-lock.json）"
+  $okFixUserNo = Test-Path (Join-Path $apiDst "scripts\fix-user-no.js")
+  $okPosKey = Test-Path (Join-Path $apiDst "scripts\backfill-position-api-code.js")
+  if (-not $okAdmin -or -not $okApi -or -not $okLock -or -not $okFixUserNo -or -not $okPosKey) {
+    Write-Error "发布包校验失败（需 admin/dist/index.html、api/dist/main.js、api/package-lock.json、api/scripts/fix-user-no.js、api/scripts/backfill-position-api-code.js）"
   }
 
   Write-Host "    已生成:"
   Write-Host "      apps\admin\dist\"
   Write-Host "      apps\api\dist\"
   Write-Host "      apps\api\package.json / package-lock.json / prisma\"
+  Write-Host "      apps\api\scripts\fix-user-no.js"
+  Write-Host "      apps\api\scripts\backfill-position-api-code.js"
   Write-Host "    （含 prisma/seed.js；服务器 apply-dist 会自动 seed）"
   Write-Host "    （不打包 .env / .env.dev；服务器密钥由 install-env/configure.sh 写 .env）"
   Write-Host "    上传方式：把「$OutDir 目录内的内容」覆盖到服务器 APP_ROOT（不要传 node_modules）"
@@ -339,7 +355,12 @@ if (-not (Test-Path (Join-Path $ApiDir "dist\main.js"))) {
 Write-Host "==> 数据库同步 (PRISMA_MODE=$PrismaMode)"
 switch ($PrismaMode) {
   "deploy" { npx prisma migrate deploy; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
-  "push"   { npx prisma db push; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
+  "push"   {
+    node scripts/backfill-position-api-code.js
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    npx prisma db push
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
   default  { Write-Host "    跳过 Prisma（生产库请在 Linux 用 scripts/install-env/apply-dist.sh 同步）" }
 }
 

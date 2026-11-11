@@ -49,6 +49,20 @@ const p = new PrismaClient();
     console.log('user_no already NOT NULL AUTO_INCREMENT');
   }
 
+  const addrTable = await p.$queryRawUnsafe(
+    `SELECT COUNT(*) AS c FROM information_schema.TABLES
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'collection_addresses'`,
+  );
+  if (Number(addrTable[0].c) > 0) {
+    const removed = await p.$executeRawUnsafe(
+      `DELETE t1 FROM collection_addresses t1
+       INNER JOIN collection_addresses t2
+         ON t1.address = t2.address
+        AND (t1.createdAt > t2.createdAt OR (t1.createdAt = t2.createdAt AND t1.id > t2.id))`,
+    );
+    console.log(`collection_addresses 重复地址已去掉 ${Number(removed) || 0} 行`);
+  }
+
   await p.$disconnect();
 })().catch(async (e) => {
   console.error(e);

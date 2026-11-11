@@ -33,6 +33,7 @@ const AUDIT_ACTION_LABELS: Record<string, string> = {
   DEPOSIT_CREDIT: '充值入账',
   DEPOSIT_SIMULATE: '模拟充值',
   COLLECTION_CONFIG_UPDATE: '更新归集配置',
+  COLLECTION_AUTO_SET: '自动归集开关',
   COLLECTION_ADDRESS_ADD: '添加归集地址',
   COLLECTION_ADDRESS_UPDATE: '更新归集地址',
   COLLECTION_ADDRESS_DELETE: '删除归集地址',

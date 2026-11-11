@@ -264,7 +264,7 @@ export function UserListPage() {
                       >
                         禁用
                       </button>
-                    ) : u.status === 'DISABLED' ? (
+                    ) : u.status === 'DISABLED' || u.status === 'REJECTED' ? (
                       <button
                         className="ghost"
                         disabled={busy === u.id}

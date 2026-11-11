@@ -32,7 +32,7 @@ export function OrderDetailScreen() {
         ]
       : [
           ['类型', item.kindLabel || (item.isOpen === false ? '平仓' : item.isOpen ? '开仓' : '操作')],
-          ['状态', item.statusLabel || (item.success ? '跟单成功' : '跟单失败')],
+          ['状态', item.statusLabel || (item.success ? '合约成功' : '合约失败')],
           ['交易对', item.pair],
           ['方向', sideText(item.positionSide)],
           ['交易所', item.exchange],

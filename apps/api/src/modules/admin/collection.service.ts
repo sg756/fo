@@ -9,6 +9,7 @@ import {
   getEnabledDepositChains,
   getPrimaryChain,
   depositNetworkOptions,
+  isNativeGasSymbol,
 } from '../deposit/chain.config';
 
 /**
@@ -61,6 +62,8 @@ export class CollectionService {
     funded: number;
     failed: number;
     skipped: number;
+    /** 余额没查到、这次没打出的地址数 */
+    unqueried: number;
     remaining: number;
     startedAt: number | null;
     finishedAt: number | null;
@@ -84,6 +87,7 @@ export class CollectionService {
     funded: 0,
     failed: 0,
     skipped: 0,
+    unqueried: 0,
     remaining: 0,
     startedAt: null,
     finishedAt: null,
@@ -97,6 +101,33 @@ export class CollectionService {
   ) {}
 
   private static readonly CFG_GAS_FEE_TIER = 'gas_fund_fee_tier';
+  private static readonly CFG_COLLECTION_AUTO = 'collection_auto';
+
+  /** 后台开关优先；没配过时才看环境变量 COLLECTION_ENABLED */
+  async isAutoCollectEnabled(): Promise<boolean> {
+    const row = await this.prisma.systemConfig.findUnique({
+      where: { key: CollectionService.CFG_COLLECTION_AUTO },
+    });
+    if (row && String(row.value ?? '').trim() !== '') {
+      const v = String(row.value).trim().toLowerCase();
+      return v === 'true' || v === '1' || v === 'yes';
+    }
+    return (process.env.COLLECTION_ENABLED || 'false').toLowerCase() === 'true';
+  }
+
+  async setCollectionAuto(enabled: boolean) {
+    const value = enabled ? 'true' : 'false';
+    await this.prisma.systemConfig.upsert({
+      where: { key: CollectionService.CFG_COLLECTION_AUTO },
+      create: {
+        key: CollectionService.CFG_COLLECTION_AUTO,
+        value,
+        remark: '后台自动归集。打开后每 10 分钟归集已开通的链，不自动补 Gas',
+      },
+      update: { value },
+    });
+    return { collectionAuto: enabled };
+  }
 
   async getGasFeeTier(): Promise<GasFeeTier> {
     const row = await this.prisma.systemConfig.findUnique({
@@ -119,20 +150,23 @@ export class CollectionService {
     return { gasFeeTier: tier };
   }
 
-  /** 标准/快 两档单笔 native 转账预估 ETH（gasLimit × 档位 gasPrice × 1.2） */
+  /** 标准/快 两档单笔 native 转账预估（gasLimit × 档位 gasPrice × 1.2）。链上暂时查不到时不抛错。 */
   async getGasFeeTierPreview(chainInput?: string) {
     const chain = chainInput ? this.payout.resolveChain(chainInput) : getPrimaryChain();
-    const tiers = await this.payout.previewNativeTransferFees(chain);
-    return {
-      chain,
-      gasLimit: Number(this.payout.nativeTransferGasLimit(chain)),
-      bufferPct: 20,
-      tiers,
-    };
-  }
-
-  private cronEnabled() {
-    return (process.env.COLLECTION_ENABLED || 'false').toLowerCase() === 'true';
+    const gasLimit = Number(this.payout.nativeTransferGasLimit(chain));
+    try {
+      const tiers = await this.payout.previewNativeTransferFees(chain);
+      return { chain, gasLimit, bufferPct: 20, tiers };
+    } catch (e: any) {
+      this.logger.warn(`Gas 档位预估失败 ${chain}: ${e?.message || e}`);
+      return {
+        chain,
+        gasLimit,
+        bufferPct: 20,
+        tiers: null,
+        message: '链上价格暂时查不到',
+      };
+    }
   }
 
   private jobSnapshot() {
@@ -169,6 +203,7 @@ export class CollectionService {
       funded: 0,
       failed: 0,
       skipped: 0,
+      unqueried: 0,
       remaining: 0,
       startedAt: Date.now(),
       finishedAt: null,
@@ -233,7 +268,7 @@ export class CollectionService {
 
   @Cron(CronExpression.EVERY_10_MINUTES)
   async cronCollect() {
-    if (!this.cronEnabled()) return;
+    if (!(await this.isAutoCollectEnabled())) return;
     try {
       await this.runAll();
     } catch (e: any) {
@@ -256,12 +291,29 @@ export class CollectionService {
   }
 
   private async runAllUnlocked() {
-    const configs = await this.prisma.collectionConfig.findMany({ where: { active: true } });
-    const results: any[] = [];
-    for (const c of configs) {
-      results.push(await this.runForChainUnlocked(c.chain));
+    const chains = getEnabledDepositChains();
+    const base = { scanned: 0, sent: 0, failed: 0, skipped: 0, queued: 0, totalWallets: 0 };
+    const notes: string[] = [];
+    for (const chain of chains) {
+      this.collectJob.chain = chain;
+      try {
+        const res = await this.runForChainUnlocked(chain, base);
+        base.scanned += Number(res.scanned || 0);
+        base.sent += Number(res.sent || 0);
+        base.failed += Number(res.failed || 0);
+        base.skipped += Number(res.skipped || 0);
+        base.queued += Number(res.queued || 0);
+        base.totalWallets += Number(res.totalWallets || 0);
+        if (res.ok === false && res.message) notes.push(`${chain}: ${res.message}`);
+      } catch (e: any) {
+        const msg = e?.message || '归集异常';
+        this.logger.warn(`[${chain}] 归集中断，继续下一条链: ${msg}`);
+        notes.push(`${chain}: ${msg}`);
+      }
     }
-    return { ok: true, results };
+    const message = notes.length ? notes.join('；') : undefined;
+    if (message) this.collectJob.message = message;
+    return { ok: notes.length === 0 || base.sent > 0, ...base, message };
   }
 
   /**
@@ -279,29 +331,73 @@ export class CollectionService {
     const skip = params.skip ?? 0;
     const take = Math.min(params.take ?? 50, 100);
     const filter = (params.filter || '').trim();
+    const enabled = getEnabledDepositChains();
+    const walletInclude = {
+      user: { select: { id: true, email: true, nickname: true, userNo: true } },
+    } as const;
 
-    const where: any = {};
-    if (chain) where.chain = chain;
-    if (params.q) where.user = { email: { contains: params.q } };
+    let rows: any[] = [];
+    let totalAll = 0;
+    let addressOrder: string[] = [];
+    await this.ensureSharedChainConfigs();
+    const allConfigs = await this.prisma.collectionConfig.findMany();
+    const sharedTarget = this.sharedTargetAddress(allConfigs);
 
-    const [rows, totalAll, allConfigs] = await Promise.all([
-      this.prisma.wallet.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        // 筛选需扫余额，先多取再内存过滤；无筛选则分页
-        skip: filter ? 0 : skip,
-        take: filter ? 500 : take,
-        include: {
-          user: { select: { id: true, email: true, nickname: true, userNo: true } },
-        },
-      }),
-      this.prisma.wallet.count({ where }),
-      this.prisma.collectionConfig.findMany(),
-    ]);
+    if (!chain) {
+      const addrWhere: any = { chain: { in: enabled } };
+      if (params.q) addrWhere.user = { email: { contains: params.q } };
+      if (!filter) {
+        const grouped = await this.prisma.wallet.groupBy({
+          by: ['address'],
+          where: addrWhere,
+          _max: { createdAt: true },
+        });
+        grouped.sort((a, b) => {
+          const ta = a._max.createdAt ? new Date(a._max.createdAt).getTime() : 0;
+          const tb = b._max.createdAt ? new Date(b._max.createdAt).getTime() : 0;
+          return tb - ta;
+        });
+        totalAll = grouped.length;
+        addressOrder = grouped.slice(skip, skip + take).map((g) => g.address);
+        rows = addressOrder.length
+          ? await this.prisma.wallet.findMany({
+              where: { address: { in: addressOrder }, chain: { in: enabled } },
+              include: walletInclude,
+            })
+          : [];
+      } else {
+        rows = await this.prisma.wallet.findMany({
+          where: addrWhere,
+          orderBy: { createdAt: 'desc' },
+          take: 500,
+          include: walletInclude,
+        });
+      }
+    } else {
+      const where: any = { chain };
+      if (params.q) where.user = { email: { contains: params.q } };
+      const [found, counted] = await Promise.all([
+        this.prisma.wallet.findMany({
+          where,
+          orderBy: { createdAt: 'desc' },
+          skip: filter ? 0 : skip,
+          take: filter ? 500 : take,
+          include: walletInclude,
+        }),
+        this.prisma.wallet.count({ where }),
+      ]);
+      rows = found;
+      totalAll = counted;
+    }
 
-    const configByChain = new Map(
-      allConfigs.map((c) => [this.payout.resolveChain(c.chain), c] as const),
-    );
+    const configByChain = new Map<DepositChain, (typeof allConfigs)[number]>();
+    for (const cfg of allConfigs) {
+      const key = this.payout.resolveChain(cfg.chain);
+      const prev = configByChain.get(key);
+      if (!prev || (!this.validTargetAddress(prev.targetAddress) && this.validTargetAddress(cfg.targetAddress))) {
+        configByChain.set(key, cfg);
+      }
+    }
     const filterConfig = chain ? configByChain.get(chain) : null;
 
     const addrsByChain = new Map<DepositChain, string[]>();
@@ -325,7 +421,7 @@ export class CollectionService {
       const c = this.payout.resolveChain(w.chain);
       const config = configByChain.get(c) || null;
       const threshold = Number(config?.threshold ?? 0);
-      const targetAddress = config?.targetAddress || null;
+      const targetAddress = this.validTargetAddress(config?.targetAddress) || sharedTarget;
       const bal = balByChain.get(c)?.get(getAddress(w.address));
       if (
         bal?.ok &&
@@ -382,7 +478,7 @@ export class CollectionService {
       const c = this.payout.resolveChain(w.chain);
       const config = configByChain.get(c) || null;
       const threshold = Number(config?.threshold ?? 0);
-      const targetAddress = config?.targetAddress || null;
+      const targetAddress = this.validTargetAddress(config?.targetAddress) || sharedTarget;
       const addr = isAddress(w.address) ? getAddress(w.address) : w.address;
       const bal = balByChain.get(c)?.get(addr);
       const est = estMap.get(`${c}:${addr}`);
@@ -396,14 +492,14 @@ export class CollectionService {
       let gasPriceGwei = 0;
       let collectable = false;
       let needGas = false;
-      let skipReason: string | null = `未配置 ${c} 归集目标地址`;
+      let skipReason: string | null = '未配置归集目标地址';
       let balanceError: string | null = null;
 
       if (!bal || !bal.ok) {
         balanceError = '查询余额失败';
         skipReason = balanceError;
       } else if (!targetAddress || !isAddress(targetAddress)) {
-        skipReason = !targetAddress ? `未配置 ${c} 归集目标地址` : `${c} 目标地址无效`;
+        skipReason = !targetAddress ? '未配置归集目标地址' : '归集目标地址无效';
       } else {
         const gp = gasPriceByChain.get(c) || est?.gasPrice || 0n;
         const screenNeed =
@@ -415,6 +511,7 @@ export class CollectionService {
           requiredGas: Math.max(est?.requiredNative || 0, screenNeed),
           gasLimit: est?.gasLimit?.toString() || '100000',
           gasPriceGwei: est ? Number(formatUnits(est.gasPrice, 9)) : 0,
+          nativeSymbol: this.payout.nativeSymbol(c),
         });
         usdt = check.usdt;
         native = check.native;
@@ -455,19 +552,49 @@ export class CollectionService {
       });
     }
 
-    let filtered = items;
-    if (filter === 'needGas') filtered = items.filter((i) => i.needGas);
-    else if (filter === 'collectable') filtered = items.filter((i) => i.collectable);
-
+    const view = chain ? items : this.collapseCustodialByAddress(items, addressOrder);
+    const matchFilter = (row: any) => {
+      if (row.byChain) {
+        const cells = Object.values(row.byChain) as any[];
+        if (filter === 'needGas') return cells.some((c) => c?.needGas);
+        if (filter === 'collectable') return cells.some((c) => c?.collectable);
+        return true;
+      }
+      if (filter === 'needGas') return !!row.needGas;
+      if (filter === 'collectable') return !!row.collectable;
+      return true;
+    };
+    const filtered = filter ? view.filter(matchFilter) : view;
     const pageItems = filter ? filtered.slice(skip, skip + take) : filtered;
     const total = filter ? filtered.length : totalAll;
 
-    const needGasRows = items.filter((i) => i.needGas);
+    const flatForSummary = chain ? items : items;
+    const needGasRows = flatForSummary.filter((i) => i.needGas);
+    const byChainSummary: Record<string, { needGasRequiredSum: number; needGasFundSuggestSum: number; nativeSymbol: string }> = {};
+    for (const row of needGasRows) {
+      const c = String(row.chain || '').toUpperCase();
+      if (!c) continue;
+      const slot = byChainSummary[c] || {
+        needGasRequiredSum: 0,
+        needGasFundSuggestSum: 0,
+        nativeSymbol: row.nativeSymbol || (c === 'BSC' ? 'BNB' : 'ETH'),
+      };
+      slot.needGasRequiredSum += Number(row.requiredGas || 0);
+      slot.needGasFundSuggestSum += Number(row.fundSuggest || 0);
+      byChainSummary[c] = slot;
+    }
     const listThreshold = Number(filterConfig?.threshold ?? 0);
+    const summaryRows = chain ? items : filter ? filtered : view;
+    const collapsedCount = (pred: (cells: any[]) => boolean) =>
+      summaryRows.filter((row) => {
+        if (!row.byChain) return pred([row]);
+        return pred(Object.values(row.byChain) as any[]);
+      }).length;
     return {
       items: pageItems,
       total,
       chain: chain || null,
+      chains: chain ? [chain] : enabled,
       threshold: listThreshold,
       targetAddress: filterConfig?.targetAddress || null,
       configs: allConfigs.map((c) => ({
@@ -479,17 +606,45 @@ export class CollectionService {
         active: c.active,
       })),
       summary: {
-        collectable: items.filter((i) => i.collectable).length,
-        needGas: needGasRows.length,
-        belowThreshold: items.filter((i) => i.usdt < Number(i.threshold)).length,
-        /** 缺 Gas 地址的预估需 Gas 合计 */
+        collectable: chain
+          ? items.filter((i) => i.collectable).length
+          : collapsedCount((cells) => cells.some((c) => c?.collectable)),
+        needGas: chain ? needGasRows.length : collapsedCount((cells) => cells.some((c) => c?.needGas)),
+        belowThreshold: chain
+          ? items.filter((i) => i.usdt < Number(i.threshold)).length
+          : collapsedCount((cells) => cells.length > 0 && cells.every((c) => Number(c?.usdt || 0) < Number(c?.threshold || 0))),
         needGasRequiredSum: needGasRows.reduce((s, i) => s + Number(i.requiredGas || 0), 0),
-        /** 缺 Gas 地址的缺口合计（需 − 现有） */
         needGasDeficitSum: needGasRows.reduce((s, i) => s + Number(i.gasDeficit || 0), 0),
-        /** 批量补 Gas 建议合计（与补给逻辑同口径） */
         needGasFundSuggestSum: needGasRows.reduce((s, i) => s + Number(i.fundSuggest || 0), 0),
+        byChain: byChainSummary,
       },
     };
+  }
+
+  /** 同一 0x 在多条链上各有一行，列表合成一行，按链放余额和是否要补 Gas */
+  private collapseCustodialByAddress(items: any[], addressOrder: string[]) {
+    const map = new Map<string, any>();
+    for (const row of items) {
+      const key = String(row.address || '').toLowerCase();
+      if (!key) continue;
+      let hit = map.get(key);
+      if (!hit) {
+        hit = {
+          address: row.address,
+          email: row.email,
+          nickname: row.nickname,
+          userNo: row.userNo,
+          userId: row.userId,
+          byChain: {} as Record<string, any>,
+        };
+        map.set(key, hit);
+      }
+      hit.byChain[String(row.chain || '').toUpperCase()] = row;
+    }
+    if (!addressOrder.length) return [...map.values()];
+    return addressOrder
+      .map((addr) => map.get(String(addr).toLowerCase()))
+      .filter(Boolean);
   }
 
   /**
@@ -511,16 +666,35 @@ export class CollectionService {
     }
   }
 
-  private async runForChainUnlocked(chainInput?: string) {
+  private async runForChainUnlocked(
+    chainInput?: string,
+    progressBase?: {
+      scanned: number;
+      sent: number;
+      failed: number;
+      skipped: number;
+      queued: number;
+      totalWallets: number;
+    },
+  ) {
+    const base = progressBase || {
+      scanned: 0,
+      sent: 0,
+      failed: 0,
+      skipped: 0,
+      queued: 0,
+      totalWallets: 0,
+    };
     const chain = this.payout.resolveChain(chainInput || getPrimaryChain());
     this.collectJob.chain = chain;
     this.collectJob.phase = 'scan';
+    await this.ensureSharedChainConfigs();
 
     const config = await this.prisma.collectionConfig.findUnique({ where: { chain } });
     if (!config || !config.active) {
       const msg = `无活跃归集配置: ${chain}`;
       this.collectJob.message = msg;
-      return { ok: false, scanned: 0, sent: 0, failed: 0, skipped: 0, message: msg };
+      return { ok: false, scanned: 0, sent: 0, failed: 0, skipped: 0, queued: 0, totalWallets: 0, message: msg };
     }
     if (!config.targetAddress || !isAddress(config.targetAddress)) {
       const msg = '请先在后台配置有效的归集目标地址';
@@ -531,6 +705,8 @@ export class CollectionService {
         sent: 0,
         failed: 0,
         skipped: 0,
+        queued: 0,
+        totalWallets: 0,
         message: msg,
       };
     }
@@ -540,7 +716,7 @@ export class CollectionService {
     const totalWallets = await this.prisma.wallet.count({
       where: { chain, encPrivateKey: { not: null } },
     });
-    this.collectJob.totalWallets = totalWallets;
+    this.collectJob.totalWallets = base.totalWallets + totalWallets;
 
     const SCAN_PAGE = 200;
     const SEND_CONCURRENCY = Math.max(
@@ -549,7 +725,24 @@ export class CollectionService {
     );
     const SCREEN_GAS_LIMIT = 100_000n;
 
-    const gasPrice = await this.payout.getFeeGasPrice(chain);
+    const gasPrice = await this.payout.getFeeGasPrice(chain).catch((e: any) => {
+      const msg = `${chain} 手续费查不到: ${e?.message || e}`;
+      this.logger.warn(msg);
+      this.collectJob.message = msg;
+      return null;
+    });
+    if (gasPrice == null) {
+      return {
+        ok: false,
+        scanned: 0,
+        sent: 0,
+        failed: 0,
+        skipped: 0,
+        queued: 0,
+        totalWallets: 0,
+        message: this.collectJob.message || `${chain} 手续费查不到`,
+      };
+    }
     const screenRequired = Number(formatUnits((SCREEN_GAS_LIMIT * gasPrice * 120n) / 100n, 18));
 
     type Candidate = {
@@ -589,7 +782,7 @@ export class CollectionService {
 
       for (const w of wallets) {
         scanned += 1;
-        this.collectJob.scanned = scanned;
+        this.collectJob.scanned = base.scanned + scanned;
         try {
           const addr = getAddress(w.address);
           const bal = bals.get(addr);
@@ -640,8 +833,8 @@ export class CollectionService {
       }
     }
 
-    this.collectJob.skipped = skipped;
-    this.collectJob.queued = candidates.length;
+    this.collectJob.skipped = base.skipped + skipped;
+    this.collectJob.queued = base.queued + candidates.length;
     this.collectJob.phase = 'send';
 
     let sent = 0;
@@ -680,7 +873,7 @@ export class CollectionService {
             },
           });
           failed += 1;
-          this.collectJob.failed = failed;
+          this.collectJob.failed = base.failed + failed;
           skippedDetails.push({ address: c.address, email: c.email, reason });
           return;
         }
@@ -698,7 +891,7 @@ export class CollectionService {
           data: { status: 'SENT', txHash },
         });
         sent += 1;
-        this.collectJob.sent = sent;
+        this.collectJob.sent = base.sent + sent;
         this.logger.log(`归集成功 ${c.email || ''} ${c.address} → ${c.amount} USDT tx=${txHash}`);
       } catch (e: any) {
         const fail = await this.buildCollectionFailFields(e, {
@@ -720,7 +913,7 @@ export class CollectionService {
           },
         });
         failed += 1;
-        this.collectJob.failed = failed;
+        this.collectJob.failed = base.failed + failed;
         this.logger.warn(
           `归集失败 ${c.address}: ${fail.failReason}` +
             ` | 需Gas≈${fail.gasRequired ?? '—'} 有=${fail.gasHave ?? '—'} 缺口=${fail.gasDeficit ?? '—'} 损耗=${fail.gasLost ?? '—'}`,
@@ -740,10 +933,10 @@ export class CollectionService {
     );
     if (candidates.length) await Promise.all(workers);
 
-    this.collectJob.skipped = skipped;
-    this.collectJob.sent = sent;
-    this.collectJob.failed = failed;
-    this.collectJob.queued = candidates.length;
+    this.collectJob.skipped = base.skipped + skipped;
+    this.collectJob.sent = base.sent + sent;
+    this.collectJob.failed = base.failed + failed;
+    this.collectJob.queued = base.queued + candidates.length;
 
     return {
       ok: true,
@@ -753,6 +946,7 @@ export class CollectionService {
       failed,
       skipped,
       queued: candidates.length,
+      totalWallets,
       threshold,
       target: targetAddress,
       concurrency: SEND_CONCURRENCY,
@@ -831,12 +1025,7 @@ export class CollectionService {
       gasAddress = getAddress(params.gasAddress);
     }
 
-    // 选用地址时自动写入地址簿（若尚无）
-    await this.prisma.collectionAddress.upsert({
-      where: { chain_address: { chain, address: targetAddress } },
-      create: { chain, address: targetAddress, label: null },
-      update: {},
-    });
+    await this.keepOneAddressBookRow(targetAddress);
 
     const existing = await this.prisma.collectionConfig.findUnique({ where: { chain } });
     const threshold =
@@ -844,26 +1033,65 @@ export class CollectionService {
         ? params.threshold
         : Number(existing?.threshold ?? 0);
 
-    return this.prisma.collectionConfig
-      .upsert({
-        where: { chain },
+    const saved = await this.prisma.collectionConfig.upsert({
+      where: { chain },
+      create: {
+        chain,
+        targetAddress,
+        threshold,
+        gasAddress: gasAddress ?? null,
+        active: params.active ?? true,
+        updatedById: params.actorId,
+      },
+      update: {
+        targetAddress,
+        threshold,
+        ...(gasAddress !== undefined ? { gasAddress } : {}),
+        active: params.active ?? true,
+        updatedById: params.actorId,
+      },
+    });
+    // 归集目标全链共用同一地址。这次带了阈值就写到每条已开通链；缺补给钱包的链一并补上
+    const sharedGas = gasAddress ?? (existing?.gasAddress && isAddress(existing.gasAddress) ? getAddress(existing.gasAddress) : null);
+    const sharedGasKey = existing?.encGasPrivateKey ?? null;
+    for (const other of getEnabledDepositChains()) {
+      if (other === chain) continue;
+      const otherRow = await this.prisma.collectionConfig.findUnique({ where: { chain: other } });
+      const otherHasGas = !!(otherRow?.gasAddress && otherRow.encGasPrivateKey && isAddress(otherRow.gasAddress));
+      await this.prisma.collectionConfig.upsert({
+        where: { chain: other },
         create: {
-          chain,
+          chain: other,
           targetAddress,
-          threshold,
-          gasAddress: gasAddress ?? null,
+          threshold:
+            params.threshold !== undefined && params.threshold !== null
+              ? threshold
+              : otherRow
+                ? otherRow.threshold
+                : threshold,
+          gasAddress: otherHasGas ? getAddress(otherRow!.gasAddress!) : sharedGas,
+          encGasPrivateKey: otherHasGas ? otherRow!.encGasPrivateKey : sharedGasKey,
           active: params.active ?? true,
           updatedById: params.actorId,
         },
         update: {
           targetAddress,
-          threshold,
-          ...(gasAddress !== undefined ? { gasAddress } : {}),
-          active: params.active ?? true,
           updatedById: params.actorId,
+          ...(params.threshold !== undefined && params.threshold !== null ? { threshold } : {}),
+          ...(!otherHasGas && sharedGas && sharedGasKey
+            ? { gasAddress: sharedGas, encGasPrivateKey: sharedGasKey }
+            : {}),
         },
-      })
-      .then((row) => this.sanitizeConfig(row));
+      });
+    }
+    return this.sanitizeConfig(saved);
+  }
+
+  private async isCurrentTarget(address: string): Promise<boolean> {
+    if (!isAddress(address)) return false;
+    const want = getAddress(address);
+    const configs = await this.prisma.collectionConfig.findMany({ select: { targetAddress: true } });
+    return configs.some((c) => isAddress(c.targetAddress) && getAddress(c.targetAddress) === want);
   }
 
   private sanitizeConfig(row: {
@@ -888,8 +1116,86 @@ export class CollectionService {
     };
   }
 
-  listConfigs() {
-    return this.prisma.collectionConfig.findMany().then((rows) => rows.map((r) => this.sanitizeConfig(r)));
+  async listConfigs() {
+    await this.ensureSharedChainConfigs();
+    const rows = await this.prisma.collectionConfig.findMany();
+    return rows.map((r) => this.sanitizeConfig(r));
+  }
+
+  /**
+   * 归集目标和补给钱包各链共用。后开通的链如果还没写上，从已有配置补齐，不必再点一次「设为归集」。
+   */
+  private validTargetAddress(addr?: string | null): string | null {
+    if (!addr || !isAddress(addr)) return null;
+    const a = getAddress(addr);
+    if (a === '0x0000000000000000000000000000000000000000') return null;
+    return a;
+  }
+
+  private sharedTargetAddress(configs: { targetAddress?: string | null }[]): string | null {
+    for (const c of configs) {
+      const t = this.validTargetAddress(c.targetAddress);
+      if (t) return t;
+    }
+    return null;
+  }
+
+  private async ensureSharedChainConfigs() {
+    const enabled = getEnabledDepositChains();
+    if (!enabled.length) return;
+    const configs = await this.prisma.collectionConfig.findMany();
+    const zero = '0x0000000000000000000000000000000000000000';
+    const gasSrc = configs.find((c) => c.gasAddress && c.encGasPrivateKey && isAddress(c.gasAddress));
+    const targetSrc = configs.find(
+      (c) => isAddress(c.targetAddress) && getAddress(c.targetAddress) !== zero,
+    );
+    if (!gasSrc && !targetSrc) return;
+    for (const chain of enabled) {
+      const matches = configs.filter((c) => this.payout.resolveChain(c.chain) === chain);
+      let row = matches.find((c) => c.chain === chain) || matches[0];
+      if (row && row.chain !== chain && !matches.some((c) => c.chain === chain)) {
+        row = await this.prisma.collectionConfig.update({
+          where: { id: row.id },
+          data: { chain },
+        });
+      }
+      const hasGas = !!(row?.gasAddress && row.encGasPrivateKey && isAddress(row.gasAddress));
+      const hasTarget = !!(
+        row?.targetAddress &&
+        isAddress(row.targetAddress) &&
+        getAddress(row.targetAddress) !== zero
+      );
+      const fillGas = !hasGas && !!gasSrc;
+      const fillTarget = !hasTarget && !!targetSrc;
+      if (!fillGas && !fillTarget) continue;
+      const targetAddress = fillTarget
+        ? getAddress(targetSrc!.targetAddress)
+        : hasTarget
+          ? getAddress(row!.targetAddress)
+          : zero;
+      await this.prisma.collectionConfig.upsert({
+        where: { chain },
+        create: {
+          chain,
+          targetAddress,
+          threshold: row?.threshold ?? targetSrc?.threshold ?? 0,
+          gasAddress: fillGas ? getAddress(gasSrc!.gasAddress!) : null,
+          encGasPrivateKey: fillGas ? gasSrc!.encGasPrivateKey : null,
+          active: row?.active ?? true,
+        },
+        update: {
+          ...(fillTarget ? { targetAddress } : {}),
+          ...(fillGas
+            ? { gasAddress: getAddress(gasSrc!.gasAddress!), encGasPrivateKey: gasSrc!.encGasPrivateKey }
+            : {}),
+        },
+      });
+      for (const extra of matches) {
+        if (extra.chain !== chain && extra.id !== row?.id) {
+          await this.prisma.collectionConfig.delete({ where: { id: extra.id } }).catch(() => undefined);
+        }
+      }
+    }
   }
 
   private async attachOnChainBalances<T extends { chain: string; address: string }>(rows: T[]) {
@@ -916,7 +1222,7 @@ export class CollectionService {
           ...row,
           usdt: null,
           native: null,
-          nativeSymbol: 'ETH',
+          nativeSymbol: this.payout.nativeSymbol(chain),
           balanceOk: false as const,
         };
       }
@@ -930,33 +1236,111 @@ export class CollectionService {
     });
   }
 
-  async listAddresses(chain?: string, withBalance = false) {
-    const c = chain ? this.payout.resolveChain(chain) : undefined;
-    const rows = await this.prisma.collectionAddress.findMany({
-      where: c ? { chain: c } : undefined,
-      orderBy: { createdAt: 'desc' },
-    });
+  /** 同一 0x 在各 EVM 链通用，列表只出一把，不按链拆成两套 */
+  private dedupeByAddress<T extends { address: string; deletedAt?: Date | null }>(rows: T[]): T[] {
+    const map = new Map<string, T>();
+    for (const row of rows) {
+      const addr = row.address;
+      let key = addr.toLowerCase();
+      if (isAddress(addr)) key = getAddress(addr);
+      const prev = map.get(key);
+      if (!prev || (prev.deletedAt && !row.deletedAt)) map.set(key, row);
+    }
+    return [...map.values()];
+  }
+
+  async listAddresses(_chain?: string, withBalance = false) {
+    await this.collapseAddressBook();
+    const rows = this.dedupeByAddress(
+      await this.prisma.collectionAddress.findMany({ orderBy: { createdAt: 'desc' } }),
+    );
     if (!withBalance) return rows;
-    return this.attachOnChainBalances(rows);
+    return this.attachEnabledChainBalances(rows);
+  }
+
+  /** 同一地址在已开通的每条链上各查一次，ETH / BNB 一起返回 */
+  private async attachEnabledChainBalances<T extends { address: string }>(rows: T[]) {
+    const chains = getEnabledDepositChains();
+    if (!rows.length || !chains.length) return rows;
+    const balByChain = new Map<DepositChain, Map<string, { usdt: number; native: number; ok: boolean }>>();
+    await Promise.all(
+      chains.map(async (c) => {
+        balByChain.set(
+          c,
+          await this.payout.getBalancesBatch(
+            c,
+            rows.map((r) => r.address),
+          ),
+        );
+      }),
+    );
+    return rows.map((row) => {
+      const addr = isAddress(row.address) ? getAddress(row.address) : row.address;
+      const balances: Record<string, { usdt: number | null; native: number | null }> = {};
+      for (const c of chains) {
+        const bal = balByChain.get(c)?.get(addr);
+        balances[c] = {
+          usdt: bal?.ok ? bal.usdt : null,
+          native: bal?.ok ? bal.native : null,
+        };
+      }
+      const primary = chains.includes(getPrimaryChain()) ? getPrimaryChain() : chains[0];
+      const head = balances[primary];
+      return {
+        ...row,
+        usdt: head?.usdt ?? null,
+        native: head?.native ?? null,
+        nativeSymbol: this.payout.nativeSymbol(primary),
+        balances,
+      };
+    });
+  }
+
+  /** 地址簿一个 0x 只留一行，不按 ARB、BSC 各存一条 */
+  private async keepOneAddressBookRow(address: string, label?: string | null) {
+    const want = getAddress(address);
+    const rows = await this.prisma.collectionAddress.findMany({
+      where: { address: want },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (!rows.length) {
+      return this.prisma.collectionAddress.create({
+        data: { chain: getPrimaryChain(), address: want, label: label ?? null },
+      });
+    }
+    const keep = rows[0];
+    if (rows.length > 1) {
+      await this.prisma.collectionAddress.deleteMany({
+        where: { id: { in: rows.slice(1).map((r) => r.id) } },
+      });
+    }
+    return keep;
+  }
+
+  private async collapseAddressBook() {
+    const rows = await this.prisma.collectionAddress.findMany({ orderBy: { createdAt: 'asc' } });
+    const seen = new Set<string>();
+    const drop: string[] = [];
+    for (const row of rows) {
+      if (!isAddress(row.address)) continue;
+      const key = getAddress(row.address);
+      if (seen.has(key)) drop.push(row.id);
+      else seen.add(key);
+    }
+    if (drop.length) {
+      await this.prisma.collectionAddress.deleteMany({ where: { id: { in: drop } } });
+    }
   }
 
   async addAddress(params: { chain?: string; address: string; label?: string }) {
-    const chain = this.payout.resolveChain(params.chain || 'ARB');
     if (!params.address || !isAddress(params.address)) {
       throw new BadRequestException('地址无效');
     }
     const address = getAddress(params.address);
-    try {
-      return await this.prisma.collectionAddress.create({
-        data: {
-          chain,
-          address,
-          label: params.label?.trim() || null,
-        },
-      });
-    } catch {
-      throw new BadRequestException('该链下地址已存在');
-    }
+    const label = params.label?.trim() || null;
+    const existing = await this.prisma.collectionAddress.findFirst({ where: { address } });
+    if (existing) throw new BadRequestException('该地址已存在');
+    return this.keepOneAddressBookRow(address, label);
   }
 
   async updateAddress(params: { id: string; address?: string; label?: string | null }) {
@@ -973,9 +1357,7 @@ export class CollectionService {
     const label =
       params.label === undefined ? row.label : params.label?.trim() ? params.label.trim() : null;
 
-    const cfg = await this.prisma.collectionConfig.findUnique({ where: { chain: row.chain } });
-    const wasCurrent =
-      cfg && getAddress(cfg.targetAddress) === getAddress(row.address);
+    const wasCurrent = await this.isCurrentTarget(row.address);
 
     try {
       const updated = await this.prisma.collectionAddress.update({
@@ -984,25 +1366,29 @@ export class CollectionService {
       });
       // 若改的是当前归集目标地址，同步配置
       if (wasCurrent && address !== getAddress(row.address)) {
-        await this.prisma.collectionConfig.update({
-          where: { chain: row.chain },
+        await this.prisma.collectionConfig.updateMany({
+          where: { targetAddress: row.address },
           data: { targetAddress: address },
         });
       }
+      await this.prisma.collectionAddress.updateMany({
+        where: { address: row.address },
+        data: { address, label },
+      });
+      await this.collapseAddressBook();
       return updated;
     } catch {
-      throw new BadRequestException('该链下地址已存在或更新失败');
+      throw new BadRequestException('该地址已存在或更新失败');
     }
   }
 
   async deleteAddress(id: string) {
     const row = await this.prisma.collectionAddress.findUnique({ where: { id } });
     if (!row) throw new NotFoundException('地址不存在');
-    const cfg = await this.prisma.collectionConfig.findUnique({ where: { chain: row.chain } });
-    if (cfg && getAddress(cfg.targetAddress) === getAddress(row.address)) {
+    if (await this.isCurrentTarget(row.address)) {
       throw new BadRequestException('该地址是当前归集目标，请先在归集资金页改选其他地址再删除');
     }
-    await this.prisma.collectionAddress.delete({ where: { id } });
+    await this.prisma.collectionAddress.deleteMany({ where: { address: row.address } });
     return { ok: true };
   }
 
@@ -1065,12 +1451,12 @@ export class CollectionService {
   }
 
   private async assertNotCurrentRole(row: { chain: string; address: string }) {
-    const cfg = await this.prisma.collectionConfig.findUnique({ where: { chain: row.chain } });
-    if (!cfg) return;
-    if (cfg.gasAddress && getAddress(cfg.gasAddress) === getAddress(row.address)) {
+    const want = getAddress(row.address);
+    const configs = await this.prisma.collectionConfig.findMany();
+    if (configs.some((cfg) => cfg.gasAddress && isAddress(cfg.gasAddress) && getAddress(cfg.gasAddress) === want)) {
       throw new BadRequestException('该地址是当前 Gas 补给钱包，请先改选其他再废弃');
     }
-    if (cfg.targetAddress && getAddress(cfg.targetAddress) === getAddress(row.address)) {
+    if (configs.some((cfg) => cfg.targetAddress && isAddress(cfg.targetAddress) && getAddress(cfg.targetAddress) === want)) {
       throw new BadRequestException('该地址是当前归集目标，请先改选其他再废弃');
     }
   }
@@ -1082,28 +1468,29 @@ export class CollectionService {
   }
 
   async listGasWallets(chain?: string, withBalance = false, discarded = false) {
-    const c = chain ? this.payout.resolveChain(chain) : undefined;
-    const where: { chain?: string; deletedAt: null | { not: null } } = discarded
+    const balanceChain = chain ? this.payout.resolveChain(chain) : undefined;
+    const where: { deletedAt: null | { not: null } } = discarded
       ? { deletedAt: { not: null } }
       : { deletedAt: null };
-    if (c) where.chain = c;
-    const rows = await this.prisma.collectionGasWallet.findMany({
-      where,
-      orderBy: discarded ? { deletedAt: 'desc' } : { createdAt: 'desc' },
-    });
+    const rows = this.dedupeByAddress(
+      await this.prisma.collectionGasWallet.findMany({
+        where,
+        orderBy: discarded ? { deletedAt: 'desc' } : { createdAt: 'desc' },
+      }),
+    );
     // 兼容：若使用中地址簿空但配置里已有 Gas，迁入一条
     let list = rows;
-    if (!discarded && c && rows.length === 0) {
-      const cfg = await this.prisma.collectionConfig.findUnique({ where: { chain: c } });
+    if (!discarded && balanceChain && rows.length === 0) {
+      const cfg = await this.prisma.collectionConfig.findUnique({ where: { chain: balanceChain } });
       if (cfg?.gasAddress && cfg.encGasPrivateKey && isAddress(cfg.gasAddress)) {
         const addr = getAddress(cfg.gasAddress);
-        const existing = await this.findByChainAddress(c, addr);
+        const existing = await this.findByChainAddress(balanceChain, addr);
         if (existing) {
           if (!existing.deletedAt) list = [existing];
         } else {
           const migrated = await this.prisma.collectionGasWallet.create({
             data: {
-              chain: c,
+              chain: balanceChain,
               address: addr,
               label: '默认',
               encPrivateKey: cfg.encGasPrivateKey,
@@ -1115,7 +1502,7 @@ export class CollectionService {
     }
     const sanitized = list.map((r) => this.sanitizeGasWallet(r));
     if (!withBalance) return sanitized;
-    return this.attachOnChainBalances(sanitized);
+    return this.attachEnabledChainBalances(sanitized);
   }
 
   async addGasWallet(params: {
@@ -1132,12 +1519,15 @@ export class CollectionService {
     }
     const address = getAddress(params.address);
     const { enc } = this.parseHotPrivateKey(params.privateKey, address);
-    const existing = await this.findByChainAddress(chain, address);
+    const existing = await this.prisma.collectionGasWallet.findFirst({ where: { address } });
     if (existing) {
       if (existing.deletedAt) {
         throw new BadRequestException('该地址已在废弃列表中，请先恢复或彻底删除后再添加');
       }
-      throw new BadRequestException('该链下平台钱包地址已存在');
+      if (params.setActive !== false) {
+        await this.applyGasWalletToConfig(existing.id, params.actorId);
+      }
+      return this.sanitizeGasWallet(existing);
     }
     try {
       const row = await this.prisma.collectionGasWallet.create({
@@ -1154,7 +1544,7 @@ export class CollectionService {
       return this.sanitizeGasWallet(row);
     } catch (e: any) {
       if (e instanceof BadRequestException) throw e;
-      throw new BadRequestException('该链下平台钱包地址已存在');
+      throw new BadRequestException('该平台钱包地址已存在');
     }
   }
 
@@ -1247,20 +1637,17 @@ export class CollectionService {
         where: { id: params.id },
         data: { address, label, encPrivateKey },
       });
-      const cfg = await this.prisma.collectionConfig.findUnique({ where: { chain: row.chain } });
-      if (cfg?.gasAddress && getAddress(cfg.gasAddress) === getAddress(row.address)) {
-        await this.prisma.collectionConfig.update({
-          where: { chain: row.chain },
-          data: {
-            gasAddress: address,
-            encGasPrivateKey: encPrivateKey,
-            updatedById: params.actorId,
-          },
-        });
-      }
+      await this.prisma.collectionConfig.updateMany({
+        where: { gasAddress: row.address },
+        data: {
+          gasAddress: address,
+          encGasPrivateKey: encPrivateKey,
+          updatedById: params.actorId,
+        },
+      });
       return this.sanitizeGasWallet(updated);
     } catch {
-      throw new BadRequestException('该链下地址已存在或更新失败');
+      throw new BadRequestException('该地址已存在或更新失败');
     }
   }
 
@@ -1298,20 +1685,34 @@ export class CollectionService {
 
   async applyGasWalletToConfig(gasWalletId: string, actorId: string) {
     const gw = await this.requireGasWallet(gasWalletId);
-    const chain = this.payout.resolveChain(gw.chain);
-    const existing = await this.prisma.collectionConfig.findUnique({ where: { chain } });
-    if (!existing) {
+    const configs = await this.prisma.collectionConfig.findMany();
+    const template = configs.find((c) => c.targetAddress && isAddress(c.targetAddress));
+    if (!template) {
       throw new BadRequestException('请先选择归集目标地址，再选用 Gas 补给钱包');
     }
-    const row = await this.prisma.collectionConfig.update({
-      where: { chain },
-      data: {
-        gasAddress: gw.address,
-        encGasPrivateKey: gw.encPrivateKey,
-        updatedById: actorId,
-      },
-    });
-    return this.sanitizeConfig(row);
+    const targetAddress = getAddress(template.targetAddress);
+    let last = template;
+    for (const chain of getEnabledDepositChains()) {
+      const existing = configs.find((c) => c.chain === chain);
+      last = await this.prisma.collectionConfig.upsert({
+        where: { chain },
+        create: {
+          chain,
+          targetAddress,
+          threshold: existing?.threshold ?? template.threshold,
+          gasAddress: gw.address,
+          encGasPrivateKey: gw.encPrivateKey,
+          active: true,
+          updatedById: actorId,
+        },
+        update: {
+          gasAddress: gw.address,
+          encGasPrivateKey: gw.encPrivateKey,
+          updatedById: actorId,
+        },
+      });
+    }
+    return this.sanitizeConfig(last);
   }
 
   /**
@@ -1320,16 +1721,11 @@ export class CollectionService {
    */
   async applyGasWalletAsCollectionTarget(gasWalletId: string, actorId: string) {
     const gw = await this.requireGasWallet(gasWalletId);
-    const chain = this.payout.resolveChain(gw.chain);
     const address = getAddress(gw.address);
     const label = gw.label?.trim() || '平台钱包';
-    await this.prisma.collectionAddress.upsert({
-      where: { chain_address: { chain, address } },
-      create: { chain, address, label },
-      update: {},
-    });
+    await this.keepOneAddressBookRow(address, label);
     return this.saveTargetConfig({
-      chain,
+      chain: getPrimaryChain(),
       targetAddress: address,
       actorId,
     });
@@ -1353,10 +1749,11 @@ export class CollectionService {
   }
 
   /**
-   * 批量给「USDT ≥ 最低归集阈值且缺 Gas」的托管地址打最小 ETH（够付一次 USDT 归集）。
-   * 立即返回，进度见 collection/status.fundJob；每笔写入 collection_records（tokenSymbol=ETH）。
+   * 批量给「USDT ≥ 最低归集阈值且缺 Gas」的托管地址打最小原生币（够付一次 USDT 归集）。
+   * 传 chains 或都不传：按已开通链依次补（ARB 打 ETH，BSC 打 BNB）。传 chain 则只补这一条。
+   * 立即返回，进度见 collection/status.fundJob。
    */
-  startFundGas(params: { chain?: string; walletIds?: string[] }) {
+  startFundGas(params: { chain?: string; chains?: string[]; walletIds?: string[] }) {
     if (this.running) {
       return {
         ok: false as const,
@@ -1365,23 +1762,38 @@ export class CollectionService {
         job: this.fundJobSnapshot(),
       };
     }
+    const chains = this.resolveFundChains(params);
+    if (!chains.length) {
+      return {
+        ok: false as const,
+        started: false as const,
+        message: '没有可补 Gas 的链',
+        job: this.fundJobSnapshot(),
+      };
+    }
     this.running = true;
-    const chainHint = params.chain ? this.payout.resolveChain(params.chain) : getPrimaryChain();
-    this.resetFundJob(chainHint);
-    void this.fundNeedGasUnlocked(params)
+    this.resetFundJob(chains.join(','));
+    void this.fundChainsSequential(chains, params.walletIds)
       .then((res) => {
         this.fundJob.scanned = res.scanned ?? this.fundJob.scanned;
         this.fundJob.funded = res.funded ?? 0;
         this.fundJob.failed = res.failed ?? 0;
         this.fundJob.skipped = res.skipped ?? this.fundJob.skipped;
+        this.fundJob.unqueried = res.unqueried ?? this.fundJob.unqueried;
         this.fundJob.queued = res.queued ?? this.fundJob.queued;
         this.touchFundRemaining();
         if (res.message) this.fundJob.message = res.message;
       })
       .catch((e: any) => {
         this.logger.warn(`批量补 Gas 异常: ${e?.message}`);
-        this.fundJob.message = e?.message || '补 Gas 异常';
-        this.fundJob.failed = Math.max(this.fundJob.failed, 1);
+        const funded = this.fundJob.funded || 0;
+        const failed = Math.max(this.fundJob.failed || 0, 1);
+        const missed = this.fundJob.unqueried || 0;
+        this.fundJob.failed = failed;
+        let message = `补 Gas 完成：成功 ${funded} 笔，失败 ${failed} 笔`;
+        if (missed > 0) message += `，${missed} 个地址没查到余额`;
+        message += `。${e?.message || '补 Gas 异常'}。请稍等后再点一次「批量补 Gas」`;
+        this.fundJob.message = message;
         this.touchFundRemaining();
       })
       .finally(() => {
@@ -1394,11 +1806,99 @@ export class CollectionService {
     return { ok: true as const, started: true as const, job: this.fundJobSnapshot() };
   }
 
-  async fundGasBatch(params: { chain?: string; walletIds?: string[] }) {
+  async fundGasBatch(params: { chain?: string; chains?: string[]; walletIds?: string[] }) {
     return this.startFundGas(params);
   }
 
-  private async fundNeedGasUnlocked(params: { chain?: string; walletIds?: string[] }): Promise<{
+  /** 指定 chains 时用这些链；只指定 chain 时只补一条；都不传则补全部已开通链 */
+  private resolveFundChains(params: { chain?: string; chains?: string[] }): DepositChain[] {
+    const enabled = getEnabledDepositChains();
+    if (params.chains?.length) {
+      const picked = new Set(params.chains.map((c) => this.payout.resolveChain(c)));
+      return enabled.filter((c) => picked.has(c));
+    }
+    if (params.chain) {
+      const one = this.payout.resolveChain(params.chain);
+      return enabled.includes(one) ? [one] : [];
+    }
+    return enabled;
+  }
+
+  /** 多条链共用一把补给地址，但 ETH / BNB 余额分开，所以按链串行打 */
+  private async fundChainsSequential(chains: DepositChain[], walletIds?: string[]) {
+    const base = {
+      scanned: 0,
+      funded: 0,
+      failed: 0,
+      skipped: 0,
+      unqueried: 0,
+      heldBack: 0,
+      queued: 0,
+      totalWallets: 0,
+    };
+    const notes: string[] = [];
+    for (const chain of chains) {
+      this.fundJob.chain = chain;
+      const sym = this.payout.nativeSymbol(chain);
+      try {
+        const res = await this.fundNeedGasUnlocked({ chain, walletIds, progressBase: { ...base } });
+        base.scanned += res.scanned;
+        base.funded += res.funded;
+        base.failed += res.failed;
+        base.skipped += res.skipped;
+        base.unqueried += res.unqueried;
+        base.heldBack += res.heldBack;
+        base.queued += res.queued;
+        base.totalWallets += res.totalWallets;
+        if (!res.ok && res.queued === 0 && res.funded === 0 && res.failed === 0 && res.message) {
+          notes.push(`${chain} ${sym}: ${res.message}`);
+        } else if (res.failed > 0 && res.message) {
+          notes.push(`${chain} ${sym}: ${res.message}`);
+        }
+      } catch (e: any) {
+        const msg = e?.message || '补 Gas 异常';
+        this.logger.warn(`[${chain}] 补 Gas 中断，继续下一条链: ${msg}`);
+        base.failed += 1;
+        notes.push(`${chain} ${sym}: ${msg}`);
+      }
+    }
+    const retry = base.failed > 0 || base.unqueried > 0 || base.heldBack > 0 || notes.length > 0;
+    let message = `补 Gas 完成：成功 ${base.funded} 笔，失败 ${base.failed} 笔`;
+    if (base.unqueried > 0) message += `，${base.unqueried} 个地址没查到余额`;
+    if (base.heldBack > 0) message += `，${base.heldBack} 个因补给钱包余额不足未打出`;
+    if (base.funded === 0 && base.failed === 0 && base.unqueried === 0 && base.heldBack === 0 && !notes.length) {
+      message = '补 Gas 完成：成功 0 笔，失败 0 笔。这次没有需要补的地址';
+    } else if (retry) {
+      message += '。请稍等后再点一次「批量补 Gas」';
+    }
+    if (notes.length) message += `。${notes.join('；')}`;
+    this.fundJob.unqueried = base.unqueried;
+    return {
+      ok: base.funded > 0 || notes.length === 0,
+      scanned: base.scanned,
+      funded: base.funded,
+      skipped: base.skipped,
+      failed: base.failed,
+      unqueried: base.unqueried,
+      queued: base.queued,
+      message,
+    };
+  }
+
+  private async fundNeedGasUnlocked(params: {
+    chain?: string;
+    walletIds?: string[];
+    progressBase?: {
+      scanned: number;
+      funded: number;
+      failed: number;
+      skipped: number;
+      unqueried: number;
+      heldBack: number;
+      queued: number;
+      totalWallets: number;
+    };
+  }): Promise<{
     ok: boolean;
     message?: string;
     chain?: string;
@@ -1406,12 +1906,26 @@ export class CollectionService {
     funded: number;
     skipped: number;
     failed: number;
+    unqueried: number;
+    heldBack: number;
     queued: number;
+    totalWallets: number;
     from?: string;
     details?: any[];
   }> {
-    const empty = { scanned: 0, funded: 0, skipped: 0, failed: 0, queued: 0 };
+    const empty = {
+      scanned: 0,
+      funded: 0,
+      skipped: 0,
+      failed: 0,
+      unqueried: 0,
+      heldBack: 0,
+      queued: 0,
+      totalWallets: 0,
+    };
+    const base = params.progressBase || empty;
     const chain = this.payout.resolveChain(params.chain || getPrimaryChain());
+    const sym = this.payout.nativeSymbol(chain);
     const config = await this.prisma.collectionConfig.findUnique({ where: { chain } });
     if (!config?.encGasPrivateKey || !config.gasAddress) {
       return { ok: false, ...empty, message: '请先配置 Gas 补给钱包（地址+私钥）' };
@@ -1437,13 +1951,13 @@ export class CollectionService {
     try {
       nativeBal = await this.payout.getNativeBalance(chain, gasAddr);
     } catch {
-      return { ok: false, ...empty, message: '无法查询补给钱包 ETH 余额，请稍后重试' };
+      return { ok: false, ...empty, message: `无法查询补给钱包 ${sym} 余额，请稍后重试` };
     }
     if (!Number.isFinite(nativeBal) || nativeBal <= 0) {
       return {
         ok: false,
         ...empty,
-        message: `当前补给钱包 ETH 为 0，无法补 Gas，请先向 ${gasAddr} 打入 ETH`,
+        message: `当前补给钱包 ${sym} 为 0，无法补 Gas，请先向 ${gasAddr} 打入 ${sym}`,
       };
     }
 
@@ -1452,17 +1966,19 @@ export class CollectionService {
     const balsNeed: { w: any; usdt: number; native: number }[] = [];
     let scanned = 0;
     let skipped = 0;
+    let unqueried = 0;
     let cursor: string | undefined;
 
     this.fundJob.chain = chain;
     this.fundJob.phase = 'scan';
-    this.fundJob.totalWallets = await this.prisma.wallet.count({
+    const chainWalletCount = await this.prisma.wallet.count({
       where: {
         chain,
         encPrivateKey: { not: null },
         ...(params.walletIds?.length ? { id: { in: params.walletIds } } : {}),
       },
     });
+    this.fundJob.totalWallets = base.totalWallets + chainWalletCount;
 
     while (true) {
       const wallets = await this.prisma.wallet.findMany({
@@ -1484,11 +2000,12 @@ export class CollectionService {
       );
       for (const w of wallets) {
         scanned += 1;
-        this.fundJob.scanned = scanned;
+        this.fundJob.scanned = base.scanned + scanned;
         const addr = getAddress(w.address);
         const bal = bals.get(addr);
         if (!bal?.ok) {
-          skipped += 1;
+          unqueried += 1;
+          this.fundJob.unqueried = base.unqueried + unqueried;
           continue;
         }
         if (!(bal.usdt >= threshold && bal.usdt > 0)) {
@@ -1566,8 +2083,8 @@ export class CollectionService {
       sendJobs.push(j);
     }
 
-    this.fundJob.skipped = skipped;
-    this.fundJob.queued = sendJobs.length;
+    this.fundJob.skipped = base.skipped + skipped;
+    this.fundJob.queued = base.queued + sendJobs.length;
     this.fundJob.phase = 'send';
     this.touchFundRemaining();
 
@@ -1600,7 +2117,7 @@ export class CollectionService {
         data: {
           fromWalletId: j.id,
           chain,
-          tokenSymbol: 'ETH',
+          tokenSymbol: this.payout.nativeSymbol(chain),
           amount: j.amountEth,
           targetAddress: j.address,
           status: 'PENDING',
@@ -1640,7 +2157,7 @@ export class CollectionService {
           data: { status: 'SENT', txHash: sent.txHash },
         });
         funded += 1;
-        this.fundJob.funded = funded;
+        this.fundJob.funded = base.funded + funded;
         this.fundJob.results = [
           ...(this.fundJob.results || []),
           {
@@ -1662,12 +2179,12 @@ export class CollectionService {
           nativeAfter,
         });
         this.logger.log(
-          `Gas 补给成功 ${j.email || ''} ${j.address} ${j.amountEth} ETH 余额 ${nativeAfter} tx=${sent.txHash}`,
+          `Gas 补给成功 ${j.email || ''} ${j.address} ${j.amountEth} ${this.payout.nativeSymbol(chain)} 余额 ${nativeAfter} tx=${sent.txHash}`,
         );
       } catch (e: any) {
         const reason = e?.message || '失败';
         failed += 1;
-        this.fundJob.failed = failed;
+        this.fundJob.failed = base.failed + failed;
         this.fundJob.results = [
           ...(this.fundJob.results || []),
           { walletId: j.id, address: j.address, ok: false, error: reason, txHash },
@@ -1710,9 +2227,9 @@ export class CollectionService {
     const firstErr = details.find((d) => d?.error)?.error;
     let message: string | undefined;
     if (jobs.length === 0) {
-      message = `扫描 ${scanned} 个地址，没有「USDT≥${threshold} 且 ETH 不够一次归集」的托管钱包需要补 Gas`;
+      message = `扫描 ${scanned} 个地址，没有「USDT≥${threshold} 且 ${sym} 不够一次归集」的托管钱包需要补 Gas`;
     } else if (sendJobs.length === 0) {
-      message = `补给钱包 ETH 不够支付本次补 Gas（余额 ${nativeBal.toFixed(6)}），已跳过 ${skippedNoReserve} 个缺 Gas 地址`;
+      message = `补给钱包 ${sym} 不够支付本次补 Gas（余额 ${nativeBal.toFixed(6)}），已跳过 ${skippedNoReserve} 个缺 Gas 地址`;
     } else if (failed > 0 && funded === 0) {
       message = `补 Gas 全部失败（${failed} 笔）${firstErr ? `：${firstErr}` : ''}。托管地址未到账`;
     } else if (funded > 0 && failed > 0) {
@@ -1726,7 +2243,10 @@ export class CollectionService {
       funded,
       skipped,
       failed,
+      unqueried,
+      heldBack: skippedNoReserve,
       queued: sendJobs.length,
+      totalWallets: chainWalletCount,
       from: gasAddr,
       details: details.slice(0, 50),
       message,
@@ -1739,17 +2259,17 @@ export class CollectionService {
    */
   async transferFromGasWallet(params: {
     gasWalletId: string;
-    token: 'USDT' | 'ETH';
+    token: 'USDT' | 'ETH' | 'BNB';
     toAddress: string;
     amount: number;
     actorId: string;
+    chain?: string;
   }) {
     if (this.running) {
       return { ok: false as const, message: '归集/补 Gas/转出进行中，请稍后再试' };
     }
     this.running = true;
     try {
-      const token = params.token === 'ETH' ? 'ETH' : 'USDT';
       const amount = Number(params.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
         throw new BadRequestException('无效金额');
@@ -1765,7 +2285,12 @@ export class CollectionService {
         throw new NotFoundException('未找到托管热钱包或无私钥');
       }
 
-      const chain = this.payout.resolveChain(gw.chain);
+      const enabled = getEnabledDepositChains();
+      const chain = this.payout.resolveChain(params.chain || gw.chain);
+      if (!enabled.includes(chain)) {
+        throw new BadRequestException(`${chain} 未开通`);
+      }
+      const token = isNativeGasSymbol(params.token) ? this.payout.nativeSymbol(chain) : 'USDT';
       const toAddress = getAddress(params.toAddress);
       if (getAddress(gw.address) === toAddress) {
         throw new BadRequestException('收款地址不能与转出地址相同');
@@ -1793,12 +2318,12 @@ export class CollectionService {
         }
 
         let txHash: string;
-        if (token === 'ETH') {
+        if (token !== 'USDT') {
           const native = await this.payout.getNativeBalance(chain, gw.address);
           const reserve = Number(process.env.HOT_WALLET_ETH_RESERVE || 0.00005);
           if (amount + reserve > native) {
             throw new BadRequestException(
-              `ETH 不足（需 ${amount} + 预留 ${reserve}，现有 ${native.toFixed(6)}）`,
+              `${token} 不足（需 ${amount} + 预留 ${reserve}，现有 ${native.toFixed(6)}）`,
             );
           }
           const fee = await this.payout.resolveBroadcastFee(chain, await this.getGasFeeTier());
@@ -1872,6 +2397,7 @@ export class CollectionService {
   }
 
   async adminStatus() {
+    await this.ensureSharedChainConfigs();
     const configs = await this.prisma.collectionConfig.findMany();
     const pending = await this.prisma.collectionRecord.count({ where: { status: 'PENDING' } });
     const sent = await this.prisma.collectionRecord.count({ where: { status: 'SENT' } });
@@ -1886,12 +2412,13 @@ export class CollectionService {
       message:
         enabled.length === 1
           ? `当前仅开放 ${depositNetworkOptions()[0]?.label || primary} 充值与归集；以后可通过 DEPOSIT_ENABLED_CHAINS 加网。`
-          : '归集按已启用链分别配置目标地址；仅 USDT≥阈值且 Gas 足够时转到指定地址。',
+          : '归集目标和补给钱包各链共用。下拉只切换在哪条链上归集、补 Gas。',
       configs: configs.map((c) => this.sanitizeConfig(c)),
       stats: { pending, sent, failed },
       collectJob: this.jobSnapshot(),
       fundJob: this.fundJobSnapshot(),
       gasFeeTier: await this.getGasFeeTier(),
+      collectionAuto: await this.isAutoCollectEnabled(),
     };
   }
 }

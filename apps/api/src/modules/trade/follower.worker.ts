@@ -1,10 +1,11 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { Exchange } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
-import { formatTradeError, extractPlaceOrderId } from '../../common/trade-error';
+import { formatTradeError, extractPlaceOrderFailReason, extractPlaceOrderId } from '../../common/trade-error';
+import { isInsufficientOpenBalance } from '../../common/insufficient-balance';
 import { TradeService } from './trade.service';
 import { MapiClient } from './mapi.client';
-import { fromApiCode, accountTypeFromEqualCoin } from './exchange-codes';
+import { fromApiCode, accountTypeFromEqualCoin, parseSignalKey } from './exchange-codes';
 import { FILL_CATCH_UP_MS, isQueryFillUsable } from './order-fill.util';
 
 const CFG_SIGNAL_TIMEOUT = 'signal_timeout_seconds'; // 旧：秒
@@ -59,6 +60,57 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
   private reconcileTimer: ReturnType<typeof setInterval> | null = null;
   private abnormalReconcileTimer: ReturnType<typeof setInterval> | null = null;
   private pollMs = 500;
+  /** 同一原因限频，避免 200ms 轮询刷满日志 */
+  private gateLogAt = new Map<string, number>();
+  /**
+   * 开仓余额不足：用户 + apiCode。
+   * 第一次下单失败记一条并挡 1 分钟；冷却内不再下单、不写日志。
+   * 到点再试仍不足则续 1 分钟且不再记。开仓成功后清掉，下次不足重新记一条。
+   */
+  private balanceCool = new Map<string, { until: number; logged: boolean }>();
+  private readonly balanceCoolMs = 60_000;
+
+  private logGate(key: string, message: string, everyMs = 20_000) {
+    const now = Date.now();
+    const prev = this.gateLogAt.get(key) ?? 0;
+    if (now - prev < everyMs) return;
+    this.gateLogAt.set(key, now);
+    if (this.gateLogAt.size > 400) {
+      const cutoff = now - 120_000;
+      for (const [k, t] of this.gateLogAt) {
+        if (t < cutoff) this.gateLogAt.delete(k);
+      }
+    }
+    this.logger.warn(message);
+  }
+
+  private balanceCoolKey(userId: string, apiCode: string): string {
+    return `${userId}|${String(apiCode || '').trim().toLowerCase()}`;
+  }
+  
+  /** 冷却未结束：不再开仓、不写挂单日志。 */
+  private balanceCoolActive(userId: string, apiCode: string): boolean {
+    const row = this.balanceCool.get(this.balanceCoolKey(userId, apiCode));
+    return !!row && Date.now() < row.until;
+  }
+
+  /** 记一次不足。已有记录则是连续不足，调用方不要再写失败日志。 */
+  private noteBalanceMiss(userId: string, apiCode: string): 'first' | 'again' {
+    const key = this.balanceCoolKey(userId, apiCode);
+    const again = this.balanceCool.get(key)?.logged === true;
+    this.balanceCool.set(key, { until: Date.now() + this.balanceCoolMs, logged: true });
+    if (this.balanceCool.size > 2000) {
+      const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+      for (const [k, v] of this.balanceCool) {
+        if (v.until < cutoff) this.balanceCool.delete(k);
+      } 
+    }
+    return again ? 'again' : 'first';
+  }
+
+  private clearBalanceCool(userId: string, apiCode: string) {
+    this.balanceCool.delete(this.balanceCoolKey(userId, apiCode));
+  }
 
   constructor(
     private prisma: PrismaService,
@@ -282,6 +334,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       String(row.side || meta.orderSide || '').toLowerCase() || (isOpen ? 'open' : 'close');
     const symbol = String(row.symbol || meta.symbol || `${coinName}/${equalCoinName}`);
     const accountType = row.accountType || meta.accountType || 'future';
+    const apiCode = String(meta.apiCode || '').trim().toLowerCase() || undefined;
     const baseKey = String(row.signalKey || row.orderGid || row.orderId || row.id);
     const signalKey = `chase:${baseKey}`.slice(0, 180);
     const orderGid = String(row.orderGid || `chase-${row.orderId || row.id}`);
@@ -317,6 +370,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
             orderSide,
             positionSide,
             isOpen,
+            apiCode,
             chasedAt: new Date().toISOString(),
           }),
         },
@@ -343,6 +397,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
         coinName,
         equalCoinName,
         isOpen,
+        apiCode,
         clientOrderId,
         skipTradePassword: true,
       });
@@ -655,16 +710,37 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
     return { marketOpenClose: on, chaseOnExpire: on ? false : await this.getChaseOnExpire() };
   }
 
-  /** 管理端关闭跟单：勾选后自动跟单不再下新单（默认关=照常跟） */
-  async getFollowHalted(): Promise<boolean> {
+  /** 管理端关闭跟单：勾选后自动跟单不再下新单。库里没有这项时默认关闭跟单。 */
+  private async readFollowHalted(): Promise<{
+    halted: boolean;
+    /** 库里的原文；没有这一行时是环境变量原文 */
+    raw: string;
+    source: 'db' | 'env';
+  }> {
     const fromDb = await this.prisma.systemConfig.findUnique({
       where: { key: CFG_FOLLOW_HALTED },
     });
     if (fromDb) {
-      const v = String(fromDb.value || '').trim().toLowerCase();
-      return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+      const raw = fromDb.value == null ? '' : String(fromDb.value);
+      const v = raw.trim().toLowerCase();
+      return {
+        halted: v === '1' || v === 'true' || v === 'yes' || v === 'on',
+        raw,
+        source: 'db',
+      };
     }
-    return (process.env.FOLLOW_HALTED || 'false').toLowerCase() === 'true';
+    const envRaw = process.env.FOLLOW_HALTED;
+    const raw = envRaw == null ? '' : String(envRaw);
+    const v = (envRaw ?? 'true').trim().toLowerCase();
+    return {
+      halted: v === '1' || v === 'true' || v === 'yes' || v === 'on',
+      raw: envRaw == null ? '(未设置,按默认true)' : raw,
+      source: 'env',
+    };
+  }
+
+  async getFollowHalted(): Promise<boolean> {
+    return (await this.readFollowHalted()).halted;
   }
 
   async setFollowHalted(halted: boolean) {
@@ -820,6 +896,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
     const inspectOpts = {
       symbol: row.symbol || undefined,
       accountType: row.accountType || 'future',
+      apiCode: meta.apiCode || undefined,
       coinName: coinName || undefined,
       equalCoinName: equalCoinName || undefined,
       clientOrderId: row.clientOrderId || undefined,
@@ -1116,10 +1193,13 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
   }
 
   private async pollAndFollow() {
-    if (await this.getFollowHalted()) {
-      if ((process.env.FOLLOWER_LOG_EMPTY || 'false').toLowerCase() === 'true') {
-        this.logger.debug('跟单已关闭(follow_halted)，跳过下发');
-      }
+    const halt = await this.readFollowHalted();
+    this.logGate(
+      'halt-value',
+      `跟单环节: 关闭跟单=${halt.halted} 来源=${halt.source} 原值=${JSON.stringify(halt.raw)}`,
+    );
+    if (halt.halted) {
+      this.logGate('halted', '跟单环节: 关闭跟单为真，本轮不拉信号、不下单');
       return;
     }
 
@@ -1128,31 +1208,31 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       const res = await this.mapi.get('mapi/LastOrderRecords', { skipLog: true });
       raw = res.data;
     } catch (e: any) {
-      if ((process.env.FOLLOWER_LOG_EMPTY || 'false').toLowerCase() === 'true') {
-        this.logger.debug(`拉信号失败: ${e?.message}`);
-      }
+      this.logGate('fetch', `跟单环节: 拉 LastOrderRecords 失败，不下单: ${e?.message || e}`);
       return;
     }
 
     const { allowedGids, nameByGid, listOk } = await this.loadAccountWhitelist();
     if (!listOk || allowedGids.size === 0) {
-      if ((process.env.FOLLOWER_LOG_EMPTY || 'false').toLowerCase() === 'true') {
-        this.logger.debug('中间件账号列表不可用或为空，跳过跟单下发');
-      }
+      this.logGate(
+        'whitelist',
+        `跟单环节: 中间件账号列表${listOk ? '为空' : '不可用'}，跳过下发`,
+      );
       return;
     }
 
     const timeoutMs = await this.getSignalTimeoutMs();
     const now = Date.now();
-    // 账号列表内任一账户的信号均可跟；是否下单由模板 accountGid + 开单条件决定
-    const all = this.normalizeSignals(raw).filter(
-      (s) => s.accountGID && allowedGids.has(s.accountGID),
-    );
+    const normalized = this.normalizeSignals(raw);
+    // 信号账户须落在模板勾选的账户里（或模板选了全部账户），再按开单条件决定是否下单
+    const all = normalized.filter((s) => s.accountGID && allowedGids.has(s.accountGID));
+    const outside = normalized.length - all.length;
 
+    let noTime = 0;
     let expired = 0;
     const fresh = all.filter((s) => {
       if (s.signalAt == null) {
-        expired++;
+        noTime++;
         return false;
       }
       if (now - s.signalAt > timeoutMs) {
@@ -1162,14 +1242,30 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       return true;
     });
 
-    if (expired > 0 && (process.env.FOLLOWER_LOG_EXPIRED || 'false').toLowerCase() === 'true') {
-      this.logger.debug(`丢弃超时信号 ${expired} 条 (超时阈值 ${timeoutMs}ms)`);
+    if (normalized.length === 0) {
+      this.logGate('empty', '跟单环节: LastOrderRecords 解析后没有信号');
+      return;
     }
-
-    if (fresh.length === 0) return;
+    if (fresh.length === 0) {
+      this.logGate(
+        'stale',
+        `跟单环节: 本轮不下单 解析=${normalized.length} 不在账号列表=${outside} 无时间=${noTime} 已超时=${expired} 超时阈值=${timeoutMs}ms`,
+      );
+      return;
+    }
 
     const maxBatch = Number(process.env.FOLLOWER_MAX_SIGNALS || 20);
     const batch = fresh.slice(0, maxBatch);
+    if (fresh.length > batch.length) {
+      this.logGate(
+        'batch',
+        `跟单环节: 未过期信号 ${fresh.length} 条，本轮只处理前 ${batch.length} 条 (FOLLOWER_MAX_SIGNALS)`,
+      );
+    }
+    this.logGate(
+      'fresh',
+      `跟单环节: 未过期信号 ${fresh.length} 条，本批 ${batch.length}，账号列表 ${allowedGids.size} 个`,
+    );
 
     let followed = 0;
     for (const signal of batch) {
@@ -1268,15 +1364,11 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
 
       for (const key of Object.keys(positions)) {
         const o = positions[key] || {};
-        const parts = key.split('_');
-        if (parts.length < 4) continue;
-        const apiCode = parts[0];
-        const positionSide = parts[parts.length - 1].toLowerCase(); // long/short
-        const equalCoinName = parts[parts.length - 2].toUpperCase(); // PC / U ...
-        const coinName = parts.slice(1, parts.length - 2).join('_').toUpperCase();
-
+        const parsed = parseSignalKey(key);
+        if (!parsed) continue;
+        const { apiCode, coinName, equalCoinName, positionSide } = parsed;
         const exchange = fromApiCode(apiCode);
-        if (!exchange || !coinName) continue;
+        if (!exchange) continue;
 
         const orderGID = String(o.orderGID || o.orderGid || '');
         if (!orderGID) continue;
@@ -1413,7 +1505,13 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
     // 下单前再检一次超时 (排队等待期间可能已过期)
     const timeoutMs = await this.getSignalTimeoutMs();
     if (signal.signalAt != null) {
-      if (Date.now() - signal.signalAt > timeoutMs) return 0;
+      if (Date.now() - signal.signalAt > timeoutMs) {
+        this.logGate(
+          `late:${signal.orderGID}`,
+          `跟单环节: 排队期间信号已超时，跳过 ${signal.apiCode} ${signal.coinName} ${signal.isOpen ? '开' : '平'}`,
+        );
+        return 0;
+      }
     }
 
     const accountGid = signal.accountGID || null;
@@ -1425,7 +1523,17 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
       accountGid,
       skipPointGate: true,
     });
-    if (followers.length === 0) return 0;
+    if (followers.length === 0) {
+      this.logGate(
+        `nofollower:${signal.orderGID}`,
+        `跟单环节: 未圈到人，不下单也不写挂单日志 ${signal.apiCode} ${signal.coinName}/${signal.equalCoinName} ${signal.positionSide} ${signal.isOpen ? '开' : '平'} 账户=${accountName || '—'} gid=${accountGid}`,
+      );
+      return 0;
+    }
+    this.logGate(
+      `followers:${signal.orderGID}`,
+      `跟单环节: 圈到 ${followers.length} 人 ${signal.apiCode} ${signal.coinName} ${signal.isOpen ? '开' : '平'} 账户=${accountName || '—'}`,
+    );
 
     const marketOpenClose = await this.getMarketOpenClose();
     const followOrderType = marketOpenClose ? 'market' : signal.orderType;
@@ -1452,6 +1560,14 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
         where: { signalKey_userId: { signalKey, userId: u.id } },
       });
       if (existed) continue;
+
+      if (signal.isOpen && signal.apiCode && this.balanceCoolActive(u.id, signal.apiCode)) {
+        this.logGate(
+          `bal-skip:${u.id}:${signal.apiCode}`,
+          `跟单环节: 余额不足冷却中，跳过开仓不写日志 user=${u.email} ${signal.apiCode} ${signal.coinName}`,
+        );
+        continue;
+      }
 
       // 开仓/平仓前：先撤同币同向未完结开仓挂单（系统异常硬闸，不 PlaceOrder）
       const clear = await this.trade.clearSameDirectionOpenOrders({
@@ -1492,6 +1608,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
           coinName: signal.coinName,
           equalCoinName: signal.equalCoinName,
           positionSide: signal.positionSide,
+          apiCode: signal.apiCode,
         });
         if (!(localCloseQty > 1e-12)) {
           continue;
@@ -1514,7 +1631,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      // 开仓/平仓数量按用户声明本金与模板基准本金等比例缩放（不校验交易所余额）
+      // 开仓/平仓数量按模板统一倍数缩放：最少投入总本金 / 基准本金
       const ratio = Number((u as any).openRatio);
       const unitAmount = Number((u as any).unitAmount) || 0;
       const signalAmt = Number(signal.amount);
@@ -1687,6 +1804,9 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
           Number((signal.raw as any)?.leverage ?? (signal.raw as any)?.leverageType) || 0;
         // 信号未带杠杆时 placeOrder 默认 1；展示保证金在仓位 leverage 为空时按合约 5 倍兜底
         const placeLev = rawLev > 0 ? rawLev : undefined;
+        this.logger.log(
+          `跟单环节: 准备下单 user=${u.email} ${signal.apiCode} ${signal.coinName} ${signal.isOpen ? '开' : '平'} ${signal.positionSide} 数量=${followAmount}`,
+        );
         const result = await this.trade.placeOrder(u.id, {
           exchange: signal.exchange,
           symbol: signal.symbol,
@@ -1752,6 +1872,7 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
             `跟单成功但未解析到 orderId, 过期无法自动撤单 orderGid=${signal.orderGID} user=${u.email}`,
           );
         }
+        if (signal.isOpen && signal.apiCode) this.clearBalanceCool(u.id, signal.apiCode);
         count++;
       } catch (e: any) {
         const reason = formatTradeError(e);
@@ -1766,6 +1887,27 @@ export class FollowerWorker implements OnModuleInit, OnModuleDestroy {
           rawBody != null
             ? JSON.stringify(rawBody).slice(0, 8000)
             : undefined;
+        const apiCode = String(signal.apiCode || '').trim();
+        const balanceHit =
+          signal.isOpen &&
+          !!apiCode &&
+          isInsufficientOpenBalance(
+            signal.exchange,
+            `${reason}\n${extractPlaceOrderFailReason(rawBody) || ''}`,
+          );
+        if (balanceHit && apiCode) {
+          const kind = this.noteBalanceMiss(u.id, apiCode);
+          if (kind === 'again') {
+            await this.prisma.signalFollowLog
+              .delete({ where: { signalKey_userId: { signalKey, userId: u.id } } })
+              .catch(() => undefined);
+            this.logGate(
+              `bal-again:${u.id}:${apiCode}`,
+              `跟单环节: 连续余额不足，不写日志并再挡1分钟 user=${u.email} ${apiCode} ${signal.coinName}`,
+            );
+            continue;
+          }
+        }
         await this.prisma.signalFollowLog.update({
           where: { signalKey_userId: { signalKey, userId: u.id } },
           data: {

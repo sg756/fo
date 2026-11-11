@@ -11,6 +11,7 @@ FlowOrder / users-manager 运维脚本总说明
   scripts/deploy-windows/   → Windows：本机编译
   scripts/mobile/           → App（Expo）打包
   scripts/gost/             → GOST 代理
+  scripts/h5-nginx/         → 另一台机 nginx 托管 H5 + /api 反代
   scripts/dev/              → 本机 Windows 开发环境（Node / env / 建库）
 
 配置文件（脚本执行前先改）：
@@ -74,6 +75,9 @@ FlowOrder / users-manager 运维脚本总说明
   Windows 本机编译                   scripts\deploy-windows\build.ps1
   Windows 产物上线                   sudo bash scripts/install-env/apply-dist.sh
   Linux 启停                         scripts/deploy/run/start|restart|stop.sh
+  导出线上库到本机测试               sudo bash scripts/install-env/export-db.sh
+                                     再 scripts\dev\import-linux-db.ps1 -Dump <sql>
+  备份本机库                         scripts\dev\backup-db.cmd
 
 
 --------------------------------------------------------------------------------

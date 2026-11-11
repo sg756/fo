@@ -47,12 +47,8 @@ export function MyWalletScreen() {
     }, [load]),
   );
 
-  const totalDeposit = txs
-    .filter((t) => t.type === 'RECHARGE')
-    .reduce((s, t) => s + Number(t.amount), 0);
-  const totalCommission = txs
-    .filter((t) => t.type === 'COMMISSION')
-    .reduce((s, t) => s + Number(t.amount), 0);
+  const totalDeposit = Number(card?.rechargeTotal ?? 0);
+  const totalCommission = Number(card?.commissionTotal ?? 0);
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
@@ -68,24 +64,30 @@ export function MyWalletScreen() {
         }
       >
         <View style={[styles.hero, { backgroundColor: theme.card, borderColor: theme.border }]}>
-          <Text style={{ color: theme.textSecondary }}>点卡余额</Text>
-          <Text style={{ color: theme.text, fontSize: 30, fontWeight: '800', marginTop: 8 }}>
-            {loading ? '—' : fmtAmount(card?.balance)}
-          </Text>
-          {Number(card?.frozen) > 0 ? (
-            <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 4 }}>
-              冻结中 {fmtAmount(card?.frozen)}
-            </Text>
-          ) : null}
-          <Text style={{ color: theme.textSecondary, marginTop: 14 }}>可提佣金</Text>
-          <Text style={{ color: theme.text, fontSize: 20, fontWeight: '700', marginTop: 4 }}>
-            {loading ? '—' : fmtAmount(card?.withdrawable ?? card?.commissionBalance)}
-          </Text>
-          {Number(card?.commissionFrozen) > 0 ? (
-            <Text style={{ color: theme.warning, fontSize: 12, marginTop: 4 }}>
-              提现锁定 {fmtAmount(card?.commissionFrozen)}
-            </Text>
-          ) : null}
+          <View style={{ flexDirection: 'row', gap: 12 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: theme.textSecondary, fontSize: 12 }}>点卡余额</Text>
+              <Text style={{ color: theme.text, fontSize: 22, fontWeight: '800', marginTop: 6 }}>
+                {loading ? '—' : fmtAmount(card?.balance)}
+              </Text>
+              {Number(card?.frozen) > 0 ? (
+                <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 4 }}>
+                  冻结中 {fmtAmount(card?.frozen)}
+                </Text>
+              ) : null}
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: theme.textSecondary, fontSize: 12 }}>可提佣金</Text>
+              <Text style={{ color: theme.text, fontSize: 22, fontWeight: '800', marginTop: 6 }}>
+                {loading ? '—' : fmtAmount(card?.withdrawable ?? card?.commissionBalance)}
+              </Text>
+              {Number(card?.commissionFrozen) > 0 ? (
+                <Text style={{ color: theme.warning, fontSize: 12, marginTop: 4 }}>
+                  提现锁定 {fmtAmount(card?.commissionFrozen)}
+                </Text>
+              ) : null}
+            </View>
+          </View>
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 16 }}>
             <View style={{ flex: 1 }}>
               <PrimaryButton title="充值" onPress={() => navigation.navigate('Recharge')} />

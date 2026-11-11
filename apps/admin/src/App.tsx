@@ -33,6 +33,7 @@ import { SymbolListPage } from './pages/SymbolListPage';
 import { TradeSignalsPage } from './pages/TradeSignalsPage';
 import { TradeLogsPage } from './pages/TradeLogsPage';
 import { TradeOrderLogsPage } from './pages/TradeOrderLogsPage';
+import { FundFlowResetPage, StatsResetPage } from './pages/StatsResetPage';
 import { PositionsPage } from './pages/PositionsPage';
 import { PositionsComparePage } from './pages/PositionsComparePage';
 import { FollowersPage } from './pages/FollowersPage';
@@ -491,6 +492,14 @@ export default function App() {
           <Route
             path="trade/order-logs"
             element={<MenuRoute menu="trade_order_logs" element={<TradeOrderLogsPage />} />}
+          />
+          <Route
+            path="trade/stats-reset"
+            element={<MenuRoute menu="trade_stats_reset" element={<StatsResetPage />} />}
+          />
+          <Route
+            path="trade/fund-flow-reset"
+            element={<MenuRoute menu="trade_stats_reset" element={<FundFlowResetPage />} />}
           />
           <Route
             path="trade/positions"

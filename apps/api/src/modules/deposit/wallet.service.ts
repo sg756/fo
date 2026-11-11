@@ -1,8 +1,9 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { Wallet } from '@prisma/client';
 import { HDNodeWallet, Mnemonic, getAddress, isAddress } from 'ethers';
 import { PrismaService } from '../../prisma/prisma.service';
 import { encrypt } from '../../common/crypto.util';
-import { DepositChain } from './chain.config';
+import { DepositChain, getEnabledDepositChains } from './chain.config';
 
 const HD_INDEX_KEY = 'hd_next_index';
 
@@ -47,56 +48,125 @@ export class WalletService {
   /**
    * 确保用户有平台托管充值地址 (资金归平台, 仅用于识别该用户的链上转入)。
    * EVM 同钥同址: 若用户已有任一 EVM 地址, 复用私钥/地址, 仅补一条 chain 记录。
+   * BSC 与 ARB/ETH/BASE 是同一 0x 地址，Gas 在 BSC 上用 BNB。
    */
   async ensureUserWallet(userId: string, chain: DepositChain) {
     const existing = await this.prisma.wallet.findFirst({ where: { userId, chain } });
     if (existing) return existing;
 
-    // 复用同用户其他链的钱包 (EVM 地址相同)
     const sibling = await this.prisma.wallet.findFirst({
       where: { userId },
       orderBy: { createdAt: 'asc' },
     });
     if (sibling) {
-      return this.prisma.wallet.create({
-        data: {
-          userId,
-          chain,
-          address: sibling.address,
-          derivIndex: sibling.derivIndex,
-          encPrivateKey: sibling.encPrivateKey,
-        },
-      });
+      try {
+        return await this.prisma.wallet.create({
+          data: {
+            userId,
+            chain,
+            address: sibling.address,
+            derivIndex: sibling.derivIndex,
+            encPrivateKey: sibling.encPrivateKey,
+          },
+        });
+      } catch (e) {
+        this.rethrowWalletWrite(e);
+      }
     }
 
     const index = await this.nextDerivIndex();
     const { address, privateKey } = this.deriveAt(index);
     this.logger.log(`为用户 ${userId} 派生充值地址 index=${index} ${address}`);
-    return this.prisma.wallet.create({
-      data: {
-        userId,
-        chain,
-        address,
-        derivIndex: index,
-        encPrivateKey: encrypt(privateKey),
-      },
-    });
+    try {
+      return await this.prisma.wallet.create({
+        data: {
+          userId,
+          chain,
+          address,
+          derivIndex: index,
+          encPrivateKey: encrypt(privateKey),
+        },
+      });
+    } catch (e) {
+      this.rethrowWalletWrite(e);
+    }
   }
 
-  async findByAddress(address: string) {
+  /** 旧库 UNIQUE(address) 会挡住同一 0x 的第二条链 */
+  private rethrowWalletWrite(e: unknown): never {
+    const code = (e as { code?: string })?.code;
+    if (code === 'P2002') {
+      throw new BadRequestException(
+        '托管地址写不进去：数据表仍把地址设成全局唯一，BSC 与 ARB 是同一个地址，需要先去掉 wallets.address 的唯一索引',
+      );
+    }
+    throw e;
+  }
+
+  /**
+   * 已有托管地址的用户，补齐当前启用链（BSC 与 ARB 同一 0x）。
+   * createIfMissing 时连第一条地址也派生出来。
+   */
+  async ensureEnabledChainWallets(userId: string, opts?: { createIfMissing?: boolean }): Promise<Wallet[]> {
+    const any = await this.prisma.wallet.findFirst({
+      where: { userId },
+      select: { id: true },
+    });
+    if (!any && !opts?.createIfMissing) return [];
+    const rows: Wallet[] = [];
+    for (const chain of getEnabledDepositChains()) {
+      rows.push(await this.ensureUserWallet(userId, chain));
+    }
+    return rows;
+  }
+
+  /** 给已有钱包的用户补上新启用链，供扫块识别 */
+  async backfillEnabledChainWallets() {
+    const chains = getEnabledDepositChains();
+    const rows = await this.prisma.wallet.findMany({
+      select: { userId: true, chain: true },
+    });
+    const byUser = new Map<string, Set<string>>();
+    for (const row of rows) {
+      let set = byUser.get(row.userId);
+      if (!set) {
+        set = new Set();
+        byUser.set(row.userId, set);
+      }
+      set.add(row.chain);
+    }
+    let created = 0;
+    for (const [userId, have] of byUser) {
+      for (const chain of chains) {
+        if (have.has(chain)) continue;
+        await this.ensureUserWallet(userId, chain);
+        created += 1;
+      }
+    }
+    if (created > 0) {
+      this.logger.log(`已为启用链补齐 ${created} 条托管地址`);
+    }
+    return created;
+  }
+
+  async findByAddress(address: string, chain?: DepositChain) {
     if (!isAddress(address)) return null;
     const checksum = getAddress(address);
     return this.prisma.wallet.findFirst({
       where: {
+        ...(chain ? { chain } : {}),
         OR: [{ address: checksum }, { address: checksum.toLowerCase() }],
       },
       include: { user: { select: { id: true, email: true, status: true } } },
     });
   }
 
-  /** 当前所有活跃充值地址 (小写), 供扫块过滤 */
-  async listWatchAddresses(): Promise<string[]> {
-    const rows = await this.prisma.wallet.findMany({ select: { address: true } });
+  /** 某条链上的托管地址（小写），供扫块过滤 */
+  async listWatchAddresses(chain?: DepositChain): Promise<string[]> {
+    const rows = await this.prisma.wallet.findMany({
+      where: chain ? { chain } : undefined,
+      select: { address: true },
+    });
     return Array.from(new Set(rows.map((r) => r.address.toLowerCase())));
   }
 }

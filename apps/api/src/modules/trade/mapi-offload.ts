@@ -3,10 +3,13 @@ import { join } from 'path';
 import { Worker } from 'worker_threads';
 import type { MapiOffloadJob, MapiOffloadReply } from './mapi-offload-lib';
 
-export type MapiOffloadRequest = Omit<MapiOffloadJob, 'id'>;
+export type MapiOffloadRequest = Omit<MapiOffloadJob, 'id'> & {
+  /** 指定工作线程。不传则按 URL 分到 heavy / signal */
+  lane?: MapiOffloadLane;
+};
 
-/** heavy=盘口/交易对/账户/代理大包；signal=LastOrderRecords，互不排队 */
-export type MapiOffloadLane = 'heavy' | 'signal';
+/** heavy=盘口/交易对/账户/代理大包；signal=LastOrderRecords；probe=代理探活。三条互不排队 */
+export type MapiOffloadLane = 'heavy' | 'signal' | 'probe';
 
 type Pending = {
   resolve: (v: MapiOffloadReply) => void;
@@ -21,6 +24,7 @@ type LaneState = {
 const lanes: Record<MapiOffloadLane, LaneState> = {
   heavy: { worker: null, pending: new Map() },
   signal: { worker: null, pending: new Map() },
+  probe: { worker: null, pending: new Map() },
 };
 
 let seq = 1;
@@ -98,6 +102,7 @@ function ensureWorker(lane: MapiOffloadLane): Worker {
 }
 
 function laneOfJob(job: MapiOffloadRequest): MapiOffloadLane {
+  if (job.lane) return job.lane;
   return String(job.url || '').includes('LastOrderRecords') ? 'signal' : 'heavy';
 }
 
@@ -108,7 +113,15 @@ export async function runMapiOffload(
   const w = ensureWorker(lane);
   const state = lanes[lane];
   const id = seq++;
-  const payload: MapiOffloadJob = { ...job, id };
+  const payload: MapiOffloadJob = {
+    id,
+    url: job.url,
+    method: job.method,
+    headers: job.headers,
+    body: job.body,
+    timeoutMs: job.timeoutMs,
+    compact: job.compact,
+  };
   const waitMs = Math.max(1000, Number(job.timeoutMs) || 15_000) + 8_000;
   return new Promise<MapiOffloadReply>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -139,7 +152,7 @@ export async function runMapiOffload(
 
 export async function stopMapiOffload(): Promise<void> {
   const err = new Error('mapi 工作线程已停止');
-  const workers = (['heavy', 'signal'] as const).map((lane) => {
+  const workers = (['heavy', 'signal', 'probe'] as const).map((lane) => {
     const w = lanes[lane].worker;
     lanes[lane].worker = null;
     rejectLane(lane, err);

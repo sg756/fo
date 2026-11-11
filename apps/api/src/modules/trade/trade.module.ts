@@ -10,6 +10,7 @@ import { ExchangeFeeService } from './exchange-fee.service';
 import { TradeAdminController, TradeController } from './trade.controller';
 import { FollowerWorker } from './follower.worker';
 import { QueryPositionWorker } from './query-position.worker';
+import { ProxyProbeWorker } from './proxy-probe.worker';
 
 @Module({
   imports: [MarketModule, AdminModule, forwardRef(() => IpPoolModule)],
@@ -22,6 +23,7 @@ import { QueryPositionWorker } from './query-position.worker';
     TradeService,
     FollowerWorker,
     QueryPositionWorker,
+    ProxyProbeWorker,
   ],
   exports: [TradeService, MapiClient, SymbolService, FollowerWorker, QueryPositionWorker],
 })

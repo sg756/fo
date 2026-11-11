@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { AdminApi } from '../api';
+import { EXCHANGES } from '../exchanges';
 import { confirmDialog } from '../components/ConfirmDialog';
 import { DraggableFloatPanel } from '../components/DraggableFloatPanel';
 import { ListLoading } from '../components/ListLoading';
@@ -9,7 +10,7 @@ import { SearchSelect } from '../components/SearchSelect';
 import { toast } from '../components/Toast';
 import { CopyMonoCell } from '../components/CopyMonoCell';
 import { normalizePaged, usePager } from '../hooks/usePager';
-import { useCoinOptions, useUserOptions, useMiddlewareAccounts, MARKET_PERIOD_OPTIONS, marketPeriodLabel, accountGidLabel, accountGidTitle, USER_FILTER_PLACEHOLDER, USER_FILTER_EMPTY_HINT } from '../hooks/useSearchFilterOptions';
+import { useCoinOptions, useUserOptions, useMiddlewareAccounts, MARKET_PERIOD_OPTIONS, settlementCoinLabel, contractPeriodLabel, accountGidLabel, accountGidTitle, USER_FILTER_PLACEHOLDER, USER_FILTER_EMPTY_HINT } from '../hooks/useSearchFilterOptions';
 
 const STATUS_LABEL: Record<string, string> = {
   PENDING: '准备中',
@@ -57,6 +58,7 @@ function enrichLogRow(r: any) {
     coinName: r.coinName || req.coinName || symCoin || null,
     equalCoinName: r.equalCoinName || req.equalCoinName || symEq || null,
     accountType: r.accountType || req.accountType || null,
+    positionSide: r.positionSide || req.positionSide || null,
     signalPrice: req.price ?? req.signalPrice ?? null,
     signalAmount: req.signalAmount ?? null,
     followAmount: req.amount ?? null,
@@ -75,6 +77,14 @@ function fmtSignalTime(r: ReturnType<typeof enrichLogRow>) {
   }
 }
 
+function positionSideLabel(r: any): string {
+  const raw = String(r.positionSide || '').trim().toLowerCase();
+  if (!raw) return '—';
+  if (raw.includes('short') || raw === '空' || raw === '2') return '空';
+  if (raw.includes('long') || raw === '多' || raw === '1') return '多';
+  return '—';
+}
+
 function openCloseLabel(r: any): string {
   if (r.isOpen === true) return '开';
   if (r.isOpen === false) return '平';
@@ -83,8 +93,6 @@ function openCloseLabel(r: any): string {
   if (side === 'close' || side === 'sell') return '平';
   return '—';
 }
-
-const EXCHANGES = ['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'];
 
 function statusAccent(status: string): string | undefined {
   if (status === 'CANCEL_FAILED' || status === 'FAILED') return '#dc2626';
@@ -557,7 +565,9 @@ export function TradeOrderLogsPage() {
                 <th>交易所</th>
                 <th>币名</th>
                 <th>开平</th>
-                <th>类型</th>
+                <th>多空</th>
+                <th>结算币</th>
+                <th>周期</th>
                 <th>状态</th>
                 <th>成交形态</th>
                 <th>异常</th>
@@ -631,7 +641,23 @@ export function TradeOrderLogsPage() {
                       );
                     })()}
                   </td>
-                  <td className="nowrap">{marketPeriodLabel(r)}</td>
+                  <td className="nowrap">
+                    {(() => {
+                      const dir = positionSideLabel(r);
+                      return (
+                        <span
+                          className="badge"
+                          style={{
+                            color: dir === '多' ? '#16a34a' : dir === '空' ? '#dc2626' : undefined,
+                          }}
+                        >
+                          {dir}
+                        </span>
+                      );
+                    })()}
+                  </td>
+                  <td className="nowrap">{settlementCoinLabel(r)}</td>
+                  <td className="nowrap">{contractPeriodLabel(r)}</td>
                   <td className="nowrap">
                     <span className="badge" style={{ color: statusAccent(r.status) }}>
                       {statusLabelOf(r)}
@@ -719,10 +745,11 @@ export function TradeOrderLogsPage() {
         {signalDetail ? (
           <div className="float-kv">
             <span className="k">币</span>
-            <span className="v">
-              {signalDetail.coinName || '—'}
-              {signalDetail.equalCoinName ? `/${signalDetail.equalCoinName}` : ''}
-            </span>
+            <span className="v">{signalDetail.coinName || '—'}</span>
+            <span className="k">结算币</span>
+            <span className="v">{settlementCoinLabel(signalDetail)}</span>
+            <span className="k">周期</span>
+            <span className="v">{contractPeriodLabel(signalDetail)}</span>
             <span className="k">价格</span>
             <span className="v">
               {signalDetail.signalPrice != null && signalDetail.signalPrice !== ''
@@ -736,6 +763,18 @@ export function TradeOrderLogsPage() {
                 : signalDetail.followAmount != null && signalDetail.followAmount !== ''
                   ? String(signalDetail.followAmount)
                   : '—'}
+            </span>
+            <span className="k">多空</span>
+            <span
+              className={`v ${
+                positionSideLabel(signalDetail) === '多'
+                  ? 'side-open'
+                  : positionSideLabel(signalDetail) === '空'
+                    ? 'side-close'
+                    : ''
+              }`}
+            >
+              {positionSideLabel(signalDetail)}
             </span>
             <span className="k">开平</span>
             <span

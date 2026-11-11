@@ -27,8 +27,11 @@ import {
   toApiCode,
   apiName,
   fromApiCode,
+  lookupApiCode,
+  apiCodeModeLabel,
   isFuturesAccountType,
   accountTypeFromEqualCoin,
+  accountTypeForApiCode,
   accountTypesForExchange,
   adminBalanceAccountTypes,
 } from './exchange-codes';
@@ -66,6 +69,7 @@ import {
 import {
   estimateLiquidationPrice,
   numbersDiffer,
+  normalizeFutureEqualCoin,
   parseQueryPositionPayload,
   queryPositionMatchKey,
 } from './query-position.util';
@@ -129,6 +133,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   private accountListCache: { items: any[]; fetchedAt: number } | null = null;
   private accountListInflight: Promise<{ items: any[] }> | null = null;
   private accountListTimer: ReturnType<typeof setInterval> | null = null;
+  /** 对齐/清理用的主账户 GID 短时结果（成功含空列表才复用，避免队列里每人打一次） */
+  private listedGidsMemo: {
+    at: number;
+    result: { ok: true; gids: Set<string> } | { ok: false; message: string };
+  } | null = null;
   private proxyListCache: { items: { ip: string; name: string }[]; fetchedAt: number } | null =
     null;
   private proxyListInflight: Promise<{ items: { ip: string; name: string }[] }> | null = null;
@@ -151,9 +160,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       () => void this.refreshAccountListCache(),
       this.accountListTtlMs(),
     );
-    void this.refreshProxyListCache();
+    this.refreshProxyListInBackground();
     this.proxyListTimer = setInterval(
-      () => void this.refreshProxyListCache(),
+      () => this.refreshProxyListInBackground(),
       this.proxyListTtlMs(),
     );
   }
@@ -215,8 +224,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     const userAccountName =
       user?.nickname?.trim() || user?.email?.split('@')[0]?.trim() || userId;
     const accountName = accountOverride?.name?.trim() || userAccountName;
-    // 与 CryptoSymbolList / PlaceOrder 一致：现货 ba、合约 bac（现货码 + c）。
-    // 查资产若固定基础码，中间件会落回现货全量列表，合约余额查不到。
+    // apiCode 用该所现货码或 USDT 永续码。查资产若固定现货码，中间件会落回现货列表。
     return {
       gid,
       apiCode: toApiCode(exchange, accountType),
@@ -381,6 +389,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             exchange: dto.exchange,
             coinName: symbolSpec.coinName || dto.coinName || '',
             accountType,
+            apiCode: symbolSpec.apiCode || dto.apiCode,
+            equalCoinName: symbolSpec.equalCoinName || dto.equalCoinName,
           }),
         ) || 0;
     }
@@ -465,20 +475,35 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** 文档 InstrumentID：交易所原生币对名，示例 BTC-USDT（非 ETH/PC） */
-  private nativeInstrumentId(symbolSpec: SymbolPairInfo): string {
-    const coin = String(symbolSpec.coinName || '')
+  /**
+   * 查单/撤单的结算币，原样作为 settleCoin，并用来拼 InstrumentID。
+   * 永续 equalCoin 是 PC，结算币取交易对表 settleCoin（USDT 或 USDC）。
+   * 现货结算币就是计价币，不用表上那份永续 USDT。
+   */
+  private orderSettleCoin(symbolSpec: SymbolPairInfo, isFutures: boolean): string {
+    const listed = String(symbolSpec.settleCoin || '')
       .trim()
       .toUpperCase();
-    const settle = String(symbolSpec.settleCoin || '')
-      .trim()
-      .toUpperCase();
-    if (coin && settle) return `${coin}-${settle}`;
+    if (isFutures) {
+      if (listed && listed !== 'PC') return listed;
+      return 'USDT';
+    }
     const eq = String(symbolSpec.equalCoinName || '')
       .trim()
       .toUpperCase();
-    if (coin && eq && eq !== 'PC') return `${coin}-${eq}`;
-    return String(symbolSpec.symbol || `${coin}/${eq || 'USDT'}`);
+    if (eq === 'U' || eq === 'USD' || eq === 'USDT') return 'USDT';
+    if (eq && eq !== 'PC') return eq;
+    return listed && listed !== 'PC' ? listed : 'USDT';
+  }
+
+  /** 文档 InstrumentID：交易所原生币对名，如 BTC-USDT、BTC-USDC（非 ETH/PC） */
+  private nativeInstrumentId(symbolSpec: SymbolPairInfo, isFutures: boolean): string {
+    const coin = String(symbolSpec.coinName || '')
+      .trim()
+      .toUpperCase();
+    const settle = this.orderSettleCoin(symbolSpec, isFutures);
+    if (coin) return `${coin}-${settle}`;
+    return String(symbolSpec.symbol || settle);
   }
 
   /** 文档 PositionSide：0 未知 / 1 多 / 2 空 */
@@ -550,6 +575,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     const forCancel = ctx.orderPurpose === 'cancel';
     const lev = Number(ctx.leverage);
     const bills = this.resolveOrderBillIds(ctx);
+    const settleCoin = this.orderSettleCoin(symbolSpec, isFutures);
     return {
       gid: '',
       apiBillID: bills.apiBillID,
@@ -575,9 +601,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       // 文档 Status：0待确定 1部分完成 2全部完成 3撤消订单 — 撤单请求必须传 3
       status: forCancel ? 3 : 0,
       tradeRemark: '',
-      instrumentID: this.nativeInstrumentId(symbolSpec),
+      instrumentID: this.nativeInstrumentId(symbolSpec, isFutures),
       isConfirmed: 0,
-      settleCoin: symbolSpec.settleCoin || '',
+      settleCoin,
       updateTime: 0,
       createTime: 0,
       createTimeMillSeconds: 0,
@@ -682,6 +708,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       .includes('short')
       ? 'short'
       : 'long';
+    const apiCode = String(meta.apiCode || '').trim().toLowerCase();
     try {
       return await this.syncUserPositionFromLots({
         userId: log.userId,
@@ -689,6 +716,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         coinName,
         equalCoinName,
         positionSide,
+        apiCode,
       });
     } catch (e: any) {
       this.logger.error(
@@ -1016,7 +1044,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       orderId: resolvedOrderId,
       symbol: dto.symbol || log?.symbol || undefined,
       accountType,
-      apiCode: dto.apiCode,
+      apiCode: dto.apiCode || meta.apiCode,
       coinName: dto.coinName || log?.coinName || undefined,
       equalCoinName: dto.equalCoinName || log?.equalCoinName || undefined,
       clientOrderId,
@@ -1094,7 +1122,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       const verify = await this.inspectOrderFill(userId, dto.exchange, resolvedOrderId, {
         symbol: orderCtx.symbol,
         accountType,
-        apiCode: dto.apiCode,
+        apiCode: orderCtx.apiCode,
         coinName: orderCtx.coinName,
         equalCoinName: orderCtx.equalCoinName,
         clientOrderId: orderCtx.clientOrderId,
@@ -1254,6 +1282,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName?: string;
     equalCoinName?: string;
     accountType?: string;
+    apiCode?: string;
   }) {
     const orderId = String(params.orderId || '').trim();
     if (!orderId) throw new BadRequestException('请输入交易所订单号');
@@ -1287,8 +1316,17 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
+    let logApiCode = '';
+    try {
+      const body = log?.requestBody ? JSON.parse(log.requestBody) : {};
+      logApiCode = String(body?.apiCode || '').trim().toLowerCase();
+    } catch {
+      logApiCode = '';
+    }
+    const apiCode = String(params.apiCode || logApiCode || '').trim().toLowerCase() || undefined;
+
     this.logger.log(
-      `手动撤单测试 exchange=${params.exchange} orderId=${orderId} user=${userId} ${coinName}/${equalCoinName}`,
+      `手动撤单测试 exchange=${params.exchange} orderId=${orderId} user=${userId} ${coinName}/${equalCoinName} apiCode=${apiCode || '—'}`,
     );
 
     try {
@@ -1297,6 +1335,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         orderId,
         symbol: log?.symbol || `${coinName}/${equalCoinName}`,
         accountType: params.accountType || log?.accountType || 'future',
+        apiCode,
         coinName,
         equalCoinName,
         clientOrderId: log?.clientOrderId || undefined,
@@ -1599,10 +1638,18 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
 
     const cfg = await this.prisma.userFollowConfig.findFirst({
       where: { userId, exchange },
-      include: { template: { select: { accountGid: true, accountName: true } } },
+      include: {
+        template: {
+          select: {
+            allAccounts: true,
+            accounts: { select: { accountGid: true, accountName: true }, take: 2 },
+          },
+        },
+      },
     });
-    const accountGid = String(cfg?.template?.accountGid || '').trim() || null;
-    const accountName = String(cfg?.template?.accountName || '').trim() || null;
+    const only = this.singleTemplateAccount(cfg?.template);
+    const accountGid = only.accountGid;
+    const accountName = only.accountName;
 
     let created = 0;
     let updated = 0;
@@ -1782,6 +1829,19 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * 代理探活：用指定用户的合约 Key 打 QueryPosition，proxyIP 由调用方传入。
+   * 只表示是否拿到 HTTP 回包。不改持仓、不写挂单日志、不计入传输失败。
+   */
+  async probeQueryPosition(userId: string, exchange: Exchange, proxyIP: string): Promise<boolean> {
+    const account = await this.buildAccount(userId, exchange, 'future');
+    return this.mapi.probeReached('mapi/QueryPosition', {
+      proxyIP,
+      accountType: 'future',
+      account,
+    });
+  }
+
+  /**
    * 查询单笔委托状态 (mapi/QueryOrder, 严格按文档: order+symbol+account)。
    * 返回文档 data: { status, filledAmt, priceAvg, tradeFee, errorMsg }。
    */
@@ -1950,20 +2010,226 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     return { items, errors: [] as { exchange: string; message: string }[] };
   }
 
+  /** 同一笔本地仓：用户|apiCode|币|周期|方向。交易所不参与，USDT/USDC 靠 apiCode 分开。 */
+  private posContractKey(p: {
+    userId: string;
+    apiCode?: string | null;
+    coinName?: string | null;
+    equalCoinName?: string | null;
+    positionSide?: string | null;
+  }): string {
+    const side = String(p.positionSide || 'long').toLowerCase().includes('short')
+      ? 'short'
+      : 'long';
+    return [
+      p.userId,
+      String(p.apiCode || '').trim().toLowerCase(),
+      String(p.coinName || '').toUpperCase(),
+      String(p.equalCoinName || 'PC').toUpperCase(),
+      side,
+    ].join('|');
+  }
+
+  private apiCodeFromBody(raw: string | null | undefined): string {
+    try {
+      return String(JSON.parse(raw || '{}').apiCode || '')
+        .trim()
+        .toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+
   /**
-   * 盘口价仅观察用，不挡列表：先出本地仓，再按这些币对后台刷 GetDepth。
-   * 慢了下次轮询会带上缓存价。
+   * 没写 apiCode 的开仓归到哪一行。
+   * 这一组只有一个已知代码时跟着它；一个都没有时才用交易所默认码。
+   * 同时存在多个代码（例如 bac 和 bab）时返回空，调用方不要猜。
    */
-  private kickoffPositionMarkPrices(
-    rows: Array<{ exchange: Exchange; coinName: string; accountType: string | null }>,
+  private unlabeledLotApiCode(defaultCode: string, knownCodes: ReadonlySet<string>): string {
+    if (knownCodes.size === 1) return [...knownCodes][0];
+    if (knownCodes.size === 0) return defaultCode;
+    return '';
+  }
+
+  /** 这条开仓是否计入 wantCode。请求体有代码时必须一致。 */
+  private lotBelongsToApiCode(
+    bodyCode: string,
+    wantCode: string,
+    defaultCode: string,
+    knownCodes: ReadonlySet<string>,
+  ): boolean {
+    if (bodyCode) return bodyCode === wantCode;
+    const unlabeled = this.unlabeledLotApiCode(defaultCode, knownCodes);
+    return !!unlabeled && unlabeled === wantCode;
+  }
+
+  /** 持仓上还没有 apiCode 时，用开仓流水补上，避免以后清流水就丢。 */
+  private async rememberPositionApiCode(
+    row: {
+      userId: string;
+      exchange: Exchange;
+      coinName?: string | null;
+      equalCoinName?: string | null;
+      positionSide?: string | null;
+    },
+    apiCode: string,
+  ) {
+    const code = String(apiCode || '').trim().toLowerCase();
+    const coinName = String(row.coinName || '').trim().toUpperCase();
+    if (!code || !row.userId || !coinName) return;
+    const positionSide = String(row.positionSide || 'long').toLowerCase().includes('short')
+      ? 'short'
+      : 'long';
+    await this.prisma.userPosition.updateMany({
+      where: {
+        userId: row.userId,
+        exchange: row.exchange,
+        coinName,
+        equalCoinName: String(row.equalCoinName || '').trim().toUpperCase(),
+        positionSide,
+        apiCode: '',
+      },
+      data: { apiCode: code },
+    });
+  }
+
+  /**
+   * 每条持仓自己的 apiCode。优先持仓表上已存的，没有再读开仓流水并写回持仓。
+   */
+  private async loadOpenApiCodeMap(
+    rows: Array<{
+      userId: string;
+      exchange: Exchange;
+      coinName: string;
+      equalCoinName?: string | null;
+      positionSide?: string | null;
+      apiCode?: string | null;
+    }>,
+  ): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!rows.length) return map;
+    const missing: typeof rows = [];
+    for (const row of rows) {
+      const stored = String(row.apiCode || '').trim().toLowerCase();
+      if (!stored) {
+        missing.push(row);
+        continue;
+      }
+      const key = this.posContractKey(row);
+      if (!map.has(key)) map.set(key, stored);
+    }
+    if (!missing.length) return map;
+    rows = missing;
+    const userIds = [...new Set(rows.map((r) => r.userId).filter(Boolean))];
+    const coins = [
+      ...new Set(
+        rows.flatMap((r) => {
+          const raw = String(r.coinName || '').trim();
+          if (!raw) return [];
+          const up = raw.toUpperCase();
+          return raw === up ? [raw] : [raw, up];
+        }),
+      ),
+    ];
+    if (!userIds.length || !coins.length) return map;
+    const logs = await this.prisma.signalFollowLog.findMany({
+      where: { isOpen: true, userId: { in: userIds }, coinName: { in: coins } },
+      orderBy: { createdAt: 'desc' },
+      take: 4000,
+      select: {
+        userId: true,
+        exchange: true,
+        coinName: true,
+        equalCoinName: true,
+        positionSide: true,
+        requestBody: true,
+        filledAmt: true,
+        consumedAmt: true,
+      },
+    });
+    const fallback = new Map<string, string>();
+    const legacyCodes = new Map<string, Set<string>>();
+    for (const row of logs) {
+      let code = '';
+      try {
+        code = String(JSON.parse(row.requestBody || '{}').apiCode || '')
+          .trim()
+          .toLowerCase();
+      } catch {
+        code = '';
+      }
+      if (!code) continue;
+      const side = String(row.positionSide || 'long').toLowerCase().includes('short')
+        ? 'short'
+        : 'long';
+      const legacy = [
+        row.userId,
+        row.exchange,
+        String(row.coinName || '').toUpperCase(),
+        String(row.equalCoinName || 'PC').toUpperCase(),
+        side,
+      ].join('|');
+      const set = legacyCodes.get(legacy) || new Set<string>();
+      set.add(code);
+      legacyCodes.set(legacy, set);
+      const key = this.posContractKey({ ...row, apiCode: code });
+      const remain = Number(row.filledAmt ?? 0) - Number(row.consumedAmt ?? 0);
+      if (remain > 1e-12) {
+        if (!map.has(key)) map.set(key, code);
+      } else if (!fallback.has(key)) {
+        fallback.set(key, code);
+      }
+    }
+    for (const [k, v] of fallback) {
+      if (!map.has(k)) map.set(k, v);
+    }
+    for (const row of rows) {
+      let code = map.get(this.posContractKey(row));
+      if (!code && !String(row.apiCode || '').trim()) {
+        const side = String(row.positionSide || 'long').toLowerCase().includes('short')
+          ? 'short'
+          : 'long';
+        const legacy = [
+          row.userId,
+          row.exchange,
+          String(row.coinName || '').toUpperCase(),
+          String(row.equalCoinName || 'PC').toUpperCase(),
+          side,
+        ].join('|');
+        const set = legacyCodes.get(legacy);
+        if (set && set.size === 1) code = [...set][0];
+      }
+      if (code) {
+        const key = this.posContractKey(row);
+        if (!map.has(key)) map.set(key, code);
+        await this.rememberPositionApiCode(row, code);
+      }
+    }
+    return map;
+  }
+
+  /**
+   * 列表返回前写入标记价。先 币名_计价_开仓apiCode，永续没有再 币名_PC_BAC，都没有则为 0。
+   * 进程里还没有盘口缓存时，这一次会等 GetDepth 回来再写。
+   */
+  private async fillPositionMarkPrices(
+    rows: Array<{
+      exchange: Exchange;
+      coinName: string;
+      accountType: string | null;
+      apiCode?: string;
+      equalCoinName?: string | null;
+    }>,
   ) {
     if (!rows.length) return;
-    void this.market
+    await this.market
       .ensurePrices(
         rows.map((r) => ({
           exchange: r.exchange,
           coinName: r.coinName,
           market: String(r.accountType || '').toLowerCase() === 'spot' ? 'spot' : 'future',
+          apiCode: r.apiCode,
+          equalCoinName: r.equalCoinName || undefined,
         })),
       )
       .catch((e: any) => {
@@ -2011,9 +2277,18 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         orderBy: { openedAt: 'desc' },
       })
     ).filter((r) => !r.abnormal);
-    this.kickoffPositionMarkPrices(rows);
+    const apiCodes = await this.loadOpenApiCodeMap(rows);
+    await this.fillPositionMarkPrices(
+      rows.map((r) => ({
+        exchange: r.exchange,
+        coinName: r.coinName,
+        accountType: r.accountType,
+        apiCode: apiCodes.get(this.posContractKey(r)),
+        equalCoinName: r.equalCoinName,
+      })),
+    );
     const items = rows.map((r) => ({
-      ...this.mapUserPositionRow(r),
+      ...this.mapUserPositionRow(r, apiCodes.get(this.posContractKey(r))),
       userId: r.userId,
       source: 'local' as string,
     }));
@@ -2021,14 +2296,13 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     return { items, errors: [] as { exchange: string; message: string }[] };
   }
 
-  /** 本地仍 OPEN 的用户×交易所（合约；现货不走 QueryPosition） */
+  /** 本地仍 OPEN 的用户×交易所（含现货；按各自 apiCode 对齐） */
   async listOpenQueryPositionTargets(userId?: string): Promise<
     Array<{ userId: string; exchange: Exchange }>
   > {
     const where: Prisma.UserPositionWhereInput = {
       status: UserPositionStatus.OPEN,
       qty: { gt: 0 },
-      OR: [{ accountType: null }, { NOT: { accountType: { in: ['spot', 'SPOT'] } } }],
     };
     if (userId?.trim()) where.userId = userId.trim();
     const rows = await this.prisma.userPosition.findMany({
@@ -2046,27 +2320,166 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     return out;
   }
 
-  async hasPendingAlignOrders(userId: string, exchange: Exchange): Promise<boolean> {
-    const row = await this.prisma.signalFollowLog.findFirst({
+  /**
+   * 对齐入队目标：优先 OPEN；指定 userId 且无 OPEN 时，用最近已平/异常仓的交易所兜底，
+   * 以便还能按历史 apiCode 打 QueryPosition 补仓。定时全量扫描仍只扫 OPEN。
+   */
+  async listQueryPositionAlignTargets(userId?: string): Promise<
+    Array<{ userId: string; exchange: Exchange }>
+  > {
+    const open = await this.listOpenQueryPositionTargets(userId);
+    if (open.length > 0 || !userId?.trim()) return open;
+    const uid = userId.trim();
+    const recent = await this.prisma.userPosition.findMany({
+      where: {
+        userId: uid,
+        OR: [{ status: UserPositionStatus.CLOSED }, { abnormal: true }],
+      },
+      orderBy: [{ closedAt: 'desc' }, { updatedAt: 'desc' }],
+      take: 40,
+      select: { exchange: true },
+    });
+    const seen = new Set<string>();
+    const out: Array<{ userId: string; exchange: Exchange }> = [];
+    for (const r of recent) {
+      if (seen.has(r.exchange)) continue;
+      seen.add(r.exchange);
+      out.push({ userId: uid, exchange: r.exchange });
+    }
+    return out;
+  }
+
+  /**
+   * 无 OPEN 时：从最近已平仓 / 异常仓收集 apiCode + 主账户标签（作补入 donor）。
+   * 按 closedAt/updatedAt 新→旧，每个 apiCode 只留最近一条。
+   */
+  private async loadRecentAlignApiCodeHints(
+    userId: string,
+    exchange: Exchange,
+    take = 40,
+  ): Promise<
+    Map<
+      string,
+      {
+        accountGid: string | null;
+        accountName: string | null;
+        accountType: string | null;
+      }
+    >
+  > {
+    const rows = await this.prisma.userPosition.findMany({
+      where: {
+        userId,
+        exchange,
+        OR: [{ status: UserPositionStatus.CLOSED }, { abnormal: true }],
+      },
+      orderBy: [{ closedAt: 'desc' }, { updatedAt: 'desc' }],
+      take,
+      select: {
+        apiCode: true,
+        accountType: true,
+        accountGid: true,
+        accountName: true,
+      },
+    });
+    const map = new Map<
+      string,
+      {
+        accountGid: string | null;
+        accountName: string | null;
+        accountType: string | null;
+      }
+    >();
+    for (const r of rows) {
+      const at = String(r.accountType || '').toLowerCase() === 'spot' ? 'spot' : 'future';
+      const code =
+        String(r.apiCode || '')
+          .trim()
+          .toLowerCase() || toApiCode(exchange, at);
+      if (!code || map.has(code)) continue;
+      map.set(code, {
+        accountGid: r.accountGid ?? null,
+        accountName: r.accountName ?? null,
+        accountType: r.accountType || at,
+      });
+    }
+    return map;
+  }
+
+  /** 未完成跟单只挡住同一币+周期+方向，不让一笔挂单拖住整户对齐 */
+  private async pendingAlignKeys(userId: string, exchange: Exchange): Promise<Set<string>> {
+    const rows = await this.prisma.signalFollowLog.findMany({
       where: {
         userId,
         exchange,
         status: { in: ['PLACED', 'CANCEL_FAILED', 'PENDING'] },
       },
-      select: { id: true },
+      select: { coinName: true, equalCoinName: true, positionSide: true },
     });
-    return !!row;
+    const keys = new Set<string>();
+    for (const row of rows) {
+      if (!row.coinName) continue;
+      keys.add(
+        queryPositionMatchKey(row.coinName, row.equalCoinName || 'PC', row.positionSide || 'long'),
+      );
+    }
+    return keys;
+  }
+
+  /** 按文档 apiCode 拉一户快照。现货基础码走 spot，其余走 future。 */
+  private async fetchQueryPositionSnapshot(
+    userId: string,
+    exchange: Exchange,
+    apiCode: string,
+    opts?: { writePostLog?: boolean },
+  ): Promise<
+    | { ok: true; rows: ReturnType<typeof parseQueryPositionPayload> }
+    | { ok: false; error: string }
+  > {
+    const code = String(apiCode || '').trim().toLowerCase();
+    const accountType = accountTypeForApiCode(exchange, code);
+    const writePostLog = opts?.writePostLog === true;
+    try {
+      const account = await this.buildAccount(userId, exchange, accountType);
+      account.apiCode = code;
+      const { proxyIP } = await this.resolveProxyIp(userId);
+      const { data } = await this.mapi.post<QueryPositionResult>(
+        'mapi/QueryPosition',
+        { proxyIP, accountType, account },
+        {
+          userId,
+          exchange,
+          proxyIp: proxyIP,
+          // 定时对齐默认不写；管理端手动对齐写 PostLog（回包过大由 postlog 截断）
+          skipLog: !writePostLog,
+          feature: writePostLog
+            ? `手动对齐交易所持仓 ${code}`
+            : `用户持仓对齐 ${code}`,
+        },
+      );
+      const err = String((data as any)?.errorMsg || '').trim();
+      if (err) return { ok: false, error: err };
+      return { ok: true, rows: parseQueryPositionPayload(data, { spot: accountType === 'spot' }) };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'query-failed' };
+    }
   }
 
   /**
    * 用 QueryPosition 整户快照对齐本地 OPEN 仓。
-   * 失败 / errorMsg：整户跳过，不把本地改空、不批量废弃。
-   * 交易所多出的币跳过；数量/均价不齐覆盖；保证金 0 或没有不覆盖；
-   * 本地有而快照没有该仓（币+周期+多空）则废弃本地（DISCARD_LOCAL，不下单、不计利润）。
+   * 按开仓 apiCode 分组各查一次：现货 ba、USDT 永续 bac、USDC 永续 bab，以及其他文档码。
+   * 某个 apiCode 查询失败只留住这个码下的仓，不连累其他码。
+   * 未完成跟单只挡住同一币同一方向。数量/均价不齐就覆盖。
+   * 快照里有、本地没有的仓（含本地完全没有的币）补进行情列表。
+   * 该码快照里没有的本地仓废弃（DISCARD_LOCAL，不下单、不计利润）。
+   * 本地无 OPEN 时：用最近已平/异常仓的 apiCode 仍可查并补入；没有历史码则跳过。
+   * MultiAccountList 正常返回后：不在当前主账户列表里的本地仓一并废弃（含接口空列表）；
+   * HTTP/接口失败则不动，避免误删。
    */
   async syncLocalPositionsFromQueryPosition(
     userId: string,
     exchange: Exchange,
+    opts?: { writePostLog?: boolean },
   ): Promise<{
     ok: boolean;
     skipped?: string;
@@ -2086,138 +2499,277 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       matched: 0,
       extraSkipped: 0,
     };
-    if (await this.hasPendingAlignOrders(userId, exchange)) {
-      return { ...empty, skipped: 'pending-orders' };
-    }
+    const writePostLog = opts?.writePostLog === true;
+    const pendingKeys = await this.pendingAlignKeys(userId, exchange);
     const localRows = await this.prisma.userPosition.findMany({
       where: {
         userId,
         exchange,
         status: UserPositionStatus.OPEN,
         qty: { gt: 0 },
-        OR: [{ accountType: null }, { NOT: { accountType: { in: ['spot', 'SPOT'] } } }],
       },
     });
+
+    type HintDonor = {
+      accountGid: string | null;
+      accountName: string | null;
+      accountType: string | null;
+      equalCoinName?: string | null;
+    };
+    const hintDonors = new Map<string, HintDonor>();
+    const groups = new Map<string, typeof localRows>();
+
     if (localRows.length === 0) {
-      return { ...empty, ok: true, skipped: 'no-open' };
-    }
-
-    let remote: ReturnType<typeof parseQueryPositionPayload>;
-    try {
-      const account = await this.buildAccount(userId, exchange, 'future');
-      const { proxyIP } = await this.resolveProxyIp(userId);
-      const { data } = await this.mapi.post<QueryPositionResult>(
-        'mapi/QueryPosition',
-        { proxyIP, accountType: 'future', account },
-        {
-          userId,
-          exchange,
-          proxyIp: proxyIP,
-          skipLog: true,
-          feature: '用户持仓对齐',
-        },
-      );
-      const err = String((data as any)?.errorMsg || '').trim();
-      if (err) {
-        this.logger.warn(
-          `QueryPosition 失败跳过 user=${userId} ${exchange}: ${err}`,
-        );
-        return { ...empty, skipped: err };
+      // 无 OPEN：用最近已平/异常仓的 apiCode 仍可查交易所并补入；没有历史码则无法对齐
+      const hints = await this.loadRecentAlignApiCodeHints(userId, exchange);
+      if (hints.size === 0) {
+        const orphanOnly = await this.discardOutsideAccountPositions(userId, exchange, {
+          writePostLog,
+        });
+        return {
+          ...empty,
+          ok: true,
+          skipped: orphanOnly > 0 ? undefined : 'no-open',
+          discarded: orphanOnly,
+        };
       }
-      remote = parseQueryPositionPayload(data);
-    } catch (e: any) {
-      this.logger.warn(
-        `QueryPosition 异常跳过 user=${userId} ${exchange}: ${e?.message || e}`,
+      for (const [code, hint] of hints) {
+        groups.set(code, []);
+        hintDonors.set(code, hint);
+      }
+      this.logger.log(
+        `QueryPosition 无 OPEN，用最近已平/异常 apiCode=[${[...hints.keys()].join(',')}] user=${userId} ${exchange}`,
       );
-      return { ...empty, skipped: e?.message || 'query-failed' };
+    } else {
+      const apiCodes = await this.loadOpenApiCodeMap(localRows);
+      for (const loc of localRows) {
+        const logged = (apiCodes.get(this.posContractKey(loc)) || '').toLowerCase();
+        const at = String(loc.accountType || '').toLowerCase() === 'spot' ? 'spot' : 'future';
+        const code = logged || toApiCode(exchange, at);
+        const list = groups.get(code) || [];
+        list.push(loc);
+        groups.set(code, list);
+      }
     }
 
-    const remoteByKey = new Map<string, (typeof remote)[number]>();
-    for (const p of remote) {
-      remoteByKey.set(
-        queryPositionMatchKey(p.coinName, p.equalCoinName, p.positionSide),
-        p,
-      );
-    }
-
+    type SnapRow = ReturnType<typeof parseQueryPositionPayload>[number];
+    const remoteKeys = new Set<string>();
+    const errors: string[] = [];
+    let anyOk = false;
     let overlayQty = 0;
     let overlayPrice = 0;
     let overlayLev = 0;
     let discarded = 0;
     let matched = 0;
+    let openedOtherSide = 0;
+    let pendingSkipped = 0;
+    let queryKept = 0;
     const now = new Date();
 
-    for (const loc of localRows) {
-      const key = queryPositionMatchKey(loc.coinName, loc.equalCoinName, loc.positionSide);
-      const hit = remoteByKey.get(key);
-      if (!hit) {
-        await this.prisma.userPosition.update({
-          where: { id: loc.id },
-          data: {
-            status: UserPositionStatus.CLOSED,
-            qty: 0,
-            closedAt: now,
-            closeKind: 'DISCARD_LOCAL',
-            lastCloseFailMsg: '交易所已无该仓，本地废弃',
-            lastCloseOkAt: null,
-            lastCloseOkAmt: null,
-            abnormal: false,
-            closeRetryStopAt: null,
-          },
-        });
-        discarded += 1;
+    for (const [code, rows] of groups) {
+      const fetched = await this.fetchQueryPositionSnapshot(userId, exchange, code, {
+        writePostLog,
+      });
+      if (!fetched.ok) {
+        queryKept += rows.length;
+        errors.push(`${code}:${fetched.error}`);
+        this.logger.warn(
+          `QueryPosition ${code} 失败，保留该码本地仓 user=${userId}: ${fetched.error}`,
+        );
         continue;
       }
-      matched += 1;
-      const patch: Prisma.UserPositionUpdateInput = {};
-      const locQty = Number(loc.qty);
-      const locPx = Number(loc.entryPrice);
-      if (numbersDiffer(locQty, hit.positionAmt)) {
-        patch.qty = new Prisma.Decimal(hit.positionAmt);
-        overlayQty += 1;
+      anyOk = true;
+      const byKey = new Map<string, SnapRow>();
+      for (const p of fetched.rows) {
+        const k = queryPositionMatchKey(p.coinName, p.equalCoinName, p.positionSide);
+        byKey.set(k, p);
+        remoteKeys.add(k);
       }
-      if (hit.openPrice > 0 && numbersDiffer(locPx, hit.openPrice)) {
-        patch.entryPrice = new Prisma.Decimal(hit.openPrice);
-        overlayPrice += 1;
-      }
-      let nextLev: number | null = null;
-      if (hit.leverage != null && hit.leverage > 0) {
-        nextLev = hit.leverage;
-      }
-      if (nextLev != null) {
-        const curLev = loc.leverage != null ? Number(loc.leverage) : NaN;
-        if (!Number.isFinite(curLev) || numbersDiffer(curLev, nextLev, 1e-4)) {
-          patch.leverage = new Prisma.Decimal(Math.round(nextLev * 1e4) / 1e4);
-          overlayLev += 1;
+      for (const loc of rows) {
+        const key = queryPositionMatchKey(loc.coinName, loc.equalCoinName, loc.positionSide);
+        if (pendingKeys.has(key)) {
+          pendingSkipped += 1;
+          continue;
+        }
+        const hit = byKey.get(key);
+        if (!hit) {
+          await this.prisma.userPosition.update({
+            where: { id: loc.id },
+            data: {
+              status: UserPositionStatus.CLOSED,
+              qty: 0,
+              closedAt: now,
+              closeKind: 'DISCARD_LOCAL',
+              lastCloseFailMsg: '交易所已无该仓，本地废弃',
+              lastCloseOkAt: null,
+              lastCloseOkAmt: null,
+              abnormal: false,
+              closeRetryStopAt: null,
+            },
+          });
+          discarded += 1;
+          continue;
+        }
+        matched += 1;
+        const patch: Prisma.UserPositionUpdateInput = {};
+        const locQty = Number(loc.qty);
+        const locPx = Number(loc.entryPrice);
+        if (numbersDiffer(locQty, hit.positionAmt)) {
+          patch.qty = new Prisma.Decimal(hit.positionAmt);
+          overlayQty += 1;
+        }
+        if (hit.openPrice > 0 && numbersDiffer(locPx, hit.openPrice)) {
+          patch.entryPrice = new Prisma.Decimal(hit.openPrice);
+          overlayPrice += 1;
+        }
+        let nextLev: number | null = null;
+        if (hit.leverage != null && hit.leverage > 0) {
+          nextLev = hit.leverage;
+        }
+        if (nextLev != null) {
+          const curLev = loc.leverage != null ? Number(loc.leverage) : NaN;
+          if (!Number.isFinite(curLev) || numbersDiffer(curLev, nextLev, 1e-4)) {
+            patch.leverage = new Prisma.Decimal(Math.round(nextLev * 1e4) / 1e4);
+            overlayLev += 1;
+          }
+        }
+        if (hit.liqPrice != null && hit.liqPrice > 0) {
+          const cur = loc.liqPrice != null ? Number(loc.liqPrice) : NaN;
+          if (!Number.isFinite(cur) || numbersDiffer(cur, hit.liqPrice)) {
+            patch.liqPrice = new Prisma.Decimal(hit.liqPrice);
+          }
+        }
+        if (hit.risk != null && hit.risk > 0) {
+          const cur = loc.risk != null ? Number(loc.risk) : NaN;
+          if (!Number.isFinite(cur) || numbersDiffer(cur, hit.risk, 1e-8)) {
+            patch.risk = new Prisma.Decimal(hit.risk);
+          }
+        }
+        if (Object.keys(patch).length > 0) {
+          await this.prisma.userPosition.update({ where: { id: loc.id }, data: patch });
         }
       }
-      if (hit.liqPrice != null && hit.liqPrice > 0) {
-        const cur = loc.liqPrice != null ? Number(loc.liqPrice) : NaN;
-        if (!Number.isFinite(cur) || numbersDiffer(cur, hit.liqPrice)) {
-          patch.liqPrice = new Prisma.Decimal(hit.liqPrice);
+
+      // 快照里有、本地没有的仓都补进来（另一边，或本地完全没有的币）
+      const accountType = accountTypeForApiCode(exchange, code);
+      for (const hit of byKey.values()) {
+        const hitKey = queryPositionMatchKey(hit.coinName, hit.equalCoinName, hit.positionSide);
+        const exists = rows.some(
+          (loc) =>
+            queryPositionMatchKey(loc.coinName, loc.equalCoinName, loc.positionSide) === hitKey,
+        );
+        if (exists) continue;
+        if (pendingKeys.has(hitKey)) {
+          pendingSkipped += 1;
+          continue;
         }
-      }
-      if (hit.risk != null && hit.risk > 0) {
-        const cur = loc.risk != null ? Number(loc.risk) : NaN;
-        if (!Number.isFinite(cur) || numbersDiffer(cur, hit.risk, 1e-8)) {
-          patch.risk = new Prisma.Decimal(hit.risk);
-        }
-      }
-      if (Object.keys(patch).length > 0) {
-        await this.prisma.userPosition.update({ where: { id: loc.id }, data: patch });
+        const sibling = rows.find((loc) => {
+          const coin = String(loc.coinName || '').toUpperCase() === hit.coinName;
+          const eq =
+            normalizeFutureEqualCoin(loc.equalCoinName) ===
+            normalizeFutureEqualCoin(hit.equalCoinName);
+          return coin && eq;
+        });
+        const hint = hintDonors.get(code);
+        const donor = sibling || rows[0] || hint || null;
+        const equalCoinName =
+          String(hit.equalCoinName || donor?.equalCoinName || 'PC').trim().toUpperCase() || 'PC';
+        const positionSide = hit.positionSide;
+        await this.prisma.userPosition.upsert({
+          where: {
+            user_pos_uniq: {
+              userId,
+              apiCode: code,
+              coinName: hit.coinName,
+              equalCoinName,
+              positionSide,
+            },
+          },
+          create: {
+            userId,
+            exchange,
+            coinName: hit.coinName,
+            equalCoinName,
+            positionSide,
+            accountType: donor?.accountType || accountType,
+            accountGid: donor?.accountGid ?? undefined,
+            accountName: donor?.accountName ?? undefined,
+            apiCode: code,
+            qty: new Prisma.Decimal(hit.positionAmt),
+            entryPrice: new Prisma.Decimal(hit.openPrice > 0 ? hit.openPrice : 0),
+            leverage:
+              hit.leverage != null && hit.leverage > 0
+                ? new Prisma.Decimal(hit.leverage)
+                : undefined,
+            liqPrice:
+              hit.liqPrice != null && hit.liqPrice > 0
+                ? new Prisma.Decimal(hit.liqPrice)
+                : undefined,
+            risk:
+              hit.risk != null && hit.risk > 0 ? new Prisma.Decimal(hit.risk) : undefined,
+            status: UserPositionStatus.OPEN,
+            openedAt: now,
+            closedAt: null,
+            closeKind: null,
+            abnormal: false,
+          },
+          update: {
+            exchange,
+            accountType: donor?.accountType || accountType,
+            accountGid: donor?.accountGid ?? undefined,
+            accountName: donor?.accountName ?? undefined,
+            qty: new Prisma.Decimal(hit.positionAmt),
+            entryPrice: new Prisma.Decimal(hit.openPrice > 0 ? hit.openPrice : 0),
+            ...(hit.leverage != null && hit.leverage > 0
+              ? { leverage: new Prisma.Decimal(hit.leverage) }
+              : {}),
+            ...(hit.liqPrice != null && hit.liqPrice > 0
+              ? { liqPrice: new Prisma.Decimal(hit.liqPrice) }
+              : {}),
+            ...(hit.risk != null && hit.risk > 0
+              ? { risk: new Prisma.Decimal(hit.risk) }
+              : {}),
+            status: UserPositionStatus.OPEN,
+            closedAt: null,
+            closeKind: null,
+            abnormal: false,
+            abnormalAt: null,
+          },
+        });
+        openedOtherSide += 1;
+        remoteKeys.add(hitKey);
       }
     }
 
-    const extraSkipped = [...remoteByKey.keys()].filter(
-      (k) =>
-        !localRows.some(
-          (loc) =>
-            queryPositionMatchKey(loc.coinName, loc.equalCoinName, loc.positionSide) === k,
-        ),
-    ).length;
+    // 先按交易所快照对齐，再按当前主账户列表清掉旧账户仓（交易所上可能仍有仓，本地也要废弃）
+    const orphanDiscarded = await this.discardOutsideAccountPositions(userId, exchange, {
+      writePostLog,
+    });
+    discarded += orphanDiscarded;
+
+    if (!anyOk) {
+      if (orphanDiscarded > 0) {
+        this.logger.log(
+          `QueryPosition 对齐 user=${userId} ${exchange} 查询失败但已清列表外仓=${orphanDiscarded}：${errors.join('; ') || 'query-failed'}`,
+        );
+        return {
+          ok: true,
+          overlayQty: 0,
+          overlayPrice: 0,
+          overlayLev: 0,
+          discarded,
+          matched: 0,
+          extraSkipped: 0,
+          skipped: errors.join('; ') || 'query-failed',
+        };
+      }
+      return { ...empty, skipped: errors.join('; ') || 'query-failed' };
+    }
+
+    const extraSkipped = 0;
 
     this.logger.log(
-      `QueryPosition 对齐 user=${userId} ${exchange} 匹配=${matched} 改数量=${overlayQty} 改均价=${overlayPrice} 改杠杆=${overlayLev} 废弃=${discarded} 交易所多出跳过=${extraSkipped}`,
+      `QueryPosition 对齐 user=${userId} ${exchange} 匹配=${matched} 改数量=${overlayQty} 改均价=${overlayPrice} 改杠杆=${overlayLev} 补入=${openedOtherSide} 废弃=${discarded}(列表外=${orphanDiscarded}) 挂单跳过=${pendingSkipped} 查询失败保留=${queryKept}`,
     );
     return {
       ok: true,
@@ -2238,12 +2790,18 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     positionSide?: string | null;
     qty: Prisma.Decimal | number;
     entryPrice: Prisma.Decimal | number;
+    apiCode?: string;
+    equalCoinName?: string | null;
   }): number | null {
     const qty = Number(r.qty);
     const entry = Number(r.entryPrice);
     const at = String(r.accountType || '').toLowerCase();
     const market: 'spot' | 'future' = at === 'spot' ? 'spot' : 'future';
-    const mark = this.market.getPrice(r.coinName, r.exchange, { market });
+    const mark = this.market.getPrice(r.coinName, r.exchange, {
+      market,
+      apiCode: r.apiCode,
+      equalCoinName: r.equalCoinName || undefined,
+    });
     if (
       !(
         mark != null &&
@@ -2290,7 +2848,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     abnormalAt?: Date | null;
     closeRetryStopAt?: Date | null;
     closeKind?: string | null;
-  }) {
+    apiCode?: string | null;
+  }, apiCode?: string) {
+    const openApiCode = String(apiCode || r.apiCode || '').trim().toLowerCase() || undefined;
     const qty = Number(r.qty);
     const entry = Number(r.entryPrice);
     const side = String(r.positionSide || 'long').toLowerCase().includes('short')
@@ -2307,9 +2867,15 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     const symbol = eq ? `${r.coinName}/${eq}` : r.coinName;
     const market: 'spot' | 'future' = at === 'spot' ? 'spot' : 'future';
     const isClosed = r.status === UserPositionStatus.CLOSED;
-    const mark = isClosed ? null : this.market.getPrice(r.coinName, r.exchange, { market });
+    const mark = isClosed
+      ? null
+      : this.market.getPrice(r.coinName, r.exchange, {
+          market,
+          apiCode: openApiCode,
+          equalCoinName: eq || undefined,
+        });
     const spec = this.symbols.peek(
-      toApiCode(r.exchange, at === 'spot' ? 'spot' : 'future'),
+      openApiCode || toApiCode(r.exchange, at === 'spot' ? 'spot' : 'future'),
       r.coinName,
       eq || (at === 'spot' ? 'USDT' : 'PC'),
     );
@@ -2324,6 +2890,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           positionSide: r.positionSide,
           qty: r.qty,
           entryPrice: r.entryPrice,
+          apiCode: openApiCode,
+          equalCoinName: eq,
         });
     const pnl = pnlNum != null ? String(pnlNum) : undefined;
     // 库里多为空：跟单下单曾默认 5 倍，有落库杠杆则用落库值
@@ -2362,6 +2930,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       coinName: r.coinName,
       equalCoinName: eq || null,
       pair: symbol,
+      apiCode: openApiCode || null,
       mode,
       accountType: r.accountType || (at === 'spot' ? 'spot' : 'future'),
       accountGid: r.accountGid,
@@ -2469,6 +3038,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName?: string;
     positionSide?: string;
+    apiCode?: string;
   }) {
     const userId = String(opts.userId || '').trim();
     const coinName = String(opts.coinName || '').trim().toUpperCase();
@@ -2513,6 +3083,16 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       take: 50,
     });
 
+    const wantCode = String(opts.apiCode || '').trim().toLowerCase();
+    const knownCodes = new Set<string>();
+    for (const log of logs) {
+      const code = this.apiCodeFromBody(log.requestBody);
+      if (code) knownCodes.add(code);
+    }
+    const defaultCode = toApiCode(
+      String(opts.exchange || '').toUpperCase() as Exchange,
+      accountTypeFromEqualCoin(equal) === 'spot' ? 'spot' : 'future',
+    ).toLowerCase();
     const orderIds: string[] = [];
     let lastFollowSignal: ReturnType<TradeService['parseFollowSignalFromLog']> | null = null;
     for (const log of logs) {
@@ -2523,6 +3103,17 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         ? 'short'
         : 'long';
       if (logSide !== side) continue;
+      if (
+        !wantCode ||
+        !this.lotBelongsToApiCode(
+          this.apiCodeFromBody(log.requestBody),
+          wantCode,
+          defaultCode,
+          knownCodes,
+        )
+      ) {
+        continue;
+      }
       if (!orderIds.includes(log.orderId)) orderIds.push(log.orderId);
       if (!lastFollowSignal) lastFollowSignal = this.parseFollowSignalFromLog(log);
     }
@@ -2542,6 +3133,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     items: Array<{
       userId?: string;
       exchange: Exchange | string;
+      apiCode?: string | null;
       coinName?: string | null;
       equalCoinName?: string | null;
       side?: string;
@@ -2579,13 +3171,13 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         avgPrice: true,
         isOpen: true,
         createdAt: true,
+        requestBody: true,
       },
       orderBy: { createdAt: 'desc' },
       take: 8000,
     });
 
-    const byKey = new Map<string, string[]>();
-    const signalByKey = new Map<string, ReturnType<TradeService['parseFollowSignalFromLog']>>();
+    const grouped = new Map<string, typeof logs>();
     for (const log of logs) {
       const filled = Number(log.filledAmt ?? 0);
       const consumed = Number(log.consumedAmt ?? 0);
@@ -2593,27 +3185,63 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       const side = String(log.positionSide || 'long').toLowerCase().includes('short')
         ? 'short'
         : 'long';
-      const key = [
+      const group = [
         log.userId,
         log.exchange,
         String(log.coinName || '').toUpperCase(),
         String(log.equalCoinName || '').toUpperCase(),
         side,
       ].join('|');
-      const arr = byKey.get(key) || [];
-      if (!arr.includes(log.orderId)) arr.push(log.orderId);
-      byKey.set(key, arr);
-      if (!signalByKey.has(key)) {
-        signalByKey.set(key, this.parseFollowSignalFromLog(log));
+      const arr = grouped.get(group) || [];
+      arr.push(log);
+      grouped.set(group, arr);
+    }
+
+    const byKey = new Map<string, string[]>();
+    const signalByKey = new Map<string, ReturnType<TradeService['parseFollowSignalFromLog']>>();
+    for (const rows of grouped.values()) {
+      const knownCodes = new Set<string>();
+      for (const log of rows) {
+        const code = this.apiCodeFromBody(log.requestBody);
+        if (code) knownCodes.add(code);
+      }
+      const sample = rows[0];
+      const eq = String(sample.equalCoinName || '').toUpperCase();
+      const defaultCode = toApiCode(
+        sample.exchange,
+        accountTypeFromEqualCoin(eq) === 'spot' ? 'spot' : 'future',
+      ).toLowerCase();
+      for (const log of rows) {
+        const side = String(log.positionSide || 'long').toLowerCase().includes('short')
+          ? 'short'
+          : 'long';
+        const code = this.unlabeledLotApiCode(defaultCode, knownCodes);
+        const bodyCode = this.apiCodeFromBody(log.requestBody);
+        const effective = bodyCode || code;
+        if (!effective || !log.orderId) continue;
+        const key = [
+          log.userId,
+          effective,
+          String(log.coinName || '').toUpperCase(),
+          String(log.equalCoinName || '').toUpperCase(),
+          side,
+        ].join('|');
+        const arr = byKey.get(key) || [];
+        if (!arr.includes(log.orderId)) arr.push(log.orderId);
+        byKey.set(key, arr);
+        if (!signalByKey.has(key)) {
+          signalByKey.set(key, this.parseFollowSignalFromLog(log));
+        }
       }
     }
 
     for (const item of items) {
       if (!item.userId) continue;
       const side = String(item.side || 'long').toLowerCase().includes('short') ? 'short' : 'long';
+      const code = String(item.apiCode || '').trim().toLowerCase();
       const key = [
         item.userId,
-        item.exchange,
+        code,
         String(item.coinName || '').toUpperCase(),
         String(item.equalCoinName || '').toUpperCase(),
         side,
@@ -2669,6 +3297,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName?: string | null;
     positionSide?: string | null;
+    apiCode?: string | null;
   }) {
     const coinName = String(params.coinName || '').trim().toUpperCase();
     if (!coinName) return null;
@@ -2679,6 +3308,12 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       .includes('short')
       ? 'short'
       : 'long';
+    const defaultCode = toApiCode(
+      params.exchange,
+      accountTypeFromEqualCoin(equalCoinName) === 'spot' ? 'spot' : 'future',
+    ).toLowerCase();
+    const wantCode = String(params.apiCode || '').trim().toLowerCase() || defaultCode;
+    const exchange = (lookupApiCode(wantCode)?.exchangeId as Exchange | undefined) || params.exchange;
 
     const opens = await this.prisma.signalFollowLog.findMany({
       where: {
@@ -2719,7 +3354,15 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     let accountName: string | null = null;
     let leverage: number | null = null;
 
+    const knownCodes = new Set<string>();
     for (const o of opens) {
+      const code = this.apiCodeFromBody(o.requestBody);
+      if (code) knownCodes.add(code);
+    }
+
+    for (const o of opens) {
+      const code = this.apiCodeFromBody(o.requestBody);
+      if (!this.lotBelongsToApiCode(code, wantCode, defaultCode, knownCodes)) continue;
       const filled = Number(o.filledAmt ?? 0);
       const consumed = Number(o.consumedAmt ?? 0);
       const px = Number(o.avgPrice ?? 0);
@@ -2755,7 +3398,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         where: {
           user_pos_uniq: {
             userId: params.userId,
-            exchange: params.exchange,
+            apiCode: wantCode,
             coinName,
             equalCoinName,
             positionSide,
@@ -2774,7 +3417,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       where: {
         user_pos_uniq: {
           userId: params.userId,
-          exchange: params.exchange,
+          apiCode: wantCode,
           coinName,
           equalCoinName,
           positionSide,
@@ -2782,13 +3425,14 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       },
       create: {
         userId: params.userId,
-        exchange: params.exchange,
+        exchange,
         coinName,
         equalCoinName,
         positionSide,
         accountType,
         accountGid,
         accountName,
+        apiCode: wantCode,
         qty,
         entryPrice,
         leverage: leverage != null && leverage > 0 ? leverage : undefined,
@@ -2798,9 +3442,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         closedAt: isOpen ? null : now,
       },
       update: {
+        exchange,
         accountType: accountType ?? undefined,
         accountGid: accountGid ?? undefined,
         accountName: accountName ?? undefined,
+        apiCode: wantCode,
         qty,
         entryPrice,
         ...(leverage != null && leverage > 0 ? { leverage } : {}),
@@ -2835,13 +3481,14 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName?: string | null;
     positionSide?: string | null;
+    apiCode?: string | null;
   }): Promise<boolean> {
     const qty = await this.getOpenLocalQty(params);
     return qty > 1e-12;
   }
 
   /**
-   * 本地 OPEN 持仓数量；无仓返回 0。
+   * 本地 OPEN 持仓数量。必须带 apiCode；不带或没有这行时返回 0，不把 USDT 和 USDC 加在一起。
    */
   async getOpenLocalQty(params: {
     userId: string;
@@ -2849,6 +3496,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName?: string | null;
     positionSide?: string | null;
+    apiCode?: string | null;
   }): Promise<number> {
     const coinName = String(params.coinName || '').trim().toUpperCase();
     if (!coinName) return 0;
@@ -2859,20 +3507,27 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       .includes('short')
       ? 'short'
       : 'long';
-    const row = await this.prisma.userPosition.findFirst({
+    const apiCode = String(params.apiCode || '').trim().toLowerCase();
+    if (!apiCode) return 0;
+    const rows = await this.prisma.userPosition.findMany({
       where: {
         userId: params.userId,
         exchange: params.exchange,
         coinName,
         equalCoinName,
         positionSide,
+        apiCode,
         status: UserPositionStatus.OPEN,
         qty: { gt: 0 },
       },
       select: { qty: true },
     });
-    const qty = Number(row?.qty ?? 0);
-    return Number.isFinite(qty) && qty > 0 ? qty : 0;
+    let qty = 0;
+    for (const row of rows) {
+      const n = Number(row.qty ?? 0);
+      if (Number.isFinite(n) && n > 0) qty += n;
+    }
+    return qty;
   }
 
   /**
@@ -2925,6 +3580,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     exchange: Exchange;
     coinName: string;
     equalCoinName?: string;
+    apiCode?: string;
   }): number {
     return (
       Number(
@@ -2932,6 +3588,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           exchange: params.exchange,
           coinName: params.coinName,
           accountType: accountTypeFromEqualCoin(params.equalCoinName || 'PC'),
+          apiCode: params.apiCode,
+          equalCoinName: params.equalCoinName,
         }),
       ) || 0
     );
@@ -2973,9 +3631,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     exchange: Exchange;
     coinName: string;
     equalCoinName: string;
+    apiCode?: string;
   }): Promise<number> {
     try {
       const spec = await this.resolveSymbolSpec(params.exchange, {
+        apiCode: params.apiCode,
         coinName: params.coinName,
         equalCoinName: params.equalCoinName,
         accountType: accountTypeFromEqualCoin(params.equalCoinName),
@@ -3136,7 +3796,18 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     return rows;
   }
 
-  /** 用户对该信号账户的开仓比例 = investAmount / maxPrincipal */
+  /** 开仓倍数 = 模板最少投入总本金 / 比例基准本金。全体用户共用，不读用户填写值。 */
+  private templateOpenRatio(template: {
+    minInvestAmount?: unknown;
+    maxPrincipal?: unknown;
+  } | null | undefined): number | null {
+    const minInvest = Number(template?.minInvestAmount ?? 0);
+    const maxP = Number(template?.maxPrincipal ?? 0);
+    if (!(minInvest > 0) || !(maxP > 0)) return null;
+    return minInvest / maxP;
+  }
+
+  /** 用户对该信号账户的开仓比例。模板须覆盖该交易所，且勾了全部账户或包含该 GID。 */
   async resolveOpenRatio(
     userId: string,
     exchange: Exchange,
@@ -3144,21 +3815,113 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   ): Promise<number | null> {
     const gid = String(accountGid || '').trim();
     if (!gid) return null;
+    const globalTpl = await this.appliedGlobalTemplate();
+    if (globalTpl) {
+      if (!globalTpl.active || !this.templateCovers(globalTpl, exchange, gid)) return null;
+      if (this.missingTemplateAccounts(globalTpl, await this.liveMiddlewareAccounts()).length > 0) {
+        return null;
+      }
+      return this.templateOpenRatio(globalTpl);
+    }
     const cfg = await this.prisma.userFollowConfig.findFirst({
       where: {
         userId,
         exchange,
-        template: { accountGid: gid },
+        template: this.templateScopeWhere(exchange, gid),
       },
       select: {
-        investAmount: true,
-        template: { select: { maxPrincipal: true } },
+        template: { select: { minInvestAmount: true, maxPrincipal: true } },
       },
     });
-    const invest = Number(cfg?.investAmount ?? 0);
-    const maxP = Number(cfg?.template?.maxPrincipal ?? 0);
-    if (!(invest > 0) || !(maxP > 0)) return null;
-    return invest / maxP;
+    return this.templateOpenRatio(cfg?.template);
+  }
+
+  /** 仅当模板只绑了一个账户时才有唯一 GID，供展示回填。全部账户或多账户不猜测。 */
+  private singleTemplateAccount(
+    template:
+      | {
+          allAccounts?: boolean;
+          accounts?: { accountGid: string; accountName: string | null }[];
+        }
+      | null
+      | undefined,
+  ): { accountGid: string | null; accountName: string | null } {
+    if (!template || template.allAccounts) return { accountGid: null, accountName: null };
+    const rows = template.accounts || [];
+    if (rows.length !== 1) return { accountGid: null, accountName: null };
+    return {
+      accountGid: String(rows[0].accountGid || '').trim() || null,
+      accountName: String(rows[0].accountName || '').trim() || null,
+    };
+  }
+
+  private accountSummary(template: {
+    allAccounts: boolean;
+    accounts?: { accountName: string | null }[];
+  }): string | null {
+    if (template.allAccounts) return '全部账户';
+    const names = (template.accounts || [])
+      .map((a) => String(a.accountName || '').trim())
+      .filter(Boolean);
+    if (names.length === 0) return null;
+    if (names.length <= 2) return names.join('、');
+    return `${names[0]} 等${names.length}个`;
+  }
+
+  /**
+   * 当前中间件主账户。拉不到列表时返回 null，不能把模板误判成失效。
+   */
+  async liveMiddlewareAccounts(): Promise<{
+    gids: Set<string>;
+    names: Map<string, string>;
+  } | null> {
+    try {
+      const { items } = await this.multiAccountList({ skipLog: true });
+      const gids = new Set<string>();
+      const names = new Map<string, string>();
+      for (const a of items || []) {
+        const gid = String((a as any).value ?? (a as any).gid ?? '').trim();
+        if (!gid) continue;
+        gids.add(gid);
+        const name = String((a as any).name ?? '').trim();
+        if (name) names.set(gid, name);
+      }
+      return { gids, names };
+    } catch {
+      return null;
+    }
+  }
+
+  /** 模板勾了具体账户，但该 GID 已不在中间件里。全部账户不按这个判断。 */
+  missingTemplateAccounts(
+    template:
+      | {
+          allAccounts?: boolean;
+          accounts?: { accountGid: string; accountName?: string | null }[];
+        }
+      | null
+      | undefined,
+    live: { gids: Set<string> } | null,
+  ): { accountGid: string; accountName: string | null }[] {
+    if (!template || template.allAccounts || !live) return [];
+    const missing: { accountGid: string; accountName: string | null }[] = [];
+    for (const a of template.accounts || []) {
+      const gid = String(a.accountGid || '').trim();
+      if (!gid || live.gids.has(gid)) continue;
+      missing.push({ accountGid: gid, accountName: a.accountName ?? null });
+    }
+    return missing;
+  }
+
+  /** 模板覆盖该交易所，且（有 GID 时）覆盖该主账户。空白不代表全部。 */
+  private templateScopeWhere(exchange: Exchange, accountGid?: string) {
+    const gid = String(accountGid || '').trim();
+    return {
+      OR: [{ allExchanges: true }, { exchanges: { some: { exchange } } }],
+      ...(gid
+        ? { AND: [{ OR: [{ allAccounts: true }, { accounts: { some: { accountGid: gid } } }] }] }
+        : {}),
+    };
   }
 
   private reconcileLockKey(params: {
@@ -3167,10 +3930,12 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName: string;
     positionSide: string;
+    apiCode?: string | null;
   }) {
     return [
       params.userId,
       params.exchange,
+      String(params.apiCode || '').trim().toLowerCase(),
       params.coinName,
       params.equalCoinName,
       params.positionSide,
@@ -3285,6 +4050,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           positionSide: true,
           accountGid: true,
           qty: true,
+          apiCode: true,
         },
       });
       if (!locals.length) {
@@ -3317,16 +4083,19 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           .includes('short')
           ? 'short'
           : 'long';
+        const apiCode = String(row.apiCode || '').trim().toLowerCase();
         const match = signalRows.find(
           (r) =>
             r.coinName === coinName &&
             r.equalCoinName === equalCoinName &&
             r.positionSide === positionSide &&
+            (!apiCode || String(r.apiCode || '').toLowerCase() === apiCode) &&
             (!r.exchange || r.exchange === params.exchange),
         );
         const signalSize = match ? Math.max(0, match.size) : 0;
         return {
           positionSide,
+          apiCode,
           signalSize,
           orphan: signalSize <= eps,
         };
@@ -3352,6 +4121,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             coinName,
             equalCoinName,
             positionSide: c.positionSide,
+            apiCode: c.apiCode || undefined,
             accountGid,
             reason: params.reason,
           });
@@ -3390,6 +4160,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName?: string;
     positionSide: string;
+    apiCode?: string;
     accountGid?: string;
     reason?: string;
   }): Promise<{
@@ -3408,12 +4179,17 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       .includes('short')
       ? 'short'
       : 'long';
+    const wantCode = String(params.apiCode || '').trim().toLowerCase();
+    if (!wantCode) {
+      return { action: 'skip', message: 'no-api-code' };
+    }
     const lock = this.reconcileLockKey({
       userId: params.userId,
       exchange: params.exchange,
       coinName,
       equalCoinName,
       positionSide,
+      apiCode: wantCode,
     });
     if (this.reconcileInFlight.has(lock)) {
       return { action: 'skip', message: 'in-flight' };
@@ -3427,6 +4203,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           coinName,
           equalCoinName,
           positionSide,
+          apiCode: wantCode,
           status: UserPositionStatus.OPEN,
           qty: { gt: 0 },
         },
@@ -3443,6 +4220,16 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       if (!accountGid) {
         return { action: 'skip', localQty, message: 'no-accountGid' };
       }
+      const apiCode =
+        String(pos.apiCode || wantCode || '').trim().toLowerCase() ||
+        (await this.resolvePositionApiCode({
+          userId: params.userId,
+          exchange: params.exchange,
+          coinName,
+          equalCoinName,
+          positionSide,
+          apiCode: wantCode,
+        }));
 
       let signalSize = 0;
       try {
@@ -3452,6 +4239,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             r.coinName === coinName &&
             r.equalCoinName === equalCoinName &&
             r.positionSide === positionSide &&
+            (!apiCode || String(r.apiCode || '').toLowerCase() === apiCode) &&
             (!r.exchange || r.exchange === params.exchange),
         );
         signalSize = match ? Math.max(0, match.size) : 0;
@@ -3472,6 +4260,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           exchange: params.exchange,
           coinName,
           equalCoinName,
+          apiCode,
         });
         const orphanKey = this.exchangeMinFloorKey({
           userId: params.userId,
@@ -3485,6 +4274,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           coinName,
           equalCoinName,
           symbol: `${coinName}/${equalCoinName}`,
+          apiCode,
           amount: localQty,
         });
         if (
@@ -3500,7 +4290,16 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             message: 'below-min-contract',
           };
         }
-        if (!(this.peekReconcileMark({ exchange: params.exchange, coinName, equalCoinName }) > 0)) {
+        if (
+          !(
+            this.peekReconcileMark({
+              exchange: params.exchange,
+              coinName,
+              equalCoinName,
+              apiCode,
+            }) > 0
+          )
+        ) {
           return {
             action: 'skip',
             localQty,
@@ -3518,6 +4317,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             positionSide,
             amount: orphanAmt,
             accountType: accountTypeFromEqualCoin(equalCoinName),
+            apiCode,
             accountGid,
             accountName: pos.accountName || undefined,
             source: 'RECONCILE_ORPHAN',
@@ -3586,12 +4386,14 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         coinName,
         equalCoinName,
         symbol: `${coinName}/${equalCoinName}`,
+        apiCode,
         amount: resolved.amount,
       });
       const minQty = await this.resolveMinPlaceQty({
         exchange: params.exchange,
         coinName,
         equalCoinName,
+        apiCode,
       });
       const excessKey = this.exchangeMinFloorKey({
         userId: params.userId,
@@ -3614,7 +4416,16 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           message: 'below-min-contract',
         };
       }
-      if (!(this.peekReconcileMark({ exchange: params.exchange, coinName, equalCoinName }) > 0)) {
+      if (
+        !(
+          this.peekReconcileMark({
+            exchange: params.exchange,
+            coinName,
+            equalCoinName,
+            apiCode,
+          }) > 0
+        )
+      ) {
         return {
           action: 'skip',
           localQty,
@@ -3634,6 +4445,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           positionSide,
           amount: closeAmt,
           accountType: accountTypeFromEqualCoin(equalCoinName),
+          apiCode,
           accountGid,
           accountName: pos.accountName || undefined,
           source: 'RECONCILE_EXCESS',
@@ -3818,6 +4630,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           coinName: row.coinName,
           equalCoinName: row.equalCoinName,
           positionSide: row.positionSide,
+          apiCode: row.apiCode || undefined,
           accountGid: row.accountGid || undefined,
           reason,
         });
@@ -3865,6 +4678,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           coinName: true,
           equalCoinName: true,
           positionSide: true,
+          requestBody: true,
         },
       });
       const keys = new Map<string, {
@@ -3873,6 +4687,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         coinName: string;
         equalCoinName: string;
         positionSide: string;
+        apiCode: string;
       }>();
       for (const o of opens) {
         const coin = String(o.coinName || '').toUpperCase();
@@ -3881,7 +4696,10 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         const side = String(o.positionSide || 'long').toLowerCase().includes('short')
           ? 'short'
           : 'long';
-        const k = `${o.userId}|${o.exchange}|${coin}|${eq}|${side}`;
+        const code =
+          this.apiCodeFromBody(o.requestBody) ||
+          toApiCode(o.exchange, accountTypeFromEqualCoin(eq) === 'spot' ? 'spot' : 'future').toLowerCase();
+        const k = `${o.userId}|${code}|${coin}|${eq}|${side}`;
         if (!keys.has(k)) {
           keys.set(k, {
             userId: o.userId,
@@ -3889,6 +4707,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             coinName: coin,
             equalCoinName: eq,
             positionSide: side,
+            apiCode: code,
           });
         }
       }
@@ -4070,12 +4889,21 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** 后台刷新 MultiAccountList 写入内存；失败保留旧缓存。 */
-  private async refreshAccountListCache(): Promise<{ items: any[] }> {
-    if (this.accountListInflight) return this.accountListInflight;
-    this.accountListInflight = (async () => {
+  /**
+   * 后台刷新 MultiAccountList 写入内存；失败保留旧缓存。
+   * 定时刷新默认不写中间件日志。管理端「拉取账户列表」传 skipLog:false。
+   */
+  private async refreshAccountListCache(opts?: { skipLog?: boolean }): Promise<{ items: any[] }> {
+    const skipLog = opts?.skipLog !== false;
+    // 定时刷新可合并；手动拉取必须自己打一枪，否则会搭上一条不写日志的请求。
+    if (skipLog && this.accountListInflight) return this.accountListInflight;
+    let task!: Promise<{ items: any[] }>;
+    task = (async () => {
       try {
-        const { data } = await this.mapi.get('mapi/MultiAccountList', { skipLog: true });
+        const { data } = await this.mapi.get('mapi/MultiAccountList', {
+          skipLog,
+          feature: '主账户列表',
+        });
         const items = Array.isArray(data) ? data : [];
         this.accountListCache = { items, fetchedAt: Date.now() };
         this.logger.log(`中间件账户列表已缓存: ${items.length} 个`);
@@ -4084,10 +4912,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`刷新账户列表失败: ${e?.message || e}`);
         return { items: this.accountListCache?.items ?? [] };
       } finally {
-        this.accountListInflight = null;
+        if (this.accountListInflight === task) this.accountListInflight = null;
       }
     })();
-    return this.accountListInflight;
+    if (skipLog) this.accountListInflight = task;
+    return task;
   }
 
   /**
@@ -4096,7 +4925,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
    */
   async multiAccountList(opts?: { skipLog?: boolean; force?: boolean }) {
     if (opts?.force) {
-      return this.refreshAccountListCache();
+      return this.refreshAccountListCache({ skipLog: opts.skipLog !== false });
     }
     if (!this.accountListCache) {
       return this.refreshAccountListCache();
@@ -4130,6 +4959,13 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       ip: String(p?.value ?? p?.ip ?? p?.host ?? '').trim(),
       name: String(p?.name ?? p?.label ?? '').trim(),
     }));
+  }
+
+  /** 启动和定时刷新不把中间件故障变成未处理拒绝，否则 Node 会退出、80 端口无人监听。 */
+  private refreshProxyListInBackground() {
+    void this.refreshProxyListCache().catch((e) => {
+      this.logger.warn(`后台刷新代理列表未成功: ${e?.message || e}`);
+    });
   }
 
   /** 后台刷新 PublicHttpProxyList；失败保留旧缓存。 */
@@ -4264,7 +5100,179 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       followConfigReady: followSetup.ready,
       followConfigCount: followSetup.configuredCount,
       followConfigHint: followSetup.hint,
-      canStart: approved && keys > 0 && followSetup.ready, // 须已配置至少一所：模板 + 声明本金
+      canStart: approved && keys > 0 && followSetup.ready, // 须已配置至少一所模板
+    };
+  }
+
+  private static readonly CFG_GLOBAL_APPLIED = 'follow_global_applied';
+  private static readonly CFG_USER_CUSTOM = 'follow_user_custom_template';
+
+  private async readConfigFlag(key: string): Promise<boolean> {
+    const row = await this.prisma.systemConfig.findUnique({ where: { key } });
+    const v = String(row?.value || '').trim().toLowerCase();
+    return v === '1' || v === 'true';
+  }
+
+  private async writeConfigFlag(key: string, on: boolean, remark: string) {
+    await this.prisma.systemConfig.upsert({
+      where: { key },
+      create: { key, value: on ? '1' : '0', remark },
+      update: { value: on ? '1' : '0' },
+    });
+  }
+
+  private globalTemplateQuery() {
+    return {
+      exchanges: { select: { exchange: true }, orderBy: { exchange: 'asc' as const } },
+      accounts: {
+        select: { accountGid: true, accountName: true },
+        orderBy: { accountName: 'asc' as const },
+      },
+    };
+  }
+
+  /** 已点击「应用」时返回那一份全局模板；未应用返回 null，不回落到用户自选。 */
+  private async appliedGlobalTemplate() {
+    const applied = await this.readConfigFlag(TradeService.CFG_GLOBAL_APPLIED);
+    if (!applied) return null;
+    return this.prisma.followTemplate.findFirst({
+      where: { isGlobal: true },
+      include: this.globalTemplateQuery(),
+    });
+  }
+
+  private templateCovers(
+    template:
+      | {
+          allExchanges?: boolean;
+          allAccounts?: boolean;
+          exchanges?: { exchange: Exchange }[];
+          accounts?: { accountGid: string }[];
+        }
+      | null
+      | undefined,
+    exchange: Exchange,
+    accountGid?: string,
+  ): boolean {
+    if (!template) return false;
+    const exOk =
+      !!template.allExchanges || (template.exchanges || []).some((e) => e.exchange === exchange);
+    if (!exOk) return false;
+    const gid = String(accountGid || '').trim();
+    if (!gid) return true;
+    return !!template.allAccounts || (template.accounts || []).some((a) => a.accountGid === gid);
+  }
+
+  async followTemplatePolicy() {
+    const [globalApplied, userCustomEnabled, globalTemplate] = await Promise.all([
+      this.readConfigFlag(TradeService.CFG_GLOBAL_APPLIED),
+      this.readConfigFlag(TradeService.CFG_USER_CUSTOM),
+      this.prisma.followTemplate.findFirst({
+        where: { isGlobal: true },
+        include: this.globalTemplateQuery(),
+      }),
+    ]);
+    return {
+      globalApplied,
+      userCustomEnabled,
+      globalTemplate: globalTemplate
+        ? {
+            id: globalTemplate.id,
+            name: globalTemplate.name,
+            active: globalTemplate.active,
+            allExchanges: globalTemplate.allExchanges,
+            allAccounts: globalTemplate.allAccounts,
+            unitAmount: Number(globalTemplate.unitAmount),
+            maxPrincipal: Number(globalTemplate.maxPrincipal),
+            minInvestAmount: Number(globalTemplate.minInvestAmount),
+            exchanges: globalTemplate.exchanges.map((e) => e.exchange),
+            accountName: this.accountSummary(globalTemplate),
+          }
+        : null,
+    };
+  }
+
+  /** 探活用：全局模板已应用时，返回它覆盖的交易所。未应用返回 null。 */
+  async globalFollowScope(): Promise<{
+    applied: true;
+    usable: boolean;
+    allExchanges: boolean;
+    exchanges: Exchange[];
+  } | null> {
+    const tpl = await this.appliedGlobalTemplate();
+    if (!tpl) return null;
+    const usable =
+      tpl.active && this.templateOpenRatio(tpl) != null && this.missingTemplateAccounts(tpl, await this.liveMiddlewareAccounts()).length === 0;
+    return {
+      applied: true,
+      usable,
+      allExchanges: tpl.allExchanges,
+      exchanges: tpl.exchanges.map((e) => e.exchange),
+    };
+  }
+
+  /** 改「是否全局模板」之前调用。已应用时不能改挂到另一份，也不能取消标记。 */
+  async assertGlobalTemplateMark(templateId: string | undefined, wantGlobal: boolean) {
+    const applied = await this.readConfigFlag(TradeService.CFG_GLOBAL_APPLIED);
+    if (!applied) return;
+    const current = await this.prisma.followTemplate.findFirst({
+      where: { isGlobal: true },
+      select: { id: true },
+    });
+    if (wantGlobal && current && current.id !== templateId) {
+      throw new BadRequestException('请先取消全局模板应用');
+    }
+    if (!wantGlobal && current && templateId && current.id === templateId) {
+      throw new BadRequestException('请先取消全局模板应用');
+    }
+  }
+
+  async applyGlobalTemplate(templateId: string) {
+    const tpl = await this.prisma.followTemplate.findUnique({
+      where: { id: templateId },
+      include: this.globalTemplateQuery(),
+    });
+    if (!tpl || !tpl.isGlobal) throw new BadRequestException('请先把该模板设为全局模板并保存');
+    if (!tpl.active) throw new BadRequestException('全局模板已停用');
+    if (this.templateOpenRatio(tpl) == null) {
+      throw new BadRequestException('全局模板的最少投入总本金或比例基准本金无效');
+    }
+    if (!tpl.allAccounts) {
+      const live = await this.liveMiddlewareAccounts();
+      if (!live) throw new BadRequestException('无法核对中间件交易账户，请稍后再应用');
+      const gone = this.missingTemplateAccounts(tpl, live);
+      if (gone.length) {
+        throw new BadRequestException(
+          `交易账户已不存在：${gone.map((a) => a.accountName || a.accountGid).join('、')}`,
+        );
+      }
+    }
+    await this.writeConfigFlag(TradeService.CFG_GLOBAL_APPLIED, true, '全局合约模板已应用到所有用户');
+    await this.writeConfigFlag(TradeService.CFG_USER_CUSTOM, false, '用户自选模板');
+    return { globalApplied: true, userCustomEnabled: false, templateId: tpl.id, name: tpl.name };
+  }
+
+  async cancelGlobalTemplate(templateId: string) {
+    const tpl = await this.prisma.followTemplate.findUnique({
+      where: { id: templateId },
+      select: { id: true, isGlobal: true, name: true },
+    });
+    if (!tpl?.isGlobal) throw new BadRequestException('这不是全局模板');
+    const applied = await this.readConfigFlag(TradeService.CFG_GLOBAL_APPLIED);
+    if (!applied) throw new BadRequestException('全局模板尚未应用');
+    await this.writeConfigFlag(TradeService.CFG_GLOBAL_APPLIED, false, '全局合约模板已取消应用');
+    await this.writeConfigFlag(TradeService.CFG_USER_CUSTOM, true, '用户自选模板');
+    return { globalApplied: false, userCustomEnabled: true, templateId: tpl.id, name: tpl.name };
+  }
+
+  async setUserCustomTemplate(enabled: boolean) {
+    if (enabled && (await this.readConfigFlag(TradeService.CFG_GLOBAL_APPLIED))) {
+      throw new BadRequestException('请先取消全局模板应用');
+    }
+    await this.writeConfigFlag(TradeService.CFG_USER_CUSTOM, enabled, '用户自选模板');
+    return {
+      userCustomEnabled: enabled,
+      globalApplied: await this.readConfigFlag(TradeService.CFG_GLOBAL_APPLIED),
     };
   }
 
@@ -4276,43 +5284,86 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     });
     const exchanges = Array.from(new Set(keys.map((k) => k.exchange)));
     if (exchanges.length === 0) {
-      return { ready: false, configuredCount: 0, hint: '请先配置交易所 API Key' };
+      return {
+        ready: false,
+        configuredCount: 0,
+        templateMode: 'custom' as const,
+        hint: '请先配置交易所 API Key',
+      };
+    }
+    const globalTpl = await this.appliedGlobalTemplate();
+    if (globalTpl) {
+      const live = await this.liveMiddlewareAccounts();
+      const stale = this.missingTemplateAccounts(globalTpl, live).length > 0;
+      const ratioOk = globalTpl.active && this.templateOpenRatio(globalTpl) != null;
+      const covered = exchanges.filter((ex) => this.templateCovers(globalTpl, ex));
+      const ready = ratioOk && !stale && covered.length > 0;
+      return {
+        ready,
+        configuredCount: ready ? covered.length : 0,
+        templateMode: 'global' as const,
+        hint: ready
+          ? `当前使用合约模板「${globalTpl.name}」`
+          : stale
+            ? '合约模板的交易账户已失效，请联系管理员'
+            : '合约模板未覆盖已绑定的交易所',
+      };
     }
     const configs = await this.prisma.userFollowConfig.findMany({
       where: { userId, exchange: { in: exchanges } },
-      include: { template: { select: { id: true, active: true, maxPrincipal: true } } },
+      include: {
+        template: {
+          select: {
+            id: true,
+            active: true,
+            maxPrincipal: true,
+            minInvestAmount: true,
+            allAccounts: true,
+            accounts: { select: { accountGid: true, accountName: true } },
+          },
+        },
+      },
     });
-    const ok = configs.filter(
-      (c) =>
-        c.template?.active &&
-        Number(c.investAmount) > 0 &&
-        Number(c.template.maxPrincipal) > 0,
-    );
-    const ready = ok.length > 0;
+    const live = await this.liveMiddlewareAccounts();
+    const usable = configs.filter((c) => {
+      const t = c.template;
+      if (!t?.active || this.templateOpenRatio(t) == null) return false;
+      return this.missingTemplateAccounts(t, live).length === 0;
+    });
+    const stale = configs.some((c) => this.missingTemplateAccounts(c.template, live).length > 0);
+    const ready = usable.length > 0;
     return {
       ready,
-      configuredCount: ok.length,
+      configuredCount: usable.length,
+      templateMode: 'custom' as const,
       hint: ready
-        ? `已配置 ${ok.length}/${exchanges.length} 所跟单比例`
-        : '请为至少一个已绑 Key 的交易所选择模板并填写投入总本金',
+        ? `已配置 ${usable.length}/${exchanges.length} 所合约模板`
+        : stale
+          ? '所选模板的交易账户已失效，请重新选择'
+          : '请先选择合约模板，选择后才能跟随合约',
     };
   }
 
-  /** 可选跟单模板（仅启用中；可按交易所过滤） */
+  /** 可选跟单模板（仅启用中；可按交易所过滤。全部交易所的模板也会出现） */
   async listActiveFollowTemplates(exchange?: Exchange) {
     const items = await this.prisma.followTemplate.findMany({
       where: {
         active: true,
-        ...(exchange ? { exchange } : {}),
+        isGlobal: false,
+        ...(exchange ? this.templateScopeWhere(exchange) : {}),
       },
-      orderBy: [{ exchange: 'asc' }, { name: 'asc' }],
+      include: {
+        exchanges: { select: { exchange: true }, orderBy: { exchange: 'asc' } },
+        accounts: { select: { accountName: true }, orderBy: { accountName: 'asc' } },
+      },
+      orderBy: { name: 'asc' },
     });
     return {
       items: items.map((t) => ({
         id: t.id,
         name: t.name,
-        exchange: t.exchange,
-        accountName: t.accountName,
+        exchange: exchange || t.exchanges[0]?.exchange || ('BINANCE' as Exchange),
+        accountName: this.accountSummary(t),
         unitAmount: Number(t.unitAmount),
         maxPrincipal: Number(t.maxPrincipal),
         minInvestAmount: Number(t.minInvestAmount),
@@ -4324,7 +5375,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * 用户跟单配置：按已绑 Key 的交易所列出（每所最多 1 模板）。
-   * investAmount 为本地声明，仅用于开仓比例，不校验交易所余额。
+   * 开仓倍数 = 模板最少投入总本金 / 基准本金，不由用户填写。
    */
   async listUserFollowConfigs(userId: string) {
     const keys = await this.prisma.exchangeKey.findMany({
@@ -4341,67 +5392,114 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             select: {
               id: true,
               name: true,
-              exchange: true,
+              allExchanges: true,
+              allAccounts: true,
               unitAmount: true,
               maxPrincipal: true,
               minInvestAmount: true,
               active: true,
-              accountName: true,
+              exchanges: { select: { exchange: true } },
+              accounts: { select: { accountGid: true, accountName: true }, orderBy: { accountName: 'asc' } },
             },
           },
         },
       }),
       exchanges.length
         ? this.prisma.followTemplate.findMany({
-            where: { active: true, exchange: { in: exchanges } },
-            orderBy: [{ exchange: 'asc' }, { name: 'asc' }],
+            where: {
+              active: true,
+              isGlobal: false,
+              OR: [
+                { allExchanges: true },
+                { exchanges: { some: { exchange: { in: exchanges } } } },
+              ],
+            },
+            include: {
+              exchanges: { select: { exchange: true } },
+              accounts: { select: { accountGid: true, accountName: true }, orderBy: { accountName: 'asc' } },
+            },
+            orderBy: { name: 'asc' },
           })
-        : Promise.resolve([] as Awaited<ReturnType<typeof this.prisma.followTemplate.findMany>>),
+        : Promise.resolve(
+            [] as Prisma.FollowTemplateGetPayload<{
+              include: {
+                exchanges: { select: { exchange: true } };
+                accounts: { select: { accountGid: true; accountName: true } };
+              };
+            }>[],
+          ),
     ]);
+    const live = await this.liveMiddlewareAccounts();
+    const accountStale = (t: { allAccounts?: boolean; accounts?: { accountGid: string }[] } | null | undefined) =>
+      this.missingTemplateAccounts(t, live).length > 0;
     const cfgMap = new Map(configs.map((c) => [c.exchange, c]));
     const items = exchanges.map((ex) => {
       const c = cfgMap.get(ex);
       const t = c?.template;
-      const investAmount = c ? Number(c.investAmount) : null;
-      const maxPrincipal = t ? Number(t.maxPrincipal) : null;
-      const ratio =
-        investAmount != null && maxPrincipal != null && maxPrincipal > 0
-          ? investAmount / maxPrincipal
-          : null;
+      const ratio = this.templateOpenRatio(t);
       return {
         exchange: ex,
         hasKey: true,
         templateId: c?.templateId ?? null,
-        investAmount,
+        investAmount: t ? Number(t.minInvestAmount) : null,
         ratio,
         template: t
           ? {
               id: t.id,
               name: t.name,
-              exchange: t.exchange,
+              exchange: ex,
               unitAmount: Number(t.unitAmount),
               maxPrincipal: Number(t.maxPrincipal),
               minInvestAmount: Number(t.minInvestAmount),
               active: t.active,
-              accountName: t.accountName,
+              accountName: this.accountSummary(t),
+              accountStale: accountStale(t),
             }
           : null,
         templates: templates
-          .filter((x) => x.exchange === ex)
+          .filter((x) => x.allExchanges || x.exchanges.some((e) => e.exchange === ex))
           .map((x) => ({
             id: x.id,
             name: x.name,
-            exchange: x.exchange,
+            exchange: ex,
             unitAmount: Number(x.unitAmount),
             maxPrincipal: Number(x.maxPrincipal),
             minInvestAmount: Number(x.minInvestAmount),
-            accountName: x.accountName,
+            accountName: this.accountSummary(x),
+            accountStale: accountStale(x),
             remark: x.remark,
           })),
       };
     });
+    const globalTpl = await this.appliedGlobalTemplate();
+    const shown = globalTpl
+      ? items.map((it) => {
+          if (!this.templateCovers(globalTpl, it.exchange)) {
+            return { ...it, templateId: null, template: null, ratio: null, investAmount: null, templates: [] };
+          }
+          const ratio = this.templateOpenRatio(globalTpl);
+          return {
+            ...it,
+            templateId: globalTpl.id,
+            investAmount: Number(globalTpl.minInvestAmount),
+            ratio,
+            templates: [],
+            template: {
+              id: globalTpl.id,
+              name: globalTpl.name,
+              exchange: it.exchange,
+              unitAmount: Number(globalTpl.unitAmount),
+              maxPrincipal: Number(globalTpl.maxPrincipal),
+              minInvestAmount: Number(globalTpl.minInvestAmount),
+              active: globalTpl.active,
+              accountName: this.accountSummary(globalTpl),
+              accountStale: accountStale(globalTpl),
+            },
+          };
+        })
+      : items;
     const summary = await this.getFollowSetupSummary(userId);
-    return { items, ...summary };
+    return { items: shown, ...summary };
   }
 
   async upsertUserFollowConfig(
@@ -4409,29 +5507,43 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     dto: {
       exchange: Exchange;
       templateId: string;
-      investAmount: number;
+      investAmount?: number;
     },
   ) {
-    const investAmount = Number(dto.investAmount);
-    if (!Number.isFinite(investAmount) || investAmount <= 0) {
-      throw new BadRequestException('请填写有效的投入总本金');
-    }
     const key = await this.prisma.exchangeKey.findFirst({
       where: { userId, exchange: dto.exchange, active: true },
     });
     if (!key) throw new BadRequestException('请先配置该交易所的 API Key');
+    if (await this.appliedGlobalTemplate()) {
+      throw new BadRequestException('当前使用全局合约模板');
+    }
 
-    const template = await this.prisma.followTemplate.findUnique({ where: { id: dto.templateId } });
+    const template = await this.prisma.followTemplate.findUnique({
+      where: { id: dto.templateId },
+      include: {
+        exchanges: { select: { exchange: true } },
+        accounts: { select: { accountGid: true, accountName: true } },
+      },
+    });
     if (!template || !template.active) throw new BadRequestException('模板不存在或已停用');
-    if (template.exchange !== dto.exchange) {
+    if (template.isGlobal) throw new BadRequestException('请选择自定义模板');
+    const gone = this.missingTemplateAccounts(template, await this.liveMiddlewareAccounts());
+    if (gone.length) {
+      const labels = gone.map((a) => a.accountName || a.accountGid);
+      throw new BadRequestException(`模板账户已失效：${labels.join('、')}`);
+    }
+    const covers =
+      template.allExchanges || template.exchanges.some((e) => e.exchange === dto.exchange);
+    if (!covers) {
       throw new BadRequestException('模板与交易所不匹配');
     }
-    if (Number(template.maxPrincipal) <= 0) {
+    const maxPrincipal = Number(template.maxPrincipal);
+    const minInvest = Number(template.minInvestAmount) || 0;
+    if (!(maxPrincipal > 0)) {
       throw new BadRequestException('模板比例基准本金无效，请联系管理员');
     }
-    const minInvest = Number(template.minInvestAmount) || 0;
-    if (minInvest > 0 && investAmount < minInvest) {
-      throw new BadRequestException(`投入总本金不能少于最少投入总本金 ${minInvest}`);
+    if (!(minInvest > 0)) {
+      throw new BadRequestException('模板最少投入总本金无效，请联系管理员');
     }
 
     const row = await this.prisma.userFollowConfig.upsert({
@@ -4440,11 +5552,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         userId,
         exchange: dto.exchange,
         templateId: template.id,
-        investAmount,
+        investAmount: minInvest,
       },
       update: {
         templateId: template.id,
-        investAmount,
+        investAmount: minInvest,
       },
       include: {
         template: {
@@ -4454,24 +5566,25 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
             unitAmount: true,
             maxPrincipal: true,
             minInvestAmount: true,
-            accountName: true,
+            allAccounts: true,
+            accounts: { select: { accountName: true }, orderBy: { accountName: 'asc' } },
           },
         },
       },
     });
-    const maxPrincipal = Number(row.template.maxPrincipal);
+    const savedMax = Number(row.template.maxPrincipal);
     return {
       exchange: row.exchange,
       templateId: row.templateId,
-      investAmount: Number(row.investAmount),
-      ratio: maxPrincipal > 0 ? Number(row.investAmount) / maxPrincipal : null,
+      investAmount: Number(row.template.minInvestAmount),
+      ratio: this.templateOpenRatio(row.template),
       template: {
         id: row.template.id,
         name: row.template.name,
         unitAmount: Number(row.template.unitAmount),
-        maxPrincipal,
+        maxPrincipal: savedMax,
         minInvestAmount: Number(row.template.minInvestAmount),
-        accountName: row.template.accountName,
+        accountName: this.accountSummary(row.template),
       },
     };
   }
@@ -4497,7 +5610,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     }
     const followSetup = await this.getFollowSetupSummary(userId);
     if (!followSetup.ready) {
-      throw new BadRequestException(followSetup.hint || '请先选择跟单模板并填写投入总本金');
+      throw new BadRequestException(followSetup.hint || '请先选择合约模板');
     }
 
     // 有空位才分配 IP；满仓抛错并写 FAIL_NO_CAPACITY 记录
@@ -4537,24 +5650,29 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * 管理端：跟单用户一览（按用户×交易所展开）。
-   * readyOnly=true 时仅返回满足自动跟单条件的行：已开启 + ACTIVE + Key + 模板/本金。
+   * ready=ready 只留可自动跟单（已开启 + ACTIVE + Key + 模板/本金）；
+   * blocked 只留还不满足的；all 全部列出。
    */
   async listAdminFollowers(opts?: {
     exchange?: Exchange;
     q?: string;
     userId?: string;
-    readyOnly?: boolean;
+    ready?: 'ready' | 'blocked' | 'all';
     skip?: number;
     take?: number;
   }) {
-    const readyOnly = opts?.readyOnly !== false;
+    const readyFilter = opts?.ready === 'blocked' || opts?.ready === 'all' ? opts.ready : 'ready';
+    const readyOnly = readyFilter === 'ready';
     const { skip, take } = this.clampAdminPage(opts?.skip, opts?.take);
     const openMin = await this.getOpenMinPointBalance();
-    const where: any = {
-      isPlatform: false,
-      followEnabled: true,
-      status: 'ACTIVE',
-    };
+    const liveAccounts = await this.liveMiddlewareAccounts();
+    const globalTpl = await this.appliedGlobalTemplate();
+    const useGlobal = !!globalTpl;
+    const where: any = { isPlatform: false };
+    if (readyOnly) {
+      where.followEnabled = true;
+      where.status = 'ACTIVE';
+    }
     if (opts?.userId?.trim()) {
       where.id = opts.userId.trim();
     } else if (opts?.q?.trim()) {
@@ -4567,14 +5685,15 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       if (/^\d+$/.test(kw)) or.push({ userNo: Number(kw) });
       where.OR = or;
     }
-    if (readyOnly) {
+    if (readyOnly && !useGlobal) {
       where.followConfigs = {
         some: {
           ...(opts?.exchange ? { exchange: opts.exchange } : {}),
-          investAmount: { gt: 0 },
-          template: { active: true, maxPrincipal: { gt: 0 } },
+          template: { active: true, maxPrincipal: { gt: 0 }, minInvestAmount: { gt: 0 } },
         },
       };
+    }
+    if (readyOnly) {
       where.exchangeKeys = {
         some: {
           active: true,
@@ -4603,12 +5722,15 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
               select: {
                 id: true,
                 name: true,
-                exchange: true,
                 unitAmount: true,
                 maxPrincipal: true,
+                minInvestAmount: true,
                 active: true,
-                accountName: true,
-                accountGid: true,
+                allAccounts: true,
+                accounts: {
+                  select: { accountGid: true, accountName: true },
+                  orderBy: { accountName: 'asc' },
+                },
               },
             },
           },
@@ -4622,6 +5744,65 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     for (const u of users) {
       const keySet = new Set(u.exchangeKeys.map((k) => k.exchange));
       const pointBalance = Number(u.pointCard?.balance ?? 0);
+      if (useGlobal && globalTpl) {
+        const exList = opts?.exchange ? [opts.exchange] : [...keySet];
+        const sources = exList.length ? exList : readyOnly ? [] : [null];
+        for (const ex of sources) {
+          const covers = !!ex && this.templateCovers(globalTpl, ex);
+          const t = covers ? globalTpl : null;
+          const minInvest = t ? Number(t.minInvestAmount) : null;
+          const maxPrincipal = t ? Number(t.maxPrincipal) : null;
+          const unitAmount = t ? Number(t.unitAmount) : null;
+          const hasKey = !!ex && keySet.has(ex);
+          const openRatio = this.templateOpenRatio(t);
+          const staleAccounts = this.missingTemplateAccounts(t, liveAccounts);
+          const templateOk = !!(t && t.active && openRatio != null && staleAccounts.length === 0);
+          const ready = u.status === 'ACTIVE' && !!u.followEnabled && hasKey && templateOk;
+          if (readyFilter === 'ready' && !ready) continue;
+          if (readyFilter === 'blocked' && ready) continue;
+          const canOpen = ready && (openMin <= 0 || pointBalance >= openMin);
+          const blockers: string[] = [];
+          if (u.status !== 'ACTIVE') blockers.push('未审核通过');
+          if (!u.followEnabled) blockers.push('未开始交易');
+          if (!ex) blockers.push('未绑定交易所');
+          else if (!hasKey) blockers.push('未绑定该所 Key');
+          if (!t) blockers.push('合约模板未覆盖该交易所');
+          else if (!t.active) blockers.push('模板已停用');
+          else if (staleAccounts.length) blockers.push('模板账户已失效');
+          else if (!(maxPrincipal != null && maxPrincipal > 0)) blockers.push('模板基准本金无效');
+          else if (!(minInvest != null && minInvest > 0)) blockers.push('模板最少投入总本金无效');
+          if (ready && !canOpen) blockers.push(`点卡不足开仓(需≥${openMin})`);
+          items.push({
+            userId: u.id,
+            userNo: u.userNo,
+            nickname: u.nickname,
+            email: u.email,
+            status: u.status,
+            followEnabled: u.followEnabled,
+            followStartedAt: u.followStartedAt,
+            investUpdatedAt: null,
+            exchange: ex,
+            hasKey,
+            templateId: t?.id ?? null,
+            templateName: t?.name ?? null,
+            templateAccountName: t ? this.accountSummary(t) : null,
+            templateAccountGid: t?.allAccounts
+              ? null
+              : (t?.accounts || []).map((a) => a.accountGid).join(',') || null,
+            investAmount: minInvest,
+            maxPrincipal,
+            unitAmount,
+            openRatio,
+            pointBalance,
+            openMinPointBalance: openMin,
+            ready,
+            canOpen,
+            canFollowClose: ready,
+            blockers,
+          });
+        }
+        continue;
+      }
       const configs = opts?.exchange
         ? u.followConfigs.filter((c) => c.exchange === opts.exchange)
         : u.followConfigs;
@@ -4631,35 +5812,40 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           ? configs
           : readyOnly
             ? []
-            : (opts?.exchange ? [opts.exchange] : [...keySet]).map((ex) => ({
-                exchange: ex as Exchange,
-                templateId: null as string | null,
-                investAmount: null as any,
-                updatedAt: null as Date | null,
-                template: null as any,
-              }));
+            : (opts?.exchange ? [opts.exchange] : keySet.size ? [...keySet] : [null]).map(
+                (ex) => ({
+                  exchange: ex as Exchange | null,
+                  templateId: null as string | null,
+                  investAmount: null as any,
+                  updatedAt: null as Date | null,
+                  template: null as any,
+                }),
+              );
 
       for (const c of rowsSource) {
-        const ex = c.exchange as Exchange;
+        const ex = c.exchange as Exchange | null;
         const t = c.template;
-        const investAmount = c.investAmount != null ? Number(c.investAmount) : null;
+        const minInvest = t ? Number(t.minInvestAmount) : null;
         const maxPrincipal = t ? Number(t.maxPrincipal) : null;
         const unitAmount = t ? Number(t.unitAmount) : null;
-        const hasKey = keySet.has(ex);
-        const templateOk = !!(t && t.active && maxPrincipal != null && maxPrincipal > 0);
-        const investOk = investAmount != null && investAmount > 0;
-        const ready = hasKey && templateOk && investOk;
-        if (readyOnly && !ready) continue;
-
-        const openRatio =
-          investOk && maxPrincipal != null && maxPrincipal > 0 ? investAmount! / maxPrincipal : null;
+        const hasKey = !!ex && keySet.has(ex);
+        const openRatio = this.templateOpenRatio(t);
+        const staleAccounts = this.missingTemplateAccounts(t, liveAccounts);
+        const templateOk = !!(t && t.active && openRatio != null && staleAccounts.length === 0);
+        const ready = u.status === 'ACTIVE' && !!u.followEnabled && hasKey && templateOk;
+        if (readyFilter === 'ready' && !ready) continue;
+        if (readyFilter === 'blocked' && ready) continue;
         const canOpen = ready && (openMin <= 0 || pointBalance >= openMin);
         const blockers: string[] = [];
-        if (!hasKey) blockers.push('未绑定该所 Key');
+        if (u.status !== 'ACTIVE') blockers.push('未审核通过');
+        if (!u.followEnabled) blockers.push('未开始交易');
+        if (!ex) blockers.push('未绑定交易所');
+        else if (!hasKey) blockers.push('未绑定该所 Key');
         if (!t) blockers.push('未选模板');
         else if (!t.active) blockers.push('模板已停用');
+        else if (staleAccounts.length) blockers.push('模板账户已失效');
         else if (!(maxPrincipal != null && maxPrincipal > 0)) blockers.push('模板基准本金无效');
-        if (!investOk) blockers.push('未填投入本金');
+        else if (!(minInvest != null && minInvest > 0)) blockers.push('模板最少投入总本金无效');
         if (ready && !canOpen) blockers.push(`点卡不足开仓(需≥${openMin})`);
 
         items.push({
@@ -4670,15 +5856,17 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           status: u.status,
           followEnabled: u.followEnabled,
           followStartedAt: u.followStartedAt,
-          /** 跟单配置最近保存时间（含投入本金/模板变更） */
+          /** 跟单配置最近保存时间 */
           investUpdatedAt: (c as any).updatedAt ?? null,
           exchange: ex,
           hasKey,
           templateId: t?.id ?? c.templateId ?? null,
           templateName: t?.name ?? null,
-          templateAccountName: t?.accountName ?? null,
-          templateAccountGid: t?.accountGid ?? null,
-          investAmount,
+          templateAccountName: t ? this.accountSummary(t) : null,
+          templateAccountGid: t?.allAccounts
+            ? null
+            : (t?.accounts || []).map((a: { accountGid: string }) => a.accountGid).join(',') || null,
+          investAmount: minInvest,
           maxPrincipal,
           unitAmount,
           openRatio,
@@ -4697,19 +5885,65 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       items: items.slice(skip, skip + take),
       total,
       openMinPointBalance: openMin,
+      ready: readyFilter,
       readyOnly,
     };
   }
 
   /**
    * 可跟单用户（圈人）: 审核通过 + 已开跟单 + 该所 Key + 模板/本金有效。
-   * opts.accountGid: 信号中间件账户，须与模板 template.accountGid 一致（空模板 GID 不匹配）。
+   * opts.accountGid: 信号主账户。模板须勾选全部账户，或 accounts 中包含该 GID。
    */
   async listEligibleFollowers(
     exchange: Exchange,
     opts?: { forOpen?: boolean; accountGid?: string; skipPointGate?: boolean },
   ) {
     const signalAccountGid = opts?.accountGid?.trim() || '';
+    const scope = this.templateScopeWhere(exchange, signalAccountGid);
+    const liveAccounts = await this.liveMiddlewareAccounts();
+    const globalTpl = await this.appliedGlobalTemplate();
+    if (globalTpl) {
+      if (
+        !globalTpl.active ||
+        this.templateOpenRatio(globalTpl) == null ||
+        !this.templateCovers(globalTpl, exchange, signalAccountGid) ||
+        this.missingTemplateAccounts(globalTpl, liveAccounts).length > 0
+      ) {
+        return [];
+      }
+      const users = await this.prisma.user.findMany({
+        where: {
+          status: 'ACTIVE',
+          followEnabled: true,
+          isPlatform: false,
+          exchangeKeys: { some: { exchange, active: true } },
+        },
+        select: {
+          id: true,
+          email: true,
+          exchangeKeys: {
+            where: { exchange, active: true },
+            select: { exchange: true, label: true },
+          },
+        },
+      });
+      const minInvest = Number(globalTpl.minInvestAmount);
+      const maxPrincipal = Number(globalTpl.maxPrincipal);
+      const unitAmount = Number(globalTpl.unitAmount);
+      const ratio = this.templateOpenRatio(globalTpl) ?? 0;
+      return users.map((u) => ({
+        id: u.id,
+        email: u.email,
+        exchangeKeys: u.exchangeKeys,
+        templateId: globalTpl.id,
+        templateName: globalTpl.name,
+        templateAccountGid: signalAccountGid,
+        investAmount: minInvest,
+        maxPrincipal,
+        unitAmount,
+        openRatio: ratio,
+      }));
+    }
     const users = await this.prisma.user.findMany({
       where: {
         status: 'ACTIVE',
@@ -4719,13 +5953,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         followConfigs: {
           some: {
             exchange,
-            investAmount: { gt: 0 },
             template: {
               active: true,
               maxPrincipal: { gt: 0 },
-              ...(signalAccountGid
-                ? { accountGid: signalAccountGid }
-                : {}),
+              minInvestAmount: { gt: 0 },
+              ...scope,
             },
           },
         },
@@ -4740,9 +5972,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         followConfigs: {
           where: {
             exchange,
-            ...(signalAccountGid
-              ? { template: { accountGid: signalAccountGid } }
-              : {}),
+            template: scope,
           },
           take: 1,
           select: {
@@ -4752,9 +5982,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
               select: {
                 id: true,
                 name: true,
+                allAccounts: true,
                 unitAmount: true,
                 maxPrincipal: true,
-                accountGid: true,
+                minInvestAmount: true,
+                accounts: { select: { accountGid: true, accountName: true } },
               },
             },
           },
@@ -4762,35 +5994,29 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       },
     });
 
-    let mapped = users
+    return users
+      .filter((u) => this.missingTemplateAccounts(u.followConfigs[0]?.template, liveAccounts).length === 0)
       .map((u) => {
         const cfg = u.followConfigs[0];
-        const investAmount = cfg ? Number(cfg.investAmount) : 0;
+        const minInvest = cfg?.template ? Number(cfg.template.minInvestAmount) : 0;
         const maxPrincipal = cfg?.template ? Number(cfg.template.maxPrincipal) : 0;
         const unitAmount = cfg?.template ? Number(cfg.template.unitAmount) : 0;
-        const templateAccountGid = cfg?.template?.accountGid?.trim() || '';
-        const ratio = maxPrincipal > 0 ? investAmount / maxPrincipal : 0;
+        const ratio = this.templateOpenRatio(cfg?.template) ?? 0;
         return {
           id: u.id,
           email: u.email,
           exchangeKeys: u.exchangeKeys,
           templateId: cfg?.templateId ?? null,
           templateName: cfg?.template?.name ?? null,
-          templateAccountGid,
-          investAmount,
+          templateAccountGid: signalAccountGid,
+          investAmount: minInvest,
           maxPrincipal,
           unitAmount,
-          /** 开仓数量比例 = 声明本金 / 模板基准本金 */
+          /** 开仓数量比例 = 模板最少投入总本金 / 基准本金 */
           openRatio: ratio,
         };
       })
-      .filter((u) => {
-        // 跟单下发必须带信号账户：模板未绑账户或与信号不一致的排除
-        if (!signalAccountGid) return true;
-        return !!u.templateAccountGid && u.templateAccountGid === signalAccountGid;
-      });
-
-    return mapped;
+      .filter((u) => !!u.templateId);
   }
 
   async followStatus(userId: string) {
@@ -4925,8 +6151,8 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
                 accSum += usdtNum;
                 assets.push({
                   asset,
-                  free: String(a.free ?? '0'),
-                  total: String(a.total ?? a.free ?? '0'),
+                  free: this.fmtQty(Number(a.free ?? 0)),
+                  total: this.fmtQty(Number(a.total ?? a.free ?? 0)),
                   usdt: this.fmtMoney(usdtNum),
                   usdtNum,
                 });
@@ -5246,6 +6472,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           coinName: coinName || '',
           equalCoinName,
           positionSide,
+          apiCode: String(meta.apiCode || '').trim().toLowerCase(),
         });
       } catch (e: any) {
         this.logger.warn(
@@ -5484,9 +6711,16 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     let priceAvg = Number(log.priceAvg);
     let tradeFee = Number(log.tradeFee);
     let state: FillSnapshot['state'] = log.finalFill ? 'filled' : 'unknown';
+    let fillMeta: any = {};
+    try {
+      fillMeta = row.requestBody ? JSON.parse(row.requestBody) : {};
+    } catch {
+      fillMeta = {};
+    }
     const q = await this.inspectOrderFill(log.userId, log.exchange, log.orderId, {
       symbol: log.symbol || row.symbol || undefined,
       accountType: log.accountType || row.accountType || 'future',
+      apiCode: fillMeta.apiCode || undefined,
       coinName: row.coinName || undefined,
       equalCoinName: row.equalCoinName || undefined,
       clientOrderId: row.clientOrderId || undefined,
@@ -5736,21 +6970,33 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       (await this.prisma.pointCard.findUnique({ where: { userId } })) ??
       (await this.prisma.pointCard.create({ data: { userId } }));
 
-    const [stats, openMin, apiKeyCount] = await Promise.all([
+    const [stats, openMin, apiKeyCount, withdrawByStatus] = await Promise.all([
       this.profitStats(userId),
       this.getOpenMinPointBalance(),
       this.keys.countComplete(userId),
+      this.prisma.withdrawRequest.groupBy({
+        by: ['status'],
+        where: {
+          userId,
+          status: { in: ['PENDING', 'APPROVED', 'SETTLED', 'RELEASED'] },
+        },
+        _sum: { amount: true, fee: true },
+      }),
     ]);
+
+    const withdrawSum = (statuses: string[]) =>
+      withdrawByStatus
+        .filter((row) => statuses.includes(row.status))
+        .reduce(
+          (n, row) => n + Number(row._sum.amount ?? 0) + Number(row._sum.fee ?? 0),
+          0,
+        );
 
     const pointBalance = Number(pointCard.balance);
     const claimableNum = Number(pointCard.commissionBalance);
-    const pendingNum = Number(pointCard.commissionFrozen);
-    const claimedNum = Math.max(
-      0,
-      (Number.isFinite(stats.commissionNum) ? stats.commissionNum : 0) -
-        (Number.isFinite(claimableNum) ? claimableNum : 0) -
-        (Number.isFinite(pendingNum) ? pendingNum : 0),
-    );
+    // 待审 = 已申请、还在审核中的提现；已领 = 审核通过（含已打款）
+    const pendingNum = withdrawSum(['PENDING']);
+    const claimedNum = withdrawSum(['APPROVED', 'SETTLED', 'RELEASED']);
     const totalAssetsNum =
       (Number.isFinite(pointBalance) ? pointBalance : 0) +
       (Number.isFinite(stats.totalNum) ? stats.totalNum : 0) +
@@ -5821,8 +7067,21 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
 
   private fmtAmount(n: number): string {
     if (!Number.isFinite(n)) return '0';
-    if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
-    return n.toLocaleString('en-US', { maximumFractionDigits: 8 });
+    const abs = Math.abs(n);
+    if (abs >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
+    return this.fmtQty(n);
+  }
+
+  /** 资产数量：固定小数，避免 5.4e-7、1e-8 这种科学计数。 */
+  private fmtQty(n: number): string {
+    if (!Number.isFinite(n) || n === 0) return '0';
+    const neg = n < 0;
+    const abs = Math.abs(n);
+    const digits = abs >= 1 ? 8 : 12;
+    let s = abs.toFixed(digits);
+    if (s.includes('.')) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    if (!s || s === '0') return '0';
+    return neg ? `-${s}` : s;
   }
 
   private fmtTime(d: Date | string): string {
@@ -5969,6 +7228,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       exchange: string;
       coinName: string;
       equalCoinName: string;
+      apiCode: string | null;
       side: string;
       signalSize: number | null;
       signalPrice: number | null;
@@ -6027,6 +7287,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         exchange,
         coinName,
         equalCoinName,
+        apiCode: String(loc.apiCode || sig?.apiCode || '').trim().toLowerCase() || null,
         side,
         signalSize,
         signalPrice,
@@ -6061,6 +7322,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           exchange: String(sig.exchange || ''),
           coinName: sig.coinName,
           equalCoinName: sig.equalCoinName,
+          apiCode: String(sig.apiCode || '').trim().toLowerCase() || null,
           side: sig.positionSide,
           signalSize: sig.size,
           signalPrice: sig.price,
@@ -6083,6 +7345,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         exchange: String(sig.exchange || ''),
         coinName: sig.coinName,
         equalCoinName: sig.equalCoinName,
+        apiCode: String(sig.apiCode || '').trim().toLowerCase() || null,
         side: sig.positionSide,
         signalSize: sig.size,
         signalPrice: sig.price,
@@ -6579,6 +7842,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       });
       const meta = posMetaByKey.get(posKey);
       const accountType = log?.accountType ?? meta?.accountType ?? null;
+      const closeApiCode = this.apiCodeFromBody(log?.requestBody);
       const accountGid = log?.accountGid ?? meta?.accountGid ?? null;
       const accountName = log?.accountName ?? meta?.accountName ?? null;
 
@@ -6660,6 +7924,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         coinName: coin,
         equalCoinName: eq || null,
         pair: symbol,
+        apiCode: closeApiCode || null,
         mode,
         accountType: accountType || (at === 'spot' ? 'spot' : 'future'),
         accountGid,
@@ -6863,26 +8128,41 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       this.prisma.userPosition.findMany({
         where,
         select: {
+          userId: true,
           coinName: true,
           exchange: true,
+          equalCoinName: true,
           accountType: true,
           positionSide: true,
           qty: true,
           entryPrice: true,
+          apiCode: true,
         },
       }),
     ]);
-    this.kickoffPositionMarkPrices(allForPnl);
+    const apiCodes = await this.loadOpenApiCodeMap([...rows, ...allForPnl]);
+    await this.fillPositionMarkPrices(
+      allForPnl.map((r) => ({
+        exchange: r.exchange,
+        coinName: r.coinName,
+        accountType: r.accountType,
+        apiCode: apiCodes.get(this.posContractKey(r)),
+        equalCoinName: r.equalCoinName,
+      })),
+    );
 
     const items = rows.map((r) => ({
-      ...this.mapUserPositionRow(r),
+      ...this.mapUserPositionRow(r, apiCodes.get(this.posContractKey(r))),
       userId: r.userId,
       user: r.user,
     }));
     let pnlSum = 0;
     let counted = 0;
     for (const r of allForPnl) {
-      const n = this.unrealizedPnlNum(r);
+      const n = this.unrealizedPnlNum({
+        ...r,
+        apiCode: apiCodes.get(this.posContractKey(r)),
+      });
       if (n == null) continue;
       pnlSum += n;
       counted += 1;
@@ -6899,7 +8179,87 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * 该仓 apiCode。先读持仓表，没有再读开仓流水并写回持仓。
+   * 流水清掉后仍用持仓上这一列，避免平 USDC 仓时打到 USDT 永续。
+   */
+  private async resolvePositionApiCode(params: {
+    userId: string;
+    exchange: Exchange;
+    coinName: string;
+    equalCoinName: string;
+    positionSide: string;
+    apiCode?: string;
+  }): Promise<string | undefined> {
+    const asked = String(params.apiCode || '').trim().toLowerCase();
+    if (asked) {
+      const exact = await this.prisma.userPosition.findUnique({
+        where: {
+          user_pos_uniq: {
+            userId: params.userId,
+            apiCode: asked,
+            coinName: params.coinName,
+            equalCoinName: params.equalCoinName,
+            positionSide: params.positionSide,
+          },
+        },
+        select: { apiCode: true },
+      });
+      const exactCode = String(exact?.apiCode || '').trim().toLowerCase();
+      if (exactCode) return exactCode;
+      return asked;
+    }
+    const storedRows = await this.prisma.userPosition.findMany({
+      where: {
+        userId: params.userId,
+        exchange: params.exchange,
+        coinName: params.coinName,
+        equalCoinName: params.equalCoinName,
+        positionSide: params.positionSide,
+      },
+      select: { apiCode: true },
+    });
+    const codes = [
+      ...new Set(
+        storedRows
+          .map((r) => String(r.apiCode || '').trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    ];
+    if (codes.length === 1) return codes[0];
+
+    const rows = await this.prisma.signalFollowLog.findMany({
+      where: {
+        userId: params.userId,
+        exchange: params.exchange,
+        isOpen: true,
+        coinName: params.coinName,
+        equalCoinName: params.equalCoinName,
+        positionSide: params.positionSide,
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+      select: { requestBody: true, filledAmt: true, consumedAmt: true },
+    });
+    let fallback = '';
+    let hit = '';
+    for (const row of rows) {
+      const code = this.apiCodeFromBody(row.requestBody);
+      if (!code) continue;
+      const remain = Number(row.filledAmt ?? 0) - Number(row.consumedAmt ?? 0);
+      if (remain > 1e-12) {
+        hit = code;
+        break;
+      }
+      if (!fallback) fallback = code;
+    }
+    const code = hit || fallback;
+    if (code) await this.rememberPositionApiCode(params, code);
+    return code || undefined;
+  }
+
+  /**
    * 管理端/对账市价平仓。中间件无独立 ClosePosition，走 PlaceOrder(isOpen=false) + 内存标记价。
+   * apiCode 用持仓上保存的开仓码（USDC 永续 bab，USDT 永续 bac），避免平 USDC 仓时打到 USDT 永续。
    * 对账没价不打单、不记失败，等后台盘口线程刷到再平。
    * 手动市价平：中间件正常回包但业务失败（successed=false / 失败文案）→ 立刻标异常持仓。
    * 成功后写平仓流水、配对盈亏/扣点分佣，并同步本地持仓。
@@ -6913,6 +8273,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     positionSide: string;
     amount: number | string;
     accountType?: string;
+    apiCode?: string;
     accountGid?: string;
     accountName?: string;
     leverage?: number | string;
@@ -6934,6 +8295,16 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     const equal = String(params.equalCoinName || 'PC').trim().toUpperCase() || 'PC';
     const symbol = String(params.symbol || `${coinName}/${equal}`).trim();
     const accountType = params.accountType || 'future';
+    const apiCode =
+      String(params.apiCode || '').trim() ||
+      (await this.resolvePositionApiCode({
+        userId: params.userId,
+        exchange: params.exchange,
+        coinName,
+        equalCoinName: equal,
+        positionSide,
+      })) ||
+      undefined;
     const source = String(params.source || 'ADMIN_CLOSE').trim() || 'ADMIN_CLOSE';
     const remark =
       String(params.remark || '').trim() ||
@@ -6951,6 +8322,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           coinName,
           equalCoinName: equal,
           positionSide,
+          ...(apiCode ? { apiCode } : {}),
         },
         select: { accountGid: true, accountName: true },
       });
@@ -6960,10 +8332,18 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     if (!displayGid || !displayName) {
       const cfg = await this.prisma.userFollowConfig.findFirst({
         where: { userId: params.userId, exchange: params.exchange },
-        include: { template: { select: { accountGid: true, accountName: true } } },
+        include: {
+          template: {
+            select: {
+              allAccounts: true,
+              accounts: { select: { accountGid: true, accountName: true }, take: 2 },
+            },
+          },
+        },
       });
-      displayGid = displayGid || String(cfg?.template?.accountGid || '').trim();
-      displayName = displayName || String(cfg?.template?.accountName || '').trim();
+      const only = this.singleTemplateAccount(cfg?.template);
+      displayGid = displayGid || only.accountGid || '';
+      displayName = displayName || only.accountName || '';
     }
 
     // 持仓上的 accountGid 是信号主账户，不能带入 PlaceOrder.account.gid
@@ -6973,6 +8353,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       coinName,
       equalCoinName: equal,
       positionSide,
+      apiCode,
     });
 
     let place: any;
@@ -6987,6 +8368,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         positionSide,
         coinName,
         equalCoinName: equal,
+        ...(apiCode ? { apiCode } : {}),
         leverage: params.leverage,
         isOpen: false,
         skipTradePassword: true,
@@ -7067,6 +8449,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         responseBody: JSON.stringify(data ?? place).slice(0, 8000),
         requestBody: JSON.stringify({
           source,
+          apiCode: apiCode || undefined,
           coinName,
           equalCoinName: equal,
           positionSide,
@@ -7080,6 +8463,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     const q = await this.inspectOrderFill(params.userId, params.exchange, orderId, {
       symbol,
       accountType,
+      apiCode,
       coinName,
       equalCoinName: equal,
       isOpen: false,
@@ -7211,7 +8595,9 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
     coinName: string;
     equalCoinName: string;
     positionSide: string;
+    apiCode?: string;
   }): Promise<string | null> {
+    const apiCode = String(params.apiCode || '').trim().toLowerCase();
     const row = await this.prisma.userPosition.findFirst({
       where: {
         userId: params.userId,
@@ -7219,6 +8605,7 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
         coinName: params.coinName,
         equalCoinName: params.equalCoinName,
         positionSide: params.positionSide,
+        ...(apiCode ? { apiCode } : {}),
         status: UserPositionStatus.OPEN,
         qty: { gt: 0 },
       },
@@ -7268,6 +8655,531 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
       requested: uniq.length,
       discarded: result.count,
       skippedNonAbnormal: skipped,
+    };
+  }
+
+  /**
+   * 现拉 MultiAccountList：仅当响应体是数组才算成功（含 []）；HTTP/抛错/非数组 → 失败且不回落旧缓存。
+   * 与后台定时刷新「失败保留旧缓存」分开：清理/对齐必须以这次成功响应为准。
+   */
+  private async listedAccountGidSet(opts?: {
+    writePostLog?: boolean;
+  }): Promise<{ ok: true; gids: Set<string> } | { ok: false; message: string }> {
+    const memoTtlMs = 30_000;
+    if (this.listedGidsMemo && Date.now() - this.listedGidsMemo.at < memoTtlMs) {
+      return this.listedGidsMemo.result;
+    }
+    let result: { ok: true; gids: Set<string> } | { ok: false; message: string };
+    const writePostLog = opts?.writePostLog === true;
+    try {
+      const { data } = await this.mapi.get('mapi/MultiAccountList', {
+        skipLog: !writePostLog,
+        feature: writePostLog ? '手动对齐-主账户列表' : '主账户列表(对齐清理)',
+      });
+      if (!Array.isArray(data)) {
+        const err = String((data as any)?.errorMsg || (data as any)?.message || '').trim();
+        result = {
+          ok: false,
+          message: `主账户列表返回异常，已停止删除：${err || '非数组响应'}`,
+        };
+      } else {
+        const items = data;
+        this.accountListCache = { items, fetchedAt: Date.now() };
+        const gids = new Set<string>();
+        for (const a of items) {
+          const id = String(a?.value ?? a?.gid ?? a?.accountGid ?? '').trim();
+          if (id) gids.add(id);
+        }
+        result = { ok: true, gids };
+      }
+    } catch (e: any) {
+      result = {
+        ok: false,
+        message: `主账户列表拉取失败，已停止删除：${e?.message || e}`,
+      };
+    }
+    // 成功（含空列表）复用 30s；失败只记很短，尽快下次重试
+    this.listedGidsMemo = {
+      at: Date.now(),
+      result,
+    };
+    if (!result.ok) {
+      // 失败 memo 缩短：下次调用若已过 3s 再打
+      this.listedGidsMemo.at = Date.now() - memoTtlMs + 3_000;
+    }
+    return result;
+  }
+
+  /**
+   * 废弃本用户本交易所下「不在当前主账户列表」的 OPEN 仓。
+   * 列表接口成功且为空时，视为当前无主账户，列表外（含全部已绑定仓）一并清。
+   * 列表 HTTP 失败返回 0，不动本地仓。
+   */
+  private async discardOutsideAccountPositions(
+    userId: string,
+    exchange: Exchange,
+    opts?: { writePostLog?: boolean },
+  ): Promise<number> {
+    const listed = await this.listedAccountGidSet({
+      writePostLog: opts?.writePostLog === true,
+    });
+    if (!listed.ok) {
+      this.logger.warn(
+        `对齐跳过列表外清理 user=${userId} ${exchange}: ${listed.message}`,
+      );
+      return 0;
+    }
+    const outside = this.outsideAccountWhere(listed.gids);
+    if (!outside) return 0;
+    const now = new Date();
+    const result = await this.prisma.userPosition.updateMany({
+      where: {
+        userId,
+        exchange,
+        status: UserPositionStatus.OPEN,
+        qty: { gt: 0 },
+        ...outside,
+      },
+      data: {
+        status: UserPositionStatus.CLOSED,
+        qty: 0,
+        closedAt: now,
+        closeKind: 'DISCARD_LOCAL',
+        lastCloseFailMsg: '主账户已不在当前账户列表，本地废弃',
+        lastCloseOkAt: null,
+        lastCloseOkAmt: null,
+        abnormal: false,
+        closeRetryStopAt: null,
+      },
+    });
+    if (result.count > 0) {
+      this.logger.log(
+        `对齐清列表外持仓 user=${userId} ${exchange} 废弃=${result.count}（当前列表 ${listed.gids.size} 个主账户）`,
+      );
+    }
+    return result.count;
+  }
+
+  /**
+   * 当前持仓只允许删「不在账户列表里」的未平仓。
+   * 列表内的主账户受保护。未选主账户时，删全部列表外持仓（含未绑定主账户）。
+   * 选中的主账户若还在列表里，则一笔都不删。
+   * 列表成功且为空：视为当前无主账户，返回 {}（调用方范围内的 OPEN 全清）。
+   */
+  private outsideAccountWhere(
+    gids: Set<string>,
+    accountGid?: string,
+  ): Prisma.UserPositionWhereInput | null {
+    const gid = String(accountGid || '').trim();
+    const listed = [...gids];
+    if (gid) {
+      if (gids.has(gid)) return null;
+      return { accountGid: gid };
+    }
+    if (listed.length === 0) return {};
+    return {
+      OR: [
+        { accountGid: null },
+        { accountGid: '' },
+        { accountGid: { notIn: listed } },
+      ],
+    };
+  }
+
+  async previewPurgeLocalPositions(accountGid?: string) {
+    const gid = String(accountGid || '').trim();
+    const listed = await this.listedAccountGidSet();
+    if (!listed.ok) {
+      return {
+        accountGid: gid || null,
+        scope: gid ? ('account' as const) : ('outside' as const),
+        accounts: [] as { accountGid: string; accountName: string; count: number }[],
+        total: 0,
+        blocked: listed.message,
+      };
+    }
+    const outside = this.outsideAccountWhere(listed.gids, gid);
+    if (!outside) {
+      return {
+        accountGid: gid || null,
+        scope: 'account' as const,
+        accounts: [] as { accountGid: string; accountName: string; count: number }[],
+        total: 0,
+        blocked: '该主账户还在账户列表里，不能删除它下面的持仓',
+      };
+    }
+
+    const grouped = await this.prisma.userPosition.groupBy({
+      by: ['accountGid', 'accountName'],
+      where: {
+        status: UserPositionStatus.OPEN,
+        qty: { gt: 0 },
+        ...outside,
+      },
+      _count: { _all: true },
+    });
+
+    const map = new Map<string, { accountGid: string; accountName: string; count: number }>();
+    for (const g of grouped) {
+      const id = String(g.accountGid || '').trim();
+      const name = String(g.accountName || '').trim();
+      const prev = map.get(id);
+      if (!prev) {
+        map.set(id, { accountGid: id, accountName: name, count: g._count._all });
+      } else {
+        prev.count += g._count._all;
+        if (!prev.accountName && name) prev.accountName = name;
+      }
+    }
+    const accounts = [...map.values()].sort(
+      (a, b) => b.count - a.count || a.accountName.localeCompare(b.accountName, 'zh'),
+    );
+    const total = accounts.reduce((n, a) => n + a.count, 0);
+    return {
+      accountGid: gid || null,
+      scope: gid ? ('account' as const) : ('outside' as const),
+      accounts,
+      total,
+      blocked: null as string | null,
+    };
+  }
+
+  async purgeLocalPositionsByAccount(accountGid?: string) {
+    const preview = await this.previewPurgeLocalPositions(accountGid);
+    if (preview.blocked || preview.total === 0) {
+      return {
+        ok: true as const,
+        discarded: 0,
+        accounts: preview.accounts,
+        total: 0,
+        blocked: preview.blocked,
+      };
+    }
+    const listed = await this.listedAccountGidSet();
+    if (!listed.ok) {
+      return {
+        ok: true as const,
+        discarded: 0,
+        accounts: [] as { accountGid: string; accountName: string; count: number }[],
+        total: 0,
+        blocked: listed.message,
+      };
+    }
+    const outside = this.outsideAccountWhere(listed.gids, accountGid);
+    if (!outside) {
+      return {
+        ok: true as const,
+        discarded: 0,
+        accounts: preview.accounts,
+        total: 0,
+        blocked: '该主账户还在账户列表里，不能删除它下面的持仓',
+      };
+    }
+    const now = new Date();
+    const result = await this.prisma.userPosition.updateMany({
+      where: {
+        status: UserPositionStatus.OPEN,
+        qty: { gt: 0 },
+        ...outside,
+      },
+      data: {
+        status: UserPositionStatus.CLOSED,
+        qty: 0,
+        closedAt: now,
+        closeKind: 'DISCARD_LOCAL',
+        lastCloseFailMsg: '账户列表外的本地持仓清理',
+        lastCloseOkAt: null,
+        lastCloseOkAmt: null,
+        abnormal: false,
+        closeRetryStopAt: null,
+      },
+    });
+    this.logger.log(`清理账户列表外持仓 ${result.count} 条`);
+    return {
+      ok: true as const,
+      discarded: result.count,
+      accounts: preview.accounts,
+      total: preview.total,
+      blocked: null as string | null,
+    };
+  }
+
+  /**
+   * 已平仓记录清理范围，与列表筛选一致。
+   * closedKind=all 或不传：利润明细 + 死仓都算。
+   * partial / full 只算对应利润；discard 只算死仓。
+   * 其余条件为空则不限制。
+   */
+  private async collectClosedPurgeTargets(opts: {
+    userId?: string;
+    q?: string;
+    exchange?: string;
+    coinName?: string;
+    period?: string;
+    accountGid?: string;
+    closedKind?: string;
+    recordId?: string;
+    from?: string;
+    to?: string;
+  }) {
+    const kind = String(opts.closedKind || 'all').toLowerCase();
+    const includeProfit = kind !== 'discard';
+    const includeDiscard = kind === 'all' || kind === '' || kind === 'discard';
+    const period = String(opts.period || '').toLowerCase();
+    const accountGidFilter = String(opts.accountGid || '').trim();
+    const recordId = String(opts.recordId || '').trim();
+    const coin = String(opts.coinName || '').trim().toUpperCase();
+    const fromMs = this.parseDayBoundMs(opts.from, false);
+    const toMs = this.parseDayBoundMs(opts.to, true);
+    const exchangeRaw = String(opts.exchange || '').trim().toUpperCase();
+    const exchange = (Object.values(Exchange) as string[]).includes(exchangeRaw)
+      ? (exchangeRaw as Exchange)
+      : undefined;
+
+    const userWhere: Prisma.UserWhereInput = {};
+    if (opts.userId?.trim()) {
+      userWhere.id = opts.userId.trim();
+    } else if (opts.q?.trim()) {
+      const kw = opts.q.trim();
+      const or: Prisma.UserWhereInput[] = [
+        { email: { contains: kw } },
+        { nickname: { contains: kw } },
+      ];
+      if (/^\d+$/.test(kw)) or.push({ userNo: Number(kw) });
+      userWhere.OR = or;
+    }
+    const hasUser = Object.keys(userWhere).length > 0;
+    const closedRange =
+      fromMs != null || toMs != null
+        ? {
+            ...(fromMs != null ? { gte: new Date(fromMs) } : {}),
+            ...(toMs != null ? { lte: new Date(toMs) } : {}),
+          }
+        : undefined;
+
+    const accMap = new Map<string, { accountGid: string; accountName: string; count: number }>();
+    const bump = (gidRaw: string | null | undefined, nameRaw: string | null | undefined) => {
+      const id = String(gidRaw || '').trim();
+      const name = String(nameRaw || '').trim();
+      const prev = accMap.get(id);
+      if (!prev) accMap.set(id, { accountGid: id, accountName: name, count: 1 });
+      else {
+        prev.count += 1;
+        if (!prev.accountName && name) prev.accountName = name;
+      }
+    };
+
+    const profitIds: string[] = [];
+    if (includeProfit) {
+      const profitWhere: Prisma.ProfitRecordWhereInput = {};
+      if (recordId) profitWhere.id = recordId;
+      if (exchange) profitWhere.exchange = exchange;
+      if (coin) profitWhere.symbol = { contains: coin };
+      if (closedRange) profitWhere.closedAt = closedRange;
+      if (hasUser) profitWhere.user = userWhere;
+      const profits = await this.prisma.profitRecord.findMany({
+        where: profitWhere,
+        select: { id: true, orderId: true, userId: true, exchange: true, symbol: true },
+      });
+      const orderIds = [
+        ...new Set(profits.map((p) => p.orderId).filter(Boolean)),
+      ] as string[];
+      const userIds = [...new Set(profits.map((p) => p.userId))];
+      const loadChunks = async <T>(ids: string[], load: (part: string[]) => Promise<T[]>) => {
+        const out: T[] = [];
+        for (let i = 0; i < ids.length; i += 400) {
+          out.push(...(await load(ids.slice(i, i + 400))));
+        }
+        return out;
+      };
+      const [logs, positions] = await Promise.all([
+        loadChunks(orderIds, (part) =>
+          this.prisma.signalFollowLog.findMany({
+            where: { orderId: { in: part } },
+            select: {
+              orderId: true,
+              userId: true,
+              coinName: true,
+              equalCoinName: true,
+              positionSide: true,
+              accountType: true,
+              accountGid: true,
+              accountName: true,
+              filledAmt: true,
+              status: true,
+              fillKind: true,
+              isOpen: true,
+            },
+          }),
+        ),
+        loadChunks(userIds, (part) =>
+          this.prisma.userPosition.findMany({
+            where: { userId: { in: part } },
+            select: {
+              userId: true,
+              exchange: true,
+              coinName: true,
+              equalCoinName: true,
+              positionSide: true,
+              accountType: true,
+              accountGid: true,
+              accountName: true,
+            },
+          }),
+        ),
+      ]);
+      const logByOrder = new Map<string, (typeof logs)[number]>();
+      for (const l of logs) {
+        if (!l.orderId) continue;
+        const prev = logByOrder.get(l.orderId);
+        if (!prev || (l.isOpen === false && prev.isOpen !== false)) logByOrder.set(l.orderId, l);
+      }
+      const posByKey = new Map<string, (typeof positions)[number]>();
+      for (const pos of positions) {
+        posByKey.set(
+          this.buildPosMatchKey({
+            userId: pos.userId,
+            exchange: pos.exchange,
+            coinName: pos.coinName,
+            equalCoinName: pos.equalCoinName,
+            positionSide: pos.positionSide,
+          }),
+          pos,
+        );
+      }
+      for (const p of profits) {
+        const log = p.orderId ? logByOrder.get(String(p.orderId)) : undefined;
+        const parsed = this.parseSymbolParts(p.symbol || '');
+        const coinName = String(log?.coinName || parsed.coin || '').toUpperCase();
+        const eq = String(log?.equalCoinName || parsed.equalCoin || 'USDT').toUpperCase();
+        const side = this.positionSideKey(log?.positionSide);
+        const meta = posByKey.get(
+          this.buildPosMatchKey({
+            userId: p.userId,
+            exchange: p.exchange,
+            coinName,
+            equalCoinName: eq,
+            positionSide: side,
+          }),
+        );
+        const accountType = log?.accountType ?? meta?.accountType ?? null;
+        const gid = log?.accountGid ?? meta?.accountGid ?? null;
+        const name = log?.accountName ?? meta?.accountName ?? null;
+        if (period && !this.matchMarketPeriod(period, accountType, eq)) continue;
+        if (accountGidFilter && String(gid || '') !== accountGidFilter) continue;
+        const closeKind = this.closeKindFromFillLog(log);
+        if (kind === 'partial' && closeKind !== 'PARTIAL') continue;
+        if (kind === 'full' && closeKind !== 'FULL') continue;
+        profitIds.push(p.id);
+        bump(gid, name);
+      }
+    }
+
+    const discardIds: string[] = [];
+    if (includeDiscard) {
+      const rows = await this.prisma.userPosition.findMany({
+        where: {
+          status: UserPositionStatus.CLOSED,
+          closeKind: 'DISCARD_LOCAL',
+          ...(recordId ? { id: recordId } : {}),
+          ...(exchange ? { exchange } : {}),
+          ...(accountGidFilter ? { accountGid: accountGidFilter } : {}),
+          ...(coin ? { coinName: { contains: coin } } : {}),
+          ...(closedRange ? { closedAt: closedRange } : {}),
+          ...(hasUser ? { user: userWhere } : {}),
+        },
+        select: {
+          id: true,
+          accountGid: true,
+          accountName: true,
+          accountType: true,
+          equalCoinName: true,
+        },
+      });
+      for (const r of rows) {
+        if (period && !this.matchMarketPeriod(period, r.accountType, r.equalCoinName)) continue;
+        discardIds.push(r.id);
+        bump(r.accountGid, r.accountName);
+      }
+    }
+
+    const accounts = [...accMap.values()].sort(
+      (a, b) => b.count - a.count || a.accountName.localeCompare(b.accountName, 'zh'),
+    );
+    return { profitIds, discardIds, accounts };
+  }
+
+  async previewClearClosedRecords(opts: {
+    userId?: string;
+    q?: string;
+    exchange?: string;
+    coinName?: string;
+    period?: string;
+    accountGid?: string;
+    closedKind?: string;
+    recordId?: string;
+    from?: string;
+    to?: string;
+  }) {
+    const targets = await this.collectClosedPurgeTargets(opts);
+    return {
+      accounts: targets.accounts,
+      total: targets.profitIds.length + targets.discardIds.length,
+      profitCount: targets.profitIds.length,
+      discardCount: targets.discardIds.length,
+    };
+  }
+
+  async clearClosedRecords(opts: {
+    userId?: string;
+    q?: string;
+    exchange?: string;
+    coinName?: string;
+    period?: string;
+    accountGid?: string;
+    closedKind?: string;
+    recordId?: string;
+    from?: string;
+    to?: string;
+  }) {
+    const targets = await this.collectClosedPurgeTargets(opts);
+    const chunk = 400;
+    const drop = async (ids: string[], run: (part: string[]) => Promise<unknown>) => {
+      for (let i = 0; i < ids.length; i += chunk) {
+        await run(ids.slice(i, i + chunk));
+      }
+    };
+    await this.prisma.$transaction(
+      async (tx) => {
+        await drop(targets.profitIds, (part) =>
+          tx.commissionRecord.deleteMany({ where: { profitId: { in: part } } }),
+        );
+        await drop(targets.profitIds, (part) =>
+          tx.profitRecord.deleteMany({ where: { id: { in: part } } }),
+        );
+        await drop(targets.discardIds, (part) =>
+          tx.userPosition.deleteMany({
+            where: {
+              id: { in: part },
+              status: UserPositionStatus.CLOSED,
+              closeKind: 'DISCARD_LOCAL',
+            },
+          }),
+        );
+      },
+      { timeout: 120_000 },
+    );
+    const deleted = targets.profitIds.length + targets.discardIds.length;
+    this.logger.log(
+      `清理已平仓记录 ${deleted} 条（利润 ${targets.profitIds.length}，死仓 ${targets.discardIds.length}）`,
+    );
+    return {
+      ok: true as const,
+      deleted,
+      profitDeleted: targets.profitIds.length,
+      discardDeleted: targets.discardIds.length,
+      accounts: targets.accounts,
+      total: deleted,
     };
   }
 
@@ -7323,10 +9235,11 @@ export class TradeService implements OnModuleInit, OnModuleDestroy {
           const free = Number(a.free ?? a.available ?? a.availBal ?? 0);
           const locked = Number(a.locked ?? a.frozen ?? 0);
           const net = a.net != null ? Number(a.net) : free + locked;
+          const totalNum = Number(a.total ?? a.balance ?? a.eq ?? net ?? free);
           return {
             asset: a.coinName || a.asset || a.coin || a.currency || a.symbolName || a.symbol,
-            free: String(free),
-            total: String(a.total ?? a.balance ?? a.eq ?? net ?? free),
+            free: this.fmtQty(free),
+            total: this.fmtQty(Number.isFinite(totalNum) ? totalNum : free),
           };
         }),
         raw: data,

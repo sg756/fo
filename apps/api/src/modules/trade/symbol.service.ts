@@ -58,18 +58,8 @@ export class SymbolService implements OnModuleInit, OnModuleDestroy {
 
   private lookup(apiCode: string, coin: string, equalCoin: string): SymbolPairInfo | undefined {
     const wantKey = this.key(apiCode, coin, equalCoin);
-    let hit = this.cache.find(
+    const hit = this.cache.find(
       (s) => this.key(s.apiCode, s.coinName, s.equalCoinName) === wantKey,
-    );
-    if (hit) return hit;
-
-    // 兼容合约 apiCode 变体 (bac vs ba)
-    const wantPrefix = String(apiCode).toLowerCase().replace(/[cf]$/, '');
-    hit = this.cache.find(
-      (s) =>
-        String(s.apiCode).toLowerCase().replace(/[cf]$/, '') === wantPrefix &&
-        String(s.coinName).toUpperCase() === String(coin).toUpperCase() &&
-        String(s.equalCoinName).toUpperCase() === String(equalCoin).toUpperCase(),
     );
     return hit;
   }

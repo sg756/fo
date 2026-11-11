@@ -124,7 +124,7 @@ export class AuthService {
       upline = this.resolveUpline(inviter);
     }
 
-    // 注册即分配本人邀请码；状态 PENDING，需后台审核通过后才能登录
+    // 注册即分配本人邀请码；直接 ACTIVE，无需后台审核即可登录
     const inviteCode = await this.allocInviteCode();
     const passwordHash = await bcrypt.hash(dto.password, 10);
 
@@ -137,7 +137,7 @@ export class AuthService {
         parentId: upline.parentId,
         l1Id: upline.l1Id,
         l2Id: upline.l2Id,
-        status: 'PENDING',
+        status: 'ACTIVE',
         pointCard: { create: {} },
       },
     });
@@ -147,7 +147,7 @@ export class AuthService {
     try {
       const wallet = await this.wallets.ensureUserWallet(user.id, primaryChain);
       this.logger.log(
-        `用户 ${user.id} 注册完成（待审核），账号=${nickname}，邀请码=${inviteCode}，已创建 ${primaryChain} 充值地址 ${wallet.address}`,
+        `用户 ${user.id} 注册完成，账号=${nickname}，邀请码=${inviteCode}，已创建 ${primaryChain} 充值地址 ${wallet.address}`,
       );
       return {
         id: user.id,
@@ -157,7 +157,7 @@ export class AuthService {
         inviteCode: user.inviteCode,
         depositChain: primaryChain,
         depositAddress: wallet.address,
-        message: '注册成功，请等待管理员审核通过后再登录',
+        message: '注册成功',
       };
     } catch (e: any) {
       this.logger.error(`用户 ${user.id} 托管钱包创建失败，回滚注册: ${e?.message || e}`);

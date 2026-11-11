@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AdminApi } from '../api';
 import { confirmDialog } from '../components/ConfirmDialog';
@@ -10,9 +10,21 @@ import { Pagination } from '../components/Pagination';
 import { usePager } from '../hooks/usePager';
 import { isOnChainRateLimitError, useRefreshCooldown } from '../hooks/useRefreshCooldown';
 import { copyToClipboard } from '../utils/clipboard';
+import { fundGasDoneNotice } from '../utils/fundGasNotice';
 
 function isEvmAddress(addr: string) {
   return /^0x[a-fA-F0-9]{40}$/.test(addr.trim());
+}
+
+function gasSymbol(chain?: string) {
+  return String(chain || '').toUpperCase() === 'BSC' ? 'BNB' : 'ETH';
+}
+
+function chainStatus(cell: any) {
+  if (!cell) return <span className="hint">—</span>;
+  if (cell.collectable) return <span className="badge ok">可归集</span>;
+  if (cell.needGas) return <span className="badge warn">缺 Gas</span>;
+  return <span className="badge">{cell.skipReason || '—'}</span>;
 }
 
 function shortAddr(addr: string) {
@@ -83,7 +95,6 @@ export function WalletPage() {
   const [status, setStatus] = useState<any>(null);
   const walletPager = usePager(20);
   const [form, setForm] = useState({
-    chain: 'ARB',
     threshold: '10',
     active: true,
   });
@@ -96,6 +107,8 @@ export function WalletPage() {
   const [fundJob, setFundJob] = useState<any>(null);
   const [gasFeeTier, setGasFeeTier] = useState<'standard' | 'fast'>('standard');
   const [savingTier, setSavingTier] = useState(false);
+  const [collectionAuto, setCollectionAuto] = useState(false);
+  const [savingAuto, setSavingAuto] = useState(false);
   const [progressPanel, setProgressPanel] = useState<'collect' | 'fund' | null>(null);
   const collectAutoHide = useRef(false);
   const closedByUser = useRef<'collect' | 'fund' | null>(null);
@@ -114,9 +127,18 @@ export function WalletPage() {
     return [status?.primaryChain || 'ARB'];
   }, [status]);
 
-  const singleChain = enabledChains.length <= 1;
-  const currentCfg = configs.find((c) => c.chain === form.chain);
-  const currentTarget = currentCfg?.targetAddress ? String(currentCfg.targetAddress) : '';
+  const usableAddr = (addr: unknown) => {
+    const s = String(addr || '');
+    return isEvmAddress(s) && !/^0x0{40}$/i.test(s);
+  };
+  const currentCfg =
+    configs.find(
+      (c) => enabledChains.includes(String(c.chain || '').toUpperCase()) && usableAddr(c.targetAddress),
+    ) || configs.find((c) => usableAddr(c.targetAddress));
+  const currentTarget = usableAddr(currentCfg?.targetAddress)
+    ? String(currentCfg.targetAddress)
+    : String(configs.find((c) => usableAddr(c.targetAddress))?.targetAddress || '');
+  const gasCfg = currentCfg?.hasGasKey ? currentCfg : configs.find((c) => c.hasGasKey && usableAddr(c.gasAddress));
   const hasTarget = isEvmAddress(currentTarget);
 
   const load = useCallback(async () => {
@@ -132,13 +154,12 @@ export function WalletPage() {
       if (s?.fundJob) setFundJob(s.fundJob);
       const t = String(s?.gasFeeTier || 'standard');
       setGasFeeTier(t === 'fast' ? 'fast' : 'standard');
+      setCollectionAuto(!!s?.collectionAuto);
       const primary = s?.primaryChain || s?.enabledChains?.[0] || 'ARB';
       setForm((f) => {
-        const chain = (s?.enabledChains || []).includes(f.chain) ? f.chain : primary;
-        const hit = cfgs.find((x: any) => x.chain === chain);
+        const hit = cfgs.find((x: any) => x.chain === primary) || cfgs.find((x: any) => x.targetAddress);
         return {
           ...f,
-          chain,
           threshold: hit ? String(hit.threshold ?? 10) : f.threshold,
           active: hit ? hit.active !== false : f.active,
         };
@@ -155,7 +176,7 @@ export function WalletPage() {
       const filter = opts?.filter ?? walletFilter;
       setLoadingBal(true);
       try {
-        const res = await AdminApi.walletsWithBalance(form.chain, undefined, {
+        const res = await AdminApi.walletsWithBalance(undefined, undefined, {
           skip: (p - 1) * size,
           take: size,
           filter: filter || undefined,
@@ -170,7 +191,7 @@ export function WalletPage() {
         setLoadingBal(false);
       }
     },
-    [form.chain, walletFilter, walletPager.page, walletPager.pageSize],
+    [walletFilter, walletPager.page, walletPager.pageSize],
   );
 
   const toggleProgress = useCallback((kind: 'collect' | 'fund') => {
@@ -199,30 +220,44 @@ export function WalletPage() {
     if (!okHits.length) return;
     setWallets((ws) => {
       let flipped = 0;
+      const patchCell = (cell: any, hit: any) => {
+        const native = Number(hit.nativeAfter);
+        if (!cell || !Number.isFinite(native)) return cell;
+        const required = Number(cell.requiredGas || 0);
+        const usdt = Number(cell.usdt || 0);
+        const threshold = Number(cell.threshold || 0);
+        const amountOk = usdt >= threshold && usdt > 0;
+        const gasOk = native + 1e-8 >= required;
+        if (cell.needGas && amountOk && gasOk) flipped += 1;
+        return {
+          ...cell,
+          native,
+          gasDeficit: gasOk ? 0 : Math.max(0, required - native),
+          fundSuggest: 0,
+          needGas: amountOk && !gasOk,
+          collectable: amountOk && gasOk,
+          skipReason: amountOk && gasOk ? null : cell.skipReason,
+        };
+      };
       const next = ws.map((w) => {
+        if (w.byChain) {
+          let changed = false;
+          const byChain = { ...w.byChain };
+          for (const [chain, cell] of Object.entries(byChain) as [string, any][]) {
+            const hit = okHits.find((r) => r.walletId && r.walletId === cell?.id);
+            if (!hit) continue;
+            byChain[chain] = patchCell(cell, hit);
+            changed = true;
+          }
+          return changed ? { ...w, byChain } : w;
+        }
         const hit = okHits.find(
           (r) =>
             r.walletId === w.id ||
             String(r.address || '').toLowerCase() === String(w.address || '').toLowerCase(),
         );
         if (!hit) return w;
-        const native = Number(hit.nativeAfter);
-        if (!Number.isFinite(native)) return w;
-        const required = Number(w.requiredGas || 0);
-        const usdt = Number(w.usdt || 0);
-        const threshold = Number(w.threshold || 0);
-        const amountOk = usdt >= threshold && usdt > 0;
-        const gasOk = native + 1e-8 >= required;
-        if (w.needGas && amountOk && gasOk) flipped += 1;
-        return {
-          ...w,
-          native,
-          gasDeficit: gasOk ? 0 : Math.max(0, required - native),
-          fundSuggest: 0,
-          needGas: amountOk && !gasOk,
-          collectable: amountOk && gasOk,
-          skipReason: amountOk && gasOk ? null : w.skipReason,
-        };
+        return patchCell(w, hit);
       });
       if (flipped) {
         setWalletSummary((s: any) =>
@@ -246,7 +281,7 @@ export function WalletPage() {
   useEffect(() => {
     walletPager.goFirst();
     void loadWallets({ page: 1, quietRateLimit: true });
-  }, [form.chain, walletFilter]);
+  }, [walletFilter]);
 
   const pollJob = useCallback(async (key: 'collectJob' | 'fundJob') => {
     for (let i = 0; i < 900; i++) {
@@ -307,12 +342,8 @@ export function WalletPage() {
       try {
         const done = await pollJob('fundJob');
         if (done) {
-          toast(
-            done.message ||
-              `补 Gas 完成：合计 ${done.queued ?? 0} · 完成 ${done.funded ?? 0} · 失败 ${done.failed ?? 0}`,
-            Number(done.funded || 0) > 0 ? 'ok' : 'err',
-            4500,
-          );
+          const notice = fundGasDoneNotice(done);
+          toast(notice.text, notice.kind, notice.ms);
           applyFundResults(done?.results);
           await new Promise((r) => setTimeout(r, 1200));
           await loadWallets();
@@ -347,13 +378,13 @@ export function WalletPage() {
     setSaving(true);
     try {
       const saved = await AdminApi.saveCollectionConfig({
-        chain: form.chain,
+        chain: enabledChains[0] || 'ARB',
         targetAddress: currentTarget,
         threshold: Number(form.threshold),
         active: form.active,
       });
       toast(
-        `阈值已保存：${saved?.chain || form.chain} · USDT ≥ ${saved?.threshold ?? form.threshold}`,
+        `阈值已保存：已开通的链都是 USDT ≥ ${saved?.threshold ?? form.threshold}`,
         'ok',
         3200,
       );
@@ -363,6 +394,27 @@ export function WalletPage() {
       toast(`保存失败：${e.message || '未知错误'}`, 'err');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function toggleCollectionAuto(next: boolean) {
+    if (
+      next &&
+      !(await confirmDialog(
+        '打开后每 10 分钟自动归集已开通的链。只转 USDT 已达阈值且 Gas 已经够的地址。缺 Gas 不会自动补，仍要手动点「批量补 Gas」。',
+      ))
+    ) {
+      return;
+    }
+    setSavingAuto(true);
+    try {
+      await AdminApi.setCollectionAuto(next);
+      setCollectionAuto(next);
+      toast(next ? '已打开自动归集' : '已关闭自动归集', 'ok');
+    } catch (e: any) {
+      toast(e.message || '保存自动归集失败', 'err');
+    } finally {
+      setSavingAuto(false);
     }
   }
 
@@ -377,7 +429,7 @@ export function WalletPage() {
     setProgressPanel('collect');
     collectAutoHide.current = true;
     try {
-      const res = await AdminApi.runCollection(form.chain);
+      const res = await AdminApi.runCollection();
       if (res?.started === false || res?.ok === false) {
         const m = `归集未启动：${res?.message || '请稍后再试'}`;
         toast(m, 'err');
@@ -385,7 +437,7 @@ export function WalletPage() {
         return;
       }
       setCollectJob(res?.job || null);
-      toast('归集已开始：只转已有足够 Gas 的托管 USDT…', 'ok', 2500);
+      toast('归集已开始：已开通的链都会扫，只转 Gas 已经够的 USDT…', 'ok', 2500);
       const done = await pollJob('collectJob');
       if (done?.message && Number(done.sent || 0) === 0) {
         toast(done.message, 'err', 5000);
@@ -408,13 +460,14 @@ export function WalletPage() {
   }
 
   async function fundGas() {
-    if (!currentCfg?.hasGasKey) {
+    if (!gasCfg?.hasGasKey) {
       toast('请先配置并保存 Gas 补给钱包', 'err');
       return;
     }
+    const label = enabledChains.map((c) => `${gasSymbol(c)}（${c}）`).join('、');
     if (
       !(await confirmDialog(
-        '确认给「USDT 已达归集阈值且缺 ETH」的托管地址打最小 Gas？到账后再点「立即归集」。',
+        `确认同时检查已开通的链，给「USDT 已达阈值且缺 Gas」的托管地址补 ${label}？哪条链 Gas 够、或 USDT 没到阈值，就跳过。`,
       ))
     )
       return;
@@ -424,7 +477,7 @@ export function WalletPage() {
     appliedFundKeys.current.clear();
     setProgressPanel('fund');
     try {
-      const res = await AdminApi.fundCollectionGas({ chain: form.chain });
+      const res = await AdminApi.fundCollectionGas({ chains: enabledChains });
       if (res?.started === false || res?.ok === false) {
         toast(res?.message || '补 Gas 未启动', 'err', 5000);
         setFundJob(res?.job || null);
@@ -433,16 +486,11 @@ export function WalletPage() {
       setFundJob(res?.job || null);
       toast('补 Gas 已开始，可在下方看进度；明细见「归集记录」', 'ok', 2500);
       const done = await pollJob('fundJob');
-      if (done?.message && Number(done.funded || 0) === 0) {
-        toast(done.message, 'err', 6000);
-      } else if (done) {
-        toast(
-          `补 Gas 完成：合计 ${done.queued ?? 0} · 完成 ${done.funded ?? 0} · 剩余 ${done.remaining ?? 0} · 失败 ${done.failed ?? 0}`,
-          Number(done.funded || 0) > 0 ? 'ok' : 'err',
-          5000,
-        );
+      if (done) {
+        const notice = fundGasDoneNotice(done);
+        toast(notice.text, notice.kind, notice.ms);
       } else {
-        toast('补 Gas 进度查询超时，请到「归集记录」查看 ETH 明细', 'err');
+        toast('补 Gas 进度查询超时，请到「归集/补Gas记录」查看 ETH / BNB 明细', 'err');
       }
       applyFundResults(done?.results);
       await new Promise((r) => setTimeout(r, 1200));
@@ -468,30 +516,6 @@ export function WalletPage() {
           <div style={{ flex: '1 1 420px', minWidth: 0 }}>
         <div className="row" style={{ marginBottom: 6, flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <strong style={{ fontSize: 13 }}>归集</strong>
-          {singleChain ? (
-            <span className="badge ok">{form.chain}</span>
-          ) : (
-            <select
-              value={form.chain}
-              style={{ padding: '4px 8px', fontSize: 12 }}
-              onChange={(e) => {
-                const chain = e.target.value;
-                const hit = configs.find((x) => x.chain === chain);
-                setForm((f) => ({
-                  ...f,
-                  chain,
-                  threshold: hit ? String(hit.threshold ?? 10) : f.threshold,
-                  active: hit ? hit.active !== false : f.active,
-                }));
-              }}
-            >
-              {enabledChains.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-          )}
           {hasTarget ? (
             <AddrPeek address={currentTarget} />
           ) : (
@@ -534,11 +558,23 @@ export function WalletPage() {
                   : '归集中…'
               : '立即归集'}
           </button>
+          <label
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, whiteSpace: 'nowrap', fontSize: 12 }}
+            title="打开后每 10 分钟自动归集。缺 Gas 不会自动补"
+          >
+            <input
+              type="checkbox"
+              checked={collectionAuto}
+              disabled={savingAuto}
+              onChange={(e) => void toggleCollectionAuto(e.target.checked)}
+            />
+            自动归集
+          </label>
         </div>
         <div className="row" style={{ marginBottom: 0, flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <strong style={{ fontSize: 13 }}>Gas</strong>
-          {currentCfg?.hasGasKey ? (
-            <AddrPeek address={String(currentCfg.gasAddress || '')} />
+          {gasCfg?.hasGasKey ? (
+            <AddrPeek address={String(gasCfg.gasAddress || '')} />
           ) : (
             <span className="hint" style={{ margin: 0, color: 'var(--danger)' }}>
               未设补给钱包
@@ -549,7 +585,7 @@ export function WalletPage() {
           </Link>
           <GasFeeTierPicker
             value={gasFeeTier}
-            chain={form.chain}
+            chains={enabledChains}
             disabled={funding || running}
             saving={savingTier}
             onSaving={setSavingTier}
@@ -559,7 +595,7 @@ export function WalletPage() {
             type="button"
             className="ghost"
             style={{ padding: '4px 10px', fontSize: 12 }}
-            disabled={funding || running || !currentCfg?.hasGasKey}
+            disabled={funding || running || !gasCfg?.hasGasKey}
             onClick={() => void fundGas()}
           >
             {funding
@@ -649,7 +685,7 @@ export function WalletPage() {
 
       <div className="card list-loading-wrap">
         <div className="row" style={{ flexWrap: 'wrap', gap: 8 }}>
-          <h3 style={{ margin: 0, flex: 1 }}>用户托管钱包余额（{form.chain}）</h3>
+          <h3 style={{ margin: 0, flex: 1 }}>用户托管钱包余额</h3>
           <select
             value={walletFilter}
             onChange={(e) => setWalletFilter(e.target.value)}
@@ -671,23 +707,24 @@ export function WalletPage() {
           </button>
         </div>
         <p className="hint" style={{ marginTop: 0, marginBottom: 12 }}>
-          仅当地址 <b>USDT 达归集阈值</b> 时才估算 Gas。「批量补 Gas」给达阈值且缺 ETH 的托管地址打最小 ETH（够付一次归集）；「立即归集」只把已有足够 Gas 的托管 USDT 转到归集地址，Gas 不够会跳过。每笔都会写入「归集/补Gas记录」。
+          同一个地址的 {enabledChains.join('、')} 放在一行。USDT 到了阈值才估算 Gas。批量补 Gas 自己判断要不要补{' '}
+          {enabledChains.map((c) => gasSymbol(c)).join(' 和 ')}，够了或没到阈值就跳过。立即归集和自动归集都会把已开通的链都扫一遍，只转 Gas 已经够的。自动归集不会补 Gas。
         </p>
         {walletSummary ? (
           <div className="row" style={{ marginTop: 0, marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
             <span className="badge ok">可归集 {walletSummary.collectable}</span>
             <span className="badge warn">缺Gas {walletSummary.needGas}</span>
             <span className="badge">未达阈值 {walletSummary.belowThreshold}</span>
-            {walletSummary.needGas > 0 ? (
-              <>
-                <span className="badge warn" title="缺 Gas 地址的预估需 Gas 合计">
-                  缺Gas预估合计 {(Number(walletSummary.needGasRequiredSum) || 0).toFixed(6)} ETH
+            {enabledChains.map((c) => {
+              const slot = walletSummary.byChain?.[c];
+              const suggest = Number(slot?.needGasFundSuggestSum || 0);
+              if (!(suggest > 0)) return null;
+              return (
+                <span key={c} className="badge warn" title={`${c} 上建议补给合计`}>
+                  建议补 {gasSymbol(c)} {suggest.toFixed(6)}
                 </span>
-                <span className="badge warn" title="建议补给合计（批量补 Gas 口径）">
-                  建议补给合计 {(Number(walletSummary.needGasFundSuggestSum) || 0).toFixed(6)} ETH
-                </span>
-              </>
-            ) : null}
+              );
+            })}
           </div>
         ) : null}
         <ListLoading show={loadingBal} text="正在查询链上余额…" />
@@ -695,23 +732,29 @@ export function WalletPage() {
           <thead>
             <tr>
               <th style={{ width: 56 }}>行号</th>
-              <th>链</th>
+              <th>用户 ID</th>
+              <th>昵称</th>
               <th>地址</th>
-              <th>USDT</th>
-              <th>ETH（现有）</th>
-              <th>预估需Gas</th>
-              <th>Gas缺口</th>
-              <th>建议补给</th>
-              <th>状态</th>
+              {enabledChains.map((c) => (
+                <Fragment key={c}>
+                  <th>USDT·{c}</th>
+                  <th>{gasSymbol(c)}</th>
+                  <th>建议补{gasSymbol(c)}</th>
+                  <th>{c}</th>
+                </Fragment>
+              ))}
             </tr>
           </thead>
           <tbody>
             {wallets.map((w, idx) => (
-              <tr key={w.id}>
+              <tr key={w.address || w.id}>
                 <td style={{ fontFamily: 'monospace', textAlign: 'center' }}>
                   {(walletPager.page - 1) * walletPager.pageSize + idx + 1}
                 </td>
-                <td>{w.chain}</td>
+                <td className="mono">{w.userNo ?? '—'}</td>
+                <td className="ellipsis" title={w.nickname || w.email || ''}>
+                  {w.nickname || w.email || '—'}
+                </td>
                 <td style={{ fontFamily: 'monospace', fontSize: 11 }}>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                     {w.address?.slice(0, 8)}…{w.address?.slice(-6)}
@@ -732,33 +775,35 @@ export function WalletPage() {
                     ) : null}
                   </span>
                 </td>
-                <td>{Number(w.usdt || 0).toFixed(4)}</td>
-                <td style={{ fontFamily: 'monospace' }}>{Number(w.native || 0).toFixed(6)}</td>
-                <td
-                  style={{ fontFamily: 'monospace' }}
-                  title={
-                    w.gasLimit
-                      ? `gasLimit=${w.gasLimit} · ~${Number(w.gasPriceGwei || 0).toFixed(4)} gwei`
-                      : undefined
-                  }
-                >
-                  {Number(w.requiredGas || 0).toFixed(6)}
-                </td>
-                <td style={{ fontFamily: 'monospace', color: Number(w.gasDeficit) > 0 ? '#b45309' : undefined }}>
-                  {Number(w.gasDeficit || 0).toFixed(6)}
-                </td>
-                <td style={{ fontFamily: 'monospace', fontWeight: Number(w.fundSuggest) > 0 ? 600 : undefined }}>
-                  {Number(w.fundSuggest || 0).toFixed(6)}
-                </td>
-                <td>
-                  {w.collectable ? (
-                    <span className="badge ok">可归集</span>
-                  ) : w.needGas ? (
-                    <span className="badge warn">缺 Gas</span>
-                  ) : (
-                    <span className="badge warn">{w.skipReason || '—'}</span>
-                  )}
-                </td>
+                {enabledChains.map((c) => {
+                  const cell = w.byChain
+                    ? w.byChain[c]
+                    : String(w.chain || '').toUpperCase() === c
+                      ? w
+                      : null;
+                  return (
+                    <Fragment key={c}>
+                      <td>{cell ? Number(cell.usdt || 0).toFixed(4) : '—'}</td>
+                      <td style={{ fontFamily: 'monospace' }}>
+                        {cell ? Number(cell.native || 0).toFixed(6) : '—'}
+                      </td>
+                      <td
+                        style={{
+                          fontFamily: 'monospace',
+                          fontWeight: Number(cell?.fundSuggest) > 0 ? 600 : undefined,
+                        }}
+                        title={
+                          cell?.gasLimit
+                            ? `需 ${Number(cell.requiredGas || 0).toFixed(6)}，缺口 ${Number(cell.gasDeficit || 0).toFixed(6)}`
+                            : undefined
+                        }
+                      >
+                        {cell ? Number(cell.fundSuggest || 0).toFixed(6) : '—'}
+                      </td>
+                      <td>{chainStatus(cell)}</td>
+                    </Fragment>
+                  );
+                })}
               </tr>
             ))}
           </tbody>

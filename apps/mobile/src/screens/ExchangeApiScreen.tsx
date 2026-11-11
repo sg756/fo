@@ -213,7 +213,7 @@ export function ExchangeApiScreen() {
         <View style={[styles.tip, { backgroundColor: theme.primarySoft }]}>
           <Ionicons name="shield-checkmark-outline" size={16} color={theme.primary} />
           <Text style={{ color: theme.textSecondary, fontSize: 12, marginLeft: 8, flex: 1, lineHeight: 18 }}>
-            凭证将加密存储，仅用于跟单下单，平台不会展示明文 Secret。请提前在交易所把下单 IP 加入白名单。
+            凭证将加密存储，仅用于合约下单，平台不会展示明文 Secret。请提前在交易所把下单 IP 加入白名单。
           </Text>
         </View>
 

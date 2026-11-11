@@ -1,12 +1,14 @@
+import { useCallback, useState } from 'react';
 import * as Clipboard from 'expo-clipboard';
-import { Image, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { LinearGradientLike } from '../components/Banner';
+import { AccountApi, PointCard } from '../api/endpoints';
 import { useTheme } from '../theme/ThemeContext';
 import { useAuth } from '../auth/AuthContext';
+import { fmtAmount } from '../utils/format';
 import { notify } from '../utils/notify';
 import type { RootStackParamList } from '../navigation/types';
 
@@ -19,7 +21,8 @@ type MenuRoute =
   | 'TradeLog'
   | 'Invite'
   | 'Security'
-  | 'Settings';
+  | 'Settings'
+  | 'Notices';
 
 const MENUS: {
   title: string;
@@ -27,6 +30,7 @@ const MENUS: {
   route: MenuRoute;
   badge?: string;
 }[] = [
+  { title: '消息通知', icon: 'notifications-outline', route: 'Notices' },
   { title: '我的点卡', icon: 'wallet-outline', route: 'MyWallet' },
   { title: '资金流水', icon: 'swap-horizontal-outline', route: 'FundFlow' },
   { title: '收益记录', icon: 'receipt-outline', route: 'ProfitRecords' },
@@ -41,8 +45,35 @@ export function MeScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<NativeStackNavigationProp<RootStackParamList>>();
   const { logout, user } = useAuth();
+  const [card, setCard] = useState<PointCard | null>(null);
+  const [unread, setUnread] = useState(0);
+
+  const loadCard = useCallback(async () => {
+    try {
+      setCard(await AccountApi.pointCard());
+    } catch {
+      // 金额保持上次结果
+    }
+    try {
+      const r = await AccountApi.noticeUnread();
+      setUnread(Number(r.unread) || 0);
+    } catch {
+      setUnread(0);
+    }
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      loadCard();
+    }, [loadCard]),
+  );
+
+  const pending = Number(card?.commissionPending ?? 0);
+  const claimable = Number(card?.withdrawable ?? card?.commissionBalance ?? 0);
+  const claimed = Number(card?.commissionClaimed ?? 0);
 
   const displayName = user?.nickname || user?.email?.split('@')[0] || '用户';
+  const initial = displayName.slice(0, 1).toUpperCase();
   const roleLabel =
     user?.role === 'ADMIN' ? '管理员' : '用户';
 
@@ -52,10 +83,9 @@ export function MeScreen() {
       contentContainerStyle={{ paddingTop: insets.top + 12, paddingBottom: 28 }}
     >
       <View style={styles.profile}>
-        <Image
-          source={{ uri: 'https://i.pravatar.cc/120?img=12' }}
-          style={[styles.avatar, { borderColor: theme.border }]}
-        />
+        <View style={[styles.avatar, { backgroundColor: theme.primary }]}>
+          <Text style={{ color: '#fff', fontWeight: '800', fontSize: 22 }}>{initial}</Text>
+        </View>
         <View style={{ marginLeft: 14, flex: 1 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             <Text style={{ color: theme.text, fontSize: 20, fontWeight: '800' }}>{displayName}</Text>
@@ -85,15 +115,35 @@ export function MeScreen() {
         </View>
       </View>
 
-      <LinearGradientLike style={styles.promoCard} from={theme.bannerFrom} to={theme.bannerTo}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.promoTitle}>智能跟单 · 稳健收益</Text>
-          <Text style={styles.promoSub}>多平台 · 多策略 · 自动同步下单</Text>
-        </View>
-        <View style={styles.promoIcon}>
-          <Ionicons name="trending-up" size={26} color="#fff" />
-        </View>
-      </LinearGradientLike>
+      <View style={styles.stats}>
+        <Pressable
+          onPress={() => navigation.navigate('Commission')}
+          style={[styles.stat, { backgroundColor: theme.card, borderColor: theme.border }]}
+        >
+          <Text style={{ color: theme.textSecondary, fontSize: 12 }}>待审佣金</Text>
+          <Text style={{ color: pending < 0 ? theme.danger : theme.text, fontWeight: '700', marginTop: 4 }}>
+            {fmtAmount(pending)} USDT
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={() => navigation.navigate('Withdraw')}
+          style={[styles.stat, { backgroundColor: theme.card, borderColor: theme.border }]}
+        >
+          <Text style={{ color: theme.textSecondary, fontSize: 12 }}>可领佣金</Text>
+          <Text style={{ color: claimable < 0 ? theme.danger : theme.success, fontWeight: '700', marginTop: 4 }}>
+            {fmtAmount(claimable)} USDT
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={() => navigation.navigate('Commission')}
+          style={[styles.stat, { backgroundColor: theme.card, borderColor: theme.border }]}
+        >
+          <Text style={{ color: theme.textSecondary, fontSize: 12 }}>已领佣金</Text>
+          <Text style={{ color: claimed < 0 ? theme.danger : theme.text, fontWeight: '700', marginTop: 4 }}>
+            {fmtAmount(claimed)} USDT
+          </Text>
+        </Pressable>
+      </View>
 
       <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
         {MENUS.map((item, idx) => (
@@ -110,6 +160,9 @@ export function MeScreen() {
           >
             <Ionicons name={item.icon} size={20} color={theme.textSecondary} />
             <Text style={{ color: theme.text, fontWeight: '600', marginLeft: 12, flex: 1 }}>{item.title}</Text>
+            {item.route === 'Notices' && unread > 0 ? (
+              <View style={[styles.dot, { backgroundColor: theme.danger }]} />
+            ) : null}
             {item.badge ? (
               <Text style={{ color: theme.warning, fontSize: 12, marginRight: 6 }}>{item.badge}</Text>
             ) : null}
@@ -130,7 +183,7 @@ export function MeScreen() {
 
 const styles = StyleSheet.create({
   profile: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, marginBottom: 16 },
-  avatar: { width: 58, height: 58, borderRadius: 29, borderWidth: 1 },
+  avatar: { width: 58, height: 58, borderRadius: 29, alignItems: 'center', justifyContent: 'center' },
   vip: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -139,26 +192,11 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginLeft: 8,
   },
-  promoCard: {
-    marginHorizontal: 16,
-    borderRadius: 14,
-    padding: 18,
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 16,
-  },
-  promoTitle: { color: '#fff', fontWeight: '800', fontSize: 17 },
-  promoSub: { color: 'rgba(255,255,255,0.85)', marginTop: 6, fontSize: 12 },
-  promoIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  stats: { flexDirection: 'row', gap: 8, paddingHorizontal: 16, marginBottom: 16 },
+  stat: { flex: 1, borderRadius: 12, borderWidth: 1, paddingVertical: 10, paddingHorizontal: 10 },
   card: { marginHorizontal: 16, borderRadius: 12, borderWidth: 1, overflow: 'hidden' },
   row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 15 },
+  dot: { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
   logout: {
     marginHorizontal: 16,
     marginTop: 20,

@@ -18,7 +18,7 @@ const ERC20_ABI = [
   'function decimals() view returns (uint8)',
 ];
 
-/** Multicall3（ETH/ARB/BASE 同地址） */
+/** Multicall3（ETH/ARB/BASE/BSC 同地址） */
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const MULTICALL3_ABI = [
   'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)',
@@ -70,9 +70,9 @@ export class ChainPayoutService {
 
   resolveChain(chain: string): DepositChain {
     const c = (chain || 'ARB').toUpperCase();
-    if (c === 'ETH' || c === 'ARB' || c === 'BASE') return c;
-    // 兼容别名
+    if (c === 'ETH' || c === 'ARB' || c === 'BASE' || c === 'BSC') return c;
     if (c === 'ARBITRUM') return 'ARB';
+    if (c === 'BNB') return 'BSC';
     return 'ARB';
   }
 
@@ -122,7 +122,7 @@ export class ChainPayoutService {
   }
 
   nativeSymbol(chain: DepositChain): string {
-    return 'ETH'; // ARB/BASE/ETH 均用 ETH 作 gas
+    return DEPOSIT_CHAINS[chain].nativeSymbol;
   }
 
   /**
@@ -218,11 +218,11 @@ export class ChainPayoutService {
   }
 
   /**
-   * ETH 主网简单转账 21000 即可。
+   * ETH / BSC 简单转账 21000 即可。
    * ARB/BASE 的 gasLimit 还要覆盖 L1 数据费，写死 21000 会被节点拒成 intrinsic gas too low。
    */
   nativeTransferGasLimit(chain: DepositChain): bigint {
-    return chain === 'ETH' ? 21_000n : 250_000n;
+    return chain === 'ETH' || chain === 'BSC' ? 21_000n : 250_000n;
   }
 
   async estimateNativeTransferGasLimit(params: {
@@ -340,9 +340,7 @@ export class ChainPayoutService {
   }
 
   private expectedChainId(chain: DepositChain): bigint {
-    if (chain === 'ARB') return 42161n;
-    if (chain === 'BASE') return 8453n;
-    return 1n;
+    return BigInt(DEPOSIT_CHAINS[chain].chainId);
   }
 
   /**
@@ -392,7 +390,7 @@ export class ChainPayoutService {
       const bal = await provider.getBalance(wallet.address);
       if (bal < value + feeCost) {
         throw new Error(
-          `Gas 补给钱包 ETH 不足: 需要 ${formatUnits(value + feeCost, 18)}（含矿工费），余额 ${formatUnits(bal, 18)} (${wallet.address})`,
+          `Gas 补给钱包 ${this.nativeSymbol(chain)} 不足: 需要 ${formatUnits(value + feeCost, 18)}（含矿工费），余额 ${formatUnits(bal, 18)} (${wallet.address})`,
         );
       }
     }
@@ -423,7 +421,7 @@ export class ChainPayoutService {
     }
 
     this.logger.log(
-      `Gas 补给 ${amount} ETH ${wallet.address} → ${params.toAddress} on ${chain} tier=${fee.tier} gasLimit=${gasLimit}` +
+      `Gas 补给 ${amount} ${this.nativeSymbol(chain)} ${wallet.address} → ${params.toAddress} on ${chain} tier=${fee.tier} gasLimit=${gasLimit}` +
         (txReq.nonce != null ? ` nonce=${txReq.nonce}` : ''),
     );
     const tx = await wallet.sendTransaction(txReq);
@@ -486,7 +484,7 @@ export class ChainPayoutService {
     const native = await this.getNativeBalance(chain, wallet.address);
     if (native < est.requiredNative) {
       throw new Error(
-        `Gas 不足: 转出约需 ${est.requiredNative.toFixed(6)} ETH, 现有 ${native.toFixed(6)}`,
+        `Gas 不足: 转出约需 ${est.requiredNative.toFixed(6)} ${this.nativeSymbol(chain)}, 现有 ${native.toFixed(6)}`,
       );
     }
 
@@ -590,7 +588,8 @@ export class ChainPayoutService {
     let skipReason: string | null = null;
     if (!amountOk) skipReason = `USDT 未达阈值(${params.threshold})`;
     else if (!gasOk) {
-      skipReason = `Gas 不足(需≈${requiredGas.toFixed(6)} ETH, 有 ${native.toFixed(6)}, 建议补 ${fundSuggest.toFixed(6)})`;
+      const gas = this.nativeSymbol(params.chain);
+      skipReason = `Gas 不足(需≈${requiredGas.toFixed(6)} ${gas}, 有 ${native.toFixed(6)}, 建议补 ${fundSuggest.toFixed(6)})`;
     }
 
     return {
@@ -624,6 +623,7 @@ export class ChainPayoutService {
     requiredGas?: number;
     gasLimit?: string;
     gasPriceGwei?: number;
+    nativeSymbol?: string;
   }) {
     const usdt = Number(params.usdt) || 0;
     const native = Number(params.native) || 0;
@@ -637,7 +637,8 @@ export class ChainPayoutService {
     let skipReason: string | null = null;
     if (!amountOk) skipReason = `USDT 未达阈值(${threshold})`;
     else if (!gasOk) {
-      skipReason = `Gas 不足(需≈${requiredGas.toFixed(6)} ETH, 有 ${native.toFixed(6)}, 建议补 ${fundSuggest.toFixed(6)})`;
+      const gas = params.nativeSymbol || 'ETH';
+      skipReason = `Gas 不足(需≈${requiredGas.toFixed(6)} ${gas}, 有 ${native.toFixed(6)}, 建议补 ${fundSuggest.toFixed(6)})`;
     }
     return {
       usdt,
@@ -732,7 +733,7 @@ export class ChainPayoutService {
     const gasDeficit = Math.max(0, requiredGas - nativeBefore);
     if (!this.coversNativeGas(nativeBefore, requiredGas)) {
       throw this.collectionFailError(
-        `Gas 不足(需≈${requiredGas.toFixed(6)} ETH, 有 ${nativeBefore.toFixed(6)})`,
+        `Gas 不足(需≈${requiredGas.toFixed(6)} ${this.nativeSymbol(chain)}, 有 ${nativeBefore.toFixed(6)})`,
         { gasRequired: requiredGas, gasHave: nativeBefore, gasDeficit, gasLost: 0 },
       );
     }

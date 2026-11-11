@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AdminApi, AuthApi, getAdminMe } from '../api';
 import { confirmDialog } from '../components/ConfirmDialog';
@@ -10,12 +10,18 @@ import { BatchJobProgress } from '../components/BatchJobProgress';
 import { toast } from '../components/Toast';
 import { isOnChainRateLimitError, useRefreshCooldown } from '../hooks/useRefreshCooldown';
 import { copyToClipboard } from '../utils/clipboard';
+import { fundGasDoneNotice } from '../utils/fundGasNotice';
 
 const CHAIN_META: Record<string, { name: string; explorer: string; gas: string }> = {
   ARB: { name: 'Arbitrum One', explorer: 'https://arbiscan.io/address/', gas: 'ETH' },
   BASE: { name: 'Base', explorer: 'https://basescan.org/address/', gas: 'ETH' },
   ETH: { name: 'Ethereum', explorer: 'https://etherscan.io/address/', gas: 'ETH' },
+  BSC: { name: 'BNB Smart Chain', explorer: 'https://bscscan.com/address/', gas: 'BNB' },
 };
+
+function gasSymbol(chain?: string): string {
+  return CHAIN_META[String(chain || '').toUpperCase()]?.gas || 'ETH';
+}
 
 function isEvmAddress(addr: string) {
   return /^0x[a-fA-F0-9]{40}$/.test(addr.trim());
@@ -43,6 +49,19 @@ function fmtTime(v: unknown) {
   }
 }
 
+function gasLabel(chain: string, chains: string[]) {
+  const sym = chain === 'BSC' ? 'BNB' : 'ETH';
+  const dup = chains.filter((c) => (c === 'BSC' ? 'BNB' : 'ETH') === sym).length > 1;
+  return dup ? `${sym}·${chain}` : sym;
+}
+
+function balOf(row: any, chain: string, field: 'usdt' | 'native') {
+  const hit = row?.balances?.[chain];
+  if (hit && hit[field] != null) return hit[field];
+  if (String(row?.chain || '').toUpperCase() === chain) return row[field];
+  return null;
+}
+
 function shortAddr(addr: string) {
   const s = String(addr || '');
   if (s.length < 12) return s || '—';
@@ -51,7 +70,6 @@ function shortAddr(addr: string) {
 
 /** 平台钱包：Gas 补给 + 可作归集收款；余额 / 私钥 / 转出 */
 export function GasWalletsPage() {
-  const [chainFilter, setChainFilter] = useState('');
   const [items, setItems] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
   const [enabledChains, setEnabledChains] = useState<string[]>(['ARB']);
@@ -73,7 +91,8 @@ export function GasWalletsPage() {
 
   const [xferOpen, setXferOpen] = useState(false);
   const [xferRow, setXferRow] = useState<any>(null);
-  const [xferToken, setXferToken] = useState<'USDT' | 'ETH'>('USDT');
+  const [xferChain, setXferChain] = useState('ARB');
+  const [xferToken, setXferToken] = useState<'USDT' | 'ETH' | 'BNB'>('USDT');
   const [xferTo, setXferTo] = useState('');
   const [xferAmount, setXferAmount] = useState('');
   const [xferTotp, setXferTotp] = useState('');
@@ -111,23 +130,23 @@ export function GasWalletsPage() {
   }, [configs]);
 
   const summary = useMemo(() => {
-    let eth = 0;
-    let usdt = 0;
+    const nativeSum: Record<string, number> = {};
+    const usdtSum: Record<string, number> = {};
     let active = 0;
     let asTarget = 0;
     for (const r of items) {
-      const n = Number(r.native);
-      const u = Number(r.usdt);
-      if (Number.isFinite(n)) eth += n;
-      if (Number.isFinite(u)) usdt += u;
-      const chainKey = String(r.chain || '').toUpperCase();
-      const cur = activeGasByChain.get(chainKey);
-      if (cur && r.address && cur.toLowerCase() === String(r.address).toLowerCase()) active += 1;
-      const tgt = collectionTargetByChain.get(chainKey);
-      if (tgt && r.address && tgt.toLowerCase() === String(r.address).toLowerCase()) asTarget += 1;
+      for (const c of enabledChains) {
+        const n = Number(balOf(r, c, 'native'));
+        const u = Number(balOf(r, c, 'usdt'));
+        if (Number.isFinite(n)) nativeSum[c] = (nativeSum[c] || 0) + n;
+        if (Number.isFinite(u)) usdtSum[c] = (usdtSum[c] || 0) + u;
+      }
+      const addr = String(r.address || '').toLowerCase();
+      if (addr && [...activeGasByChain.values()].some((v) => String(v).toLowerCase() === addr)) active += 1;
+      if (addr && [...collectionTargetByChain.values()].some((v) => String(v).toLowerCase() === addr)) asTarget += 1;
     }
-    return { count: items.length, eth, usdt, active, asTarget };
-  }, [items, activeGasByChain, collectionTargetByChain]);
+    return { count: items.length, nativeSum, usdtSum, active, asTarget };
+  }, [items, enabledChains, activeGasByChain, collectionTargetByChain]);
 
   const load = useCallback(async (opts?: { quietRateLimit?: boolean }) => {
     setLoading(true);
@@ -137,11 +156,11 @@ export function GasWalletsPage() {
       const [status, cfgs, gasList, otherList] = await Promise.all([
         AdminApi.collectionStatus(),
         AdminApi.collectionConfigs(),
-        AdminApi.collectionGasWallets(chainFilter || undefined, {
+        AdminApi.collectionGasWallets(undefined, {
           withBalance: true,
           discarded: discardedView,
         }),
-        AdminApi.collectionGasWallets(chainFilter || undefined, { discarded: !discardedView }),
+        AdminApi.collectionGasWallets(undefined, { discarded: !discardedView }),
       ]);
       setItems(Array.isArray(gasList) ? gasList : []);
       setDiscardedCount(discardedView ? (gasList?.length ?? 0) : (otherList?.length ?? 0));
@@ -160,7 +179,7 @@ export function GasWalletsPage() {
     } finally {
       setLoading(false);
     }
-  }, [chainFilter, listMode]);
+  }, [listMode]);
 
   useEffect(() => {
     void load({ quietRateLimit: true });
@@ -227,9 +246,9 @@ export function GasWalletsPage() {
     setModalErr('');
     try {
       if (modalMode === 'create') {
-        const setActive = !!hasTargetByChain.get(formChain.toUpperCase());
+        const setActive = [...hasTargetByChain.values()].some(Boolean);
         const row = await AdminApi.createCollectionGasWallet({
-          chain: formChain,
+          chain: enabledChains[0] || formChain,
           label: formLabel.trim() || undefined,
           setActive,
         });
@@ -256,9 +275,9 @@ export function GasWalletsPage() {
           setModalErr('请填写私钥');
           return;
         }
-        const setActive = !!hasTargetByChain.get(formChain.toUpperCase());
+        const setActive = [...hasTargetByChain.values()].some(Boolean);
         await AdminApi.addCollectionGasWallet({
-          chain: formChain,
+          chain: enabledChains[0] || formChain,
           gasAddress: addr,
           privateKey: formPk.trim(),
           label: formLabel.trim() || undefined,
@@ -435,34 +454,50 @@ export function GasWalletsPage() {
   }
 
   async function fundGas() {
-    const chain = chainFilter || enabledChains[0] || 'ARB';
-    if (!hasTargetByChain.get(chain.toUpperCase())) {
-      setErr('请先在「归集地址」设置归集目标，再补 Gas');
+    const chains = enabledChains.length ? enabledChains : ['ARB'];
+    const ready: string[] = [];
+    const notes: string[] = [];
+    for (const chain of chains) {
+      const sym = gasSymbol(chain);
+      const key = chain.toUpperCase();
+      if (!hasTargetByChain.get(key)) {
+        notes.push(`${chain} 还没设归集目标`);
+        continue;
+      }
+      const active = activeGasByChain.get(key);
+      if (!active) {
+        notes.push(`${chain} 还没设补给钱包`);
+        continue;
+      }
+      const activeRow = items.find(
+        (r) => r.address && String(r.address).toLowerCase() === active.toLowerCase(),
+      );
+      if (activeRow && isZeroEth(balOf(activeRow, chain, 'native'))) {
+        notes.push(`补给钱包没有 ${sym}`);
+        continue;
+      }
+      ready.push(chain);
+    }
+    if (!ready.length) {
+      const msg = notes.join('；') || '没有可补 Gas 的链';
+      setErr(msg);
+      toast(msg, 'err');
       return;
     }
-    const active = activeGasByChain.get(chain.toUpperCase());
-    if (!active) {
-      setErr('请先设一个当前 Gas 补给钱包');
-      toast('请先设一个当前 Gas 补给钱包', 'err');
+    const label = ready.map((c) => `${gasSymbol(c)}（${c}）`).join('、');
+    const extra = notes.length ? `\n这次先不补：${notes.join('；')}` : '';
+    if (
+      !(await confirmDialog(
+        `确认同时给「USDT 已达阈值且缺 Gas」的托管地址补 ${label}？同一把补给地址，ETH 和 BNB 分开打。${extra}`,
+      ))
+    ) {
       return;
     }
-    const activeRow = items.find(
-      (r) =>
-        String(r.chain || '').toUpperCase() === chain.toUpperCase() &&
-        r.address &&
-        String(r.address).toLowerCase() === active.toLowerCase(),
-    );
-    if (activeRow && isZeroEth(activeRow.native)) {
-      setErr('');
-      toast('当前补给钱包没有 ETH，请先打入 ETH', 'err');
-      return;
-    }
-    if (!(await confirmDialog(`确认对 ${chain} 给「USDT 已达阈值且缺 ETH」的托管地址打最小 Gas？`))) return;
     setBusy('fund');
     setErr('');
     setFundJob(null);
     try {
-      const res = await AdminApi.fundCollectionGas({ chain });
+      const res = await AdminApi.fundCollectionGas({ chains: ready });
       if (res?.started === false || res?.ok === false) {
         toast(res?.message || '补 Gas 未启动', 'err', 5000);
         setFundJob(res?.job || null);
@@ -471,16 +506,11 @@ export function GasWalletsPage() {
       setFundJob(res?.job || null);
       toast('补 Gas 已开始，可看下方进度；明细见「归集/补Gas记录」', 'ok', 2500);
       const done = await pollFundJob();
-      if (done?.message && Number(done.funded || 0) === 0) {
-        toast(done.message, 'err', 6000);
-      } else if (done) {
-        toast(
-          `补 Gas 完成：合计 ${done.queued ?? 0} · 完成 ${done.funded ?? 0} · 剩余 ${done.remaining ?? 0} · 失败 ${done.failed ?? 0}`,
-          Number(done.funded || 0) > 0 ? 'ok' : 'err',
-          5000,
-        );
+      if (done) {
+        const notice = fundGasDoneNotice(done);
+        toast(notice.text, notice.kind, notice.ms);
       } else {
-        toast('补 Gas 进度查询超时，请到「归集/补Gas记录」查看 ETH 明细', 'err');
+        toast('补 Gas 进度查询超时，请到「归集/补Gas记录」查看 ETH / BNB 明细', 'err');
       }
       await load();
     } catch (e: any) {
@@ -492,7 +522,9 @@ export function GasWalletsPage() {
   }
 
   function openTransfer(row: any) {
+    const chain = enabledChains[0] || 'ARB';
     setXferRow(row);
+    setXferChain(chain);
     setXferToken('USDT');
     setXferTo('');
     setXferAmount('');
@@ -539,7 +571,7 @@ export function GasWalletsPage() {
     }
     if (
       !(await confirmDialog(
-        `确认从 ${shortAddr(xferRow.address)} 转出 ${amount} ${xferToken} 到\n${to}？`,
+        `确认从 ${shortAddr(xferRow.address)} 在 ${xferChain} 转出 ${amount} ${xferToken} 到\n${to}？`,
       ))
     ) {
       return;
@@ -548,6 +580,7 @@ export function GasWalletsPage() {
     try {
       const res = await AdminApi.transferCollectionGasWallet(xferRow.id, {
         token: xferToken,
+        chain: xferChain,
         toAddress: to,
         amount,
         totpCode: xferTotp.trim(),
@@ -573,19 +606,6 @@ export function GasWalletsPage() {
       <div className="card gas-wallets-head">
         <div className="gas-wallets-toolbar">
           <div className="gas-wallets-toolbar-row">
-            <label style={{ margin: 0 }}>网络</label>
-            <select
-              value={chainFilter}
-              onChange={(e) => setChainFilter(e.target.value)}
-              style={{ maxWidth: 180 }}
-            >
-              <option value="">全部网络</option>
-              {enabledChains.map((c) => (
-                <option key={c} value={c}>
-                  {CHAIN_META[c]?.name || c} ({c})
-                </option>
-              ))}
-            </select>
             {listMode === 'active' ? (
               <>
                 <button type="button" onClick={() => openCreate()} disabled={!!busy}>
@@ -617,18 +637,24 @@ export function GasWalletsPage() {
             <div className="gas-wallets-toolbar-row gas-wallets-toolbar-row2">
             <GasFeeTierPicker
               value={gasFeeTier}
-              chain={chainFilter || undefined}
+              chains={enabledChains}
               disabled={!!busy}
               saving={savingTier}
               onSaving={setSavingTier}
               onChange={setGasFeeTier}
             />
-              <button type="button" className="ghost" onClick={() => void fundGas()} disabled={!!busy}>
+              <button
+                type="button"
+                className="ghost"
+                title="一次给缺 Gas 的托管地址补已开通链上的 ETH 和 BNB"
+                onClick={() => void fundGas()}
+                disabled={!!busy}
+              >
                 {busy === 'fund'
                   ? fundJob?.phase === 'send'
                     ? `发送 ${fundJob.funded ?? 0}/${fundJob.queued ?? 0}…`
                     : fundJob?.phase === 'scan'
-                      ? `扫描 ${fundJob.scanned ?? 0}/${fundJob.totalWallets || '…'}…`
+                      ? `扫描 ${fundJob.chain || ''} ${fundJob.scanned ?? 0}/${fundJob.totalWallets || '…'}…`
                       : '补 Gas 中…'
                   : '批量补 Gas'}
               </button>
@@ -653,15 +679,24 @@ export function GasWalletsPage() {
           </div>
         ) : null}
         <div className="gas-wallets-summary">
-          <span title="当前列表所有平台钱包的 ETH 余额加总">
-            ETH <b>{summary.eth.toFixed(6)}</b>
-          </span>
-          <span className="gas-wallets-summary-sep" aria-hidden>
-            ·
-          </span>
-          <span title="当前列表所有平台钱包的 USDT 余额加总">
-            USDT <b>{summary.usdt.toFixed(4)}</b>
-          </span>
+          {enabledChains.map((c) => (
+            <span key={`sum-gas-${c}`} title={`${gasLabel(c, enabledChains)} 余额合计`}>
+              {gasLabel(c, enabledChains)} <b>{(summary.nativeSum[c] || 0).toFixed(6)}</b>
+              <span className="gas-wallets-summary-sep" aria-hidden>
+                ·
+              </span>
+            </span>
+          ))}
+          {enabledChains.map((c, i) => (
+            <span key={`sum-usdt-${c}`} title={`${c} 上的 USDT 合计`}>
+              USDT·{c} <b>{(summary.usdtSum[c] || 0).toFixed(4)}</b>
+              {i < enabledChains.length - 1 ? (
+                <span className="gas-wallets-summary-sep" aria-hidden>
+                  ·
+                </span>
+              ) : null}
+            </span>
+          ))}
           <span className="gas-wallets-summary-sep" aria-hidden>
             ·
           </span>
@@ -711,11 +746,14 @@ export function GasWalletsPage() {
           <table>
             <thead>
               <tr>
-                <th>网络</th>
                 <th>备注</th>
                 <th>地址</th>
-                <th>ETH（Gas）</th>
-                <th>USDT</th>
+                {enabledChains.map((c) => (
+                  <Fragment key={`h-${c}`}>
+                    <th>USDT·{c}</th>
+                    <th>{gasLabel(c, enabledChains)}</th>
+                  </Fragment>
+                ))}
                 <th>状态</th>
                 <th>{listMode === 'discarded' ? '废弃时间' : '创建时间'}</th>
                 <th>操作</th>
@@ -724,33 +762,24 @@ export function GasWalletsPage() {
             <tbody>
               {!loading && items.length === 0 ? (
                 <tr>
-                  <td colSpan={8} style={{ textAlign: 'center', padding: 32, color: 'var(--muted)' }}>
+                  <td colSpan={5 + enabledChains.length * 2} style={{ textAlign: 'center', padding: 32, color: 'var(--muted)' }}>
                     {listMode === 'discarded' ? '暂无废弃钱包' : '暂无平台钱包，请点「一键创建」'}
                   </td>
                 </tr>
               ) : (
                 items.map((row) => {
-                  const chain = String(row.chain || '').toUpperCase();
-                  const meta = CHAIN_META[chain] || { name: chain, explorer: '', gas: 'ETH' };
-                  const cur = activeGasByChain.get(chain);
+                  const addr = String(row.address || '').toLowerCase();
                   const isActive =
-                    !!cur && !!row.address && cur.toLowerCase() === String(row.address).toLowerCase();
-                  const tgt = collectionTargetByChain.get(chain);
+                    !!addr && [...activeGasByChain.values()].some((v) => String(v).toLowerCase() === addr);
                   const isTarget =
-                    !!tgt && !!row.address && tgt.toLowerCase() === String(row.address).toLowerCase();
-                  const explorer = meta.explorer ? `${meta.explorer}${row.address}` : '';
+                    !!addr &&
+                    [...collectionTargetByChain.values()].some((v) => String(v).toLowerCase() === addr);
                   return (
                     <tr key={row.id}>
-                      <td>
-                        <div>{meta.name}</div>
-                        <div className="hint" style={{ margin: 0 }}>
-                          {chain}
-                        </div>
-                      </td>
                       <td>{row.label || '—'}</td>
                       <td style={{ fontFamily: 'monospace', fontSize: 12 }} title={row.address}>
                         <span style={{ userSelect: 'text' }}>{shortAddr(row.address)}</span>
-                        <div className="row" style={{ gap: 4, marginTop: 4 }}>
+                        <div className="row" style={{ gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
                           <button
                             type="button"
                             className="ghost"
@@ -759,20 +788,29 @@ export function GasWalletsPage() {
                           >
                             复制
                           </button>
-                          {explorer ? (
-                            <a
-                              href={explorer}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{ fontSize: 11 }}
-                            >
-                              浏览器
-                            </a>
-                          ) : null}
+                          {enabledChains.map((c) => {
+                            const href = CHAIN_META[c]?.explorer;
+                            if (!href) return null;
+                            return (
+                              <a
+                                key={c}
+                                href={`${href}${row.address}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{ fontSize: 11 }}
+                              >
+                                {c}
+                              </a>
+                            );
+                          })}
                         </div>
                       </td>
-                      <td style={{ fontFamily: 'monospace' }}>{fmtBal(row.native, 6)}</td>
-                      <td style={{ fontFamily: 'monospace' }}>{fmtBal(row.usdt, 4)}</td>
+                      {enabledChains.map((c) => (
+                        <Fragment key={`b-${c}`}>
+                          <td style={{ fontFamily: 'monospace' }}>{fmtBal(balOf(row, c, 'usdt'), 4)}</td>
+                          <td style={{ fontFamily: 'monospace' }}>{fmtBal(balOf(row, c, 'native'), 6)}</td>
+                        </Fragment>
+                      ))}
                       <td>
                         <div className="row" style={{ gap: 4, flexWrap: 'wrap', margin: 0 }}>
                           {listMode === 'discarded' ? (
@@ -864,7 +902,7 @@ export function GasWalletsPage() {
                               style={{ padding: '2px 8px', fontSize: 12 }}
                               disabled={!!busy}
                               onClick={() => openTransfer(row)}
-                              title="转出 USDT/ETH（需 Google 验证码）"
+                              title={`转出 USDT/${gasSymbol(row.chain)}（需 Google 验证码）`}
                             >
                               转出
                             </button>
@@ -973,20 +1011,6 @@ export function GasWalletsPage() {
               </div>
             ) : null}
             <div className="user-edit-fields">
-              <label>
-                网络
-                <select
-                  value={formChain}
-                  disabled={modalMode === 'edit'}
-                  onChange={(e) => setFormChain(e.target.value)}
-                >
-                  {enabledChains.map((c) => (
-                    <option key={c} value={c}>
-                      {CHAIN_META[c]?.name || c} ({c})
-                    </option>
-                  ))}
-                </select>
-              </label>
               {modalMode !== 'create' ? (
                 <label>
                   地址
@@ -1017,7 +1041,13 @@ export function GasWalletsPage() {
                   />
                 </label>
               ) : (
-                <p className="hint">创建后将显示私钥，请立即备份；并向该地址充入 Arb ETH。</p>
+                <p className="hint">
+                  创建后将显示私钥，请立即备份。同一地址在已开通的链上共用
+                  {enabledChains.length
+                    ? `（${enabledChains.map((c) => `${c} 充 ${gasSymbol(c)}`).join('，')}）`
+                    : ''}
+                  。
+                </p>
               )}
             </div>
             <div className="row" style={{ marginTop: 16, gap: 8, flexWrap: 'wrap' }}>
@@ -1066,19 +1096,37 @@ export function GasWalletsPage() {
               转出地址：{' '}
               <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{xferRow.address}</span>
             </p>
+            <label style={{ display: 'block', fontSize: 13, marginBottom: 4 }}>网络</label>
+            <select
+              value={xferChain}
+              onChange={(e) => {
+                const c = e.target.value;
+                setXferChain(c);
+                setXferToken((t) => (t === 'USDT' ? 'USDT' : (gasSymbol(c) as 'ETH' | 'BNB')));
+              }}
+              style={{ width: '100%', marginBottom: 10 }}
+              disabled={busy === 'xfer'}
+            >
+              {enabledChains.map((c) => (
+                <option key={c} value={c}>
+                  {c} · {gasSymbol(c)}
+                </option>
+              ))}
+            </select>
             <p className="hint" style={{ margin: '0 0 10px' }}>
-              可用 ETH {fmtBal(xferRow.native, 6)} · USDT {fmtBal(xferRow.usdt, 4)}
+              可用 {gasSymbol(xferChain)} {fmtBal(balOf(xferRow, xferChain, 'native'), 6)} · USDT{' '}
+              {fmtBal(balOf(xferRow, xferChain, 'usdt'), 4)}
             </p>
             {xferErr ? <p className="err">{xferErr}</p> : null}
             <label style={{ display: 'block', fontSize: 13, marginBottom: 4 }}>币种</label>
             <select
               value={xferToken}
-              onChange={(e) => setXferToken(e.target.value as 'USDT' | 'ETH')}
+              onChange={(e) => setXferToken(e.target.value as 'USDT' | 'ETH' | 'BNB')}
               style={{ width: '100%', marginBottom: 10 }}
               disabled={busy === 'xfer'}
             >
-              <option value="USDT">USDT</option>
-              <option value="ETH">ETH</option>
+              <option value="USDT">USDT · {xferChain}</option>
+              <option value={gasSymbol(xferChain)}>{gasSymbol(xferChain)}</option>
             </select>
             <label style={{ display: 'block', fontSize: 13, marginBottom: 4 }}>收款地址</label>
             <input
@@ -1092,7 +1140,7 @@ export function GasWalletsPage() {
             <input
               value={xferAmount}
               onChange={(e) => setXferAmount(e.target.value)}
-              placeholder={xferToken === 'ETH' ? 'ETH 数量' : 'USDT 数量'}
+              placeholder={xferToken === 'USDT' ? 'USDT 数量' : `${xferToken} 数量`}
               style={{ width: '100%', marginBottom: 10 }}
               disabled={busy === 'xfer'}
             />

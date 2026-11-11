@@ -153,7 +153,7 @@ export function CollectionRecordsPage() {
           <select value={token} onChange={(e) => setToken(e.target.value)} style={{ padding: '4px 8px' }}>
             <option value="">全部类型</option>
             <option value="USDT">归集 USDT</option>
-            <option value="ETH">补 Gas ETH</option>
+            <option value="GAS">补 Gas</option>
           </select>
           <button onClick={search} disabled={loading}>
             {loading ? '查询中…' : '查询'}
@@ -194,17 +194,20 @@ export function CollectionRecordsPage() {
               </tr>
             ) : (
               items.map((r) => {
-                const isEth = String(r.tokenSymbol || '').toUpperCase() === 'ETH';
+                const sym = String(r.tokenSymbol || '').toUpperCase();
+                const isGas = sym === 'ETH' || sym === 'BNB';
+                const gasUnit =
+                  String(r.chain || '').toUpperCase() === 'BSC' || sym === 'BNB' ? 'BNB' : 'ETH';
                 const addr = r.targetAddress || r.fromWallet?.address;
                 return (
                 <tr key={r.id}>
                   <td>{new Date(r.createdAt).toLocaleString()}</td>
                   <td>
-                    <span className={`badge ${isEth ? 'warn' : 'ok'}`}>{isEth ? '补 Gas' : '归集'}</span>
+                    <span className={`badge ${isGas ? 'warn' : 'ok'}`}>{isGas ? '补 Gas' : '归集'}</span>
                   </td>
                   <td style={{ userSelect: 'text' }}>{userLabel(r.fromWallet?.user)}</td>
                   <td>
-                    {String(r.amount)} {isEth ? 'ETH' : 'USDT'}
+                    {String(r.amount)} {isGas ? sym || gasUnit : 'USDT'}
                   </td>
                   <td style={{ fontFamily: 'monospace', fontSize: 11 }}>
                     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
@@ -214,7 +217,7 @@ export function CollectionRecordsPage() {
                           type="button"
                           className="ghost"
                           style={{ fontSize: 11, padding: '2px 8px' }}
-                          onClick={() => copy(addr, isEth ? '托管地址' : '归集地址')}
+                          onClick={() => copy(addr, isGas ? '托管地址' : '归集地址')}
                         >
                           复制
                         </button>
@@ -256,7 +259,7 @@ export function CollectionRecordsPage() {
                           </div>
                         ) : null}
                         <div className="hint" style={{ margin: '2px 0 0' }}>
-                          损耗 {fmtEth(r.gasLost ?? 0)} ETH
+                          损耗 {fmtEth(r.gasLost ?? 0)} {gasUnit}
                           {Number(r.gasLost || 0) === 0 ? '（未上链或未扣费）' : ''}
                         </div>
                       </div>

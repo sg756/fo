@@ -40,6 +40,8 @@ export class DashboardController {
       profitTotalAgg,
       profitTodayAgg,
       unsettledAgg,
+      followCfgRows,
+      globalTpl,
     ] = await Promise.all([
       this.prisma.user.count({ where: { status: 'PENDING', isPlatform: false } }),
       this.prisma.user.count({ where: { createdAt: { gte: startOfToday }, isPlatform: false } }),
@@ -88,12 +90,30 @@ export class DashboardController {
         _sum: { profit: true },
         _count: { _all: true },
       }),
+      this.prisma.systemConfig.findMany({
+        where: { key: { in: ['follow_global_applied', 'follow_user_custom_template'] } },
+        select: { key: true, value: true },
+      }),
+      this.prisma.followTemplate.findFirst({
+        where: { isGlobal: true },
+        select: { id: true, name: true },
+      }),
     ]);
 
     const filledRate =
       filledFollows + failedFollows === 0
         ? 0
         : Math.round((filledFollows / Math.max(1, filledFollows + failedFollows)) * 100);
+
+    const flagOn = (key: string) => {
+      const v = String(followCfgRows.find((r) => r.key === key)?.value || '')
+        .trim()
+        .toLowerCase();
+      return v === '1' || v === 'true';
+    };
+    const globalApplied = flagOn('follow_global_applied');
+    const userCustomEnabled = flagOn('follow_user_custom_template');
+    const globalReady = !!globalTpl && globalApplied;
 
     return {
       notifications: {
@@ -138,6 +158,14 @@ export class DashboardController {
         unsettledAmount: num(unsettledAgg._sum.profit),
       },
       stats: { activeUsers },
+      followTemplate: {
+        /** 全局模板已创建并应用，或已勾选用户自选模板 */
+        ready: globalReady || userCustomEnabled,
+        globalCreated: !!globalTpl,
+        globalName: globalTpl?.name ?? null,
+        globalApplied,
+        userCustomEnabled,
+      },
     };
   }
 }

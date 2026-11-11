@@ -1,7 +1,8 @@
 import * as Clipboard from 'expo-clipboard';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Modal,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -35,6 +36,8 @@ export function RechargeScreen() {
   const [networks, setNetworks] = useState<NetworkOpt[]>([]);
   const [netIdx, setNetIdx] = useState(0);
   const [openNet, setOpenNet] = useState(false);
+  const [netAnchor, setNetAnchor] = useState({ x: 16, y: 120, width: 320 });
+  const selectRef = useRef<View>(null);
   const [address, setAddress] = useState('');
   const [networkName, setNetworkName] = useState('');
   const [loading, setLoading] = useState(true);
@@ -92,6 +95,17 @@ export function RechargeScreen() {
     }, [loadOrders]),
   );
 
+  const toggleNet = () => {
+    if (openNet) {
+      setOpenNet(false);
+      return;
+    }
+    selectRef.current?.measureInWindow((x, y, width, height) => {
+      setNetAnchor({ x, y: y + height + 4, width });
+      setOpenNet(true);
+    });
+  };
+
   const copyAddress = async () => {
     if (!address) return;
     await Clipboard.setStringAsync(address);
@@ -121,29 +135,45 @@ export function RechargeScreen() {
         ) : (
           <>
             <Text style={{ color: theme.textSecondary, marginBottom: 8 }}>选择网络</Text>
-            <Pressable
-              onPress={() => setOpenNet((v) => !v)}
-              style={[styles.select, { backgroundColor: theme.card, borderColor: theme.border }]}
-            >
-              <Text style={{ color: theme.text, fontWeight: '600' }}>{network?.label || '选择网络'}</Text>
-              <Text style={{ color: theme.textSecondary }}>{openNet ? '▴' : '▾'}</Text>
-            </Pressable>
-            {openNet ? (
-              <View style={[styles.dropdown, { backgroundColor: theme.card, borderColor: theme.border }]}>
-                {networks.map((n, i) => (
-                  <Pressable
-                    key={n.chain}
-                    onPress={() => {
-                      setNetIdx(i);
-                      setOpenNet(false);
-                    }}
-                    style={styles.dropItem}
-                  >
-                    <Text style={{ color: theme.text }}>{n.label}</Text>
-                  </Pressable>
-                ))}
+            <View ref={selectRef} collapsable={false}>
+              <Pressable
+                onPress={toggleNet}
+                style={[styles.select, { backgroundColor: theme.card, borderColor: theme.border }]}
+              >
+                <Text style={{ color: theme.text, fontWeight: '600' }}>{network?.label || '选择网络'}</Text>
+                <Text style={{ color: theme.textSecondary }}>{openNet ? '▴' : '▾'}</Text>
+              </Pressable>
+            </View>
+            <Modal visible={openNet} transparent animationType="none" onRequestClose={() => setOpenNet(false)}>
+              <View style={styles.backdrop}>
+                <Pressable style={StyleSheet.absoluteFill} onPress={() => setOpenNet(false)} />
+                <View
+                  style={[
+                    styles.dropdown,
+                    {
+                      backgroundColor: theme.card,
+                      borderColor: theme.border,
+                      top: netAnchor.y,
+                      left: netAnchor.x,
+                      width: netAnchor.width,
+                    },
+                  ]}
+                >
+                  {networks.map((n, i) => (
+                    <Pressable
+                      key={n.chain}
+                      onPress={() => {
+                        setNetIdx(i);
+                        setOpenNet(false);
+                      }}
+                      style={styles.dropItem}
+                    >
+                      <Text style={{ color: theme.text }}>{n.label}</Text>
+                    </Pressable>
+                  ))}
+                </View>
               </View>
-            ) : null}
+            </Modal>
           </>
         )}
 
@@ -170,12 +200,7 @@ export function RechargeScreen() {
           </Pressable>
         </View>
 
-        <Text style={{ color: theme.textMuted, fontSize: 12, marginVertical: 14, lineHeight: 18 }}>
-          请向该地址转入 USDT（网络：{networkName || network?.name || 'Arbitrum'}
-          ），到账后获得等额点卡。请按交易所该网络的最小提币额转出。
-        </Text>
-
-        <Text style={{ color: theme.text, fontWeight: '700', marginBottom: 10 }}>充值记录</Text>
+        <Text style={{ color: theme.text, fontWeight: '700', marginBottom: 10, marginTop: 14 }}>充值记录</Text>
         {orders.length === 0 ? (
           <Text style={{ color: theme.textMuted, textAlign: 'center', marginTop: 8 }}>暂无充值记录</Text>
         ) : (
@@ -229,10 +254,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 10,
   },
+  backdrop: { flex: 1 },
   dropdown: {
+    position: 'absolute',
     borderWidth: 1,
     borderRadius: 12,
-    marginBottom: 12,
     overflow: 'hidden',
   },
   dropItem: { paddingHorizontal: 14, paddingVertical: 12 },

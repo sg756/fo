@@ -100,6 +100,15 @@ export function WithdrawScreen() {
     );
   };
 
+  const fillAll = () => {
+    const n = Number(String(balance).replace(/,/g, ''));
+    if (!Number.isFinite(n) || n <= 0) {
+      setAmount('0');
+      return;
+    }
+    setAmount(String(n));
+  };
+
   const submit = async () => {
     if (!addr?.configured) {
       appAlert('请先设置提现地址', '提现前需保存钱包或交易所收款地址', [
@@ -192,14 +201,25 @@ export function WithdrawScreen() {
         </View>
 
         <Text style={[styles.label, { color: theme.textSecondary }]}>提现数量</Text>
-        <TextInput
-          value={amount}
-          onChangeText={setAmount}
-          keyboardType="decimal-pad"
-          placeholder="0.00"
-          placeholderTextColor={theme.textMuted}
-          style={[styles.input, { backgroundColor: theme.card, borderColor: theme.border, color: theme.text }]}
-        />
+        <View
+          style={[
+            styles.input,
+            styles.amountRow,
+            { backgroundColor: theme.card, borderColor: theme.border },
+          ]}
+        >
+          <TextInput
+            value={amount}
+            onChangeText={setAmount}
+            keyboardType="decimal-pad"
+            placeholder="0.00"
+            placeholderTextColor={theme.textMuted}
+            style={[styles.amountInput, { color: theme.text }]}
+          />
+          <Pressable onPress={fillAll} hitSlop={8} style={styles.allBtn}>
+            <Text style={{ color: theme.primary, fontWeight: '700' }}>全部</Text>
+          </Pressable>
+        </View>
         {minWithdraw > 0 ? (
           <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 8 }}>
             最低提现金额 {fmtAmount(minWithdraw)} USDT
@@ -302,6 +322,9 @@ const styles = StyleSheet.create({
   addrBox: { borderRadius: 12, borderWidth: 1, padding: 14, marginBottom: 8 },
   label: { marginTop: 16, marginBottom: 8, fontWeight: '600' },
   input: { borderRadius: 12, borderWidth: 1, paddingHorizontal: 14, paddingVertical: 12 },
+  amountRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 0, paddingRight: 10 },
+  amountInput: { flex: 1, paddingVertical: 12, paddingRight: 8 },
+  allBtn: { paddingHorizontal: 6, paddingVertical: 10 },
   loadingBtn: { borderRadius: 12, paddingVertical: 14, alignItems: 'center' },
   modalMask: {
     flex: 1,

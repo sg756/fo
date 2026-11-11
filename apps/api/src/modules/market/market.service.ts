@@ -31,6 +31,13 @@ export type ExchangePriceQuery = {
   coinName: string;
   /** spot | future；缺省按 future（永续持仓） */
   market?: 'spot' | 'future';
+  /**
+   * 信号上的 apiCode。币安现货 ba，USDT 永续 bac，USDC 永续 bab。
+   * 不传则按交易所默认（现货 ba，合约 bac）。
+   */
+  apiCode?: string;
+  /** 信号上的计价/周期：永续 PC，现货 USDT/USDC，交割为周期代码 */
+  equalCoinName?: string;
 };
 
 /**
@@ -41,35 +48,70 @@ export function parseFirstLevelMidFromDepthValue(value: any): number | null {
   return parseMidFromLib(value);
 }
 
-/** 在 GetDepth 字典中按 币_计价或周期_apiCode 查找第一档中间价 */
-export function lookupDepthMid(
-  depthMap: Record<string, any> | null | undefined,
-  opts: { coinName: string; apiCode: string; market?: 'spot' | 'future' },
-): number | null {
-  if (!depthMap || typeof depthMap !== 'object') return null;
-  const coin = String(opts.coinName || '')
+/** 盘口键：币名_计价方式_apiCode。永续 UNI_PC_BAB，现货 ETH_USDT_BA */
+export function depthBookKey(coinName: string, equalCoinName: string, apiCode: string): string {
+  const coin = String(coinName || '')
     .trim()
     .toUpperCase()
     .replace(/USDT$/i, '');
-  const api = String(opts.apiCode || '').trim().toLowerCase();
-  if (!coin || !api) return null;
-  const equal = opts.market === 'spot' ? 'USDT' : 'PC';
+  const equal = String(equalCoinName || '').trim().toUpperCase();
+  const api = String(apiCode || '').trim().toUpperCase();
+  if (!coin || !equal || !api) return '';
+  return `${coin}_${equal}_${api}`;
+}
 
-  const prefer = `${coin}_${equal}_${api}`.toUpperCase();
-  const fromPrefer = parseFirstLevelMidFromDepthValue(depthMap[prefer]);
-  if (fromPrefer) return fromPrefer;
+/** 只认精确键，不拿别的周期或别的 apiCode 顶上 */
+export function lookupDepthMid(
+  depthMap: Record<string, any> | null | undefined,
+  opts: {
+    coinName: string;
+    apiCode: string;
+    equalCoinName?: string;
+    market?: 'spot' | 'future';
+  },
+): number | null {
+  if (!depthMap || typeof depthMap !== 'object') return null;
+  const equal =
+    String(opts.equalCoinName || '').trim().toUpperCase() ||
+    (opts.market === 'spot' ? 'USDT' : 'PC');
+  const prefer = depthBookKey(opts.coinName, equal, opts.apiCode);
+  if (!prefer) return null;
+  return parseFirstLevelMidFromDepthValue(depthMap[prefer]);
+}
 
-  const apiU = api.toUpperCase();
-  const prefix = `${coin}_`;
-  for (const k of Object.keys(depthMap)) {
-    const u = k.toUpperCase();
-    if (u === prefer) continue;
-    if (u.startsWith(prefix) && u.endsWith(`_${apiU}`)) {
-      const mid = parseFirstLevelMidFromDepthValue(depthMap[k]);
-      if (mid) return mid;
-    }
+/**
+ * 标记价：先 币名_计价_信号apiCode。
+ * 永续（计价 PC）没有这本书时，再读 币名_PC_BAC。现货和交割不退到 BAC。
+ */
+export function lookupPerpMarkMid(
+  depthMap: Record<string, any> | null | undefined,
+  opts: {
+    coinName: string;
+    apiCode?: string;
+    equalCoinName?: string;
+    market?: 'spot' | 'future';
+  },
+): number | null {
+  const market = opts.market === 'spot' ? 'spot' : 'future';
+  const primary = String(opts.apiCode || '').trim().toLowerCase();
+  const equal =
+    String(opts.equalCoinName || '').trim().toUpperCase() || (market === 'spot' ? 'USDT' : 'PC');
+  if (primary) {
+    const mid = lookupDepthMid(depthMap, {
+      coinName: opts.coinName,
+      apiCode: primary,
+      equalCoinName: equal,
+      market,
+    });
+    if (mid && mid > 0) return mid;
   }
-  return null;
+  if (market === 'spot' || equal !== 'PC' || primary === 'bac') return null;
+  return lookupDepthMid(depthMap, {
+    coinName: opts.coinName,
+    apiCode: 'bac',
+    equalCoinName: 'PC',
+    market: 'future',
+  });
 }
 
 /**
@@ -87,7 +129,7 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
   /** App 行情页用（Binance 主流币） */
   private tickers = new Map<string, MarketTicker>();
   private sparks = new Map<string, number[]>();
-  /** 交易所维度标记价: EXCHANGE:MARKET:COIN → { price, updatedAt } */
+  /** 交易所维度标记价: EXCHANGE:MARKET:COIN[:apiCode] → { price, updatedAt } */
   private exchangeQuotes = new Map<string, { price: number; updatedAt: number }>();
   /**
    * GetDepth 全量字典缓存（文档无参数，一次返回全部）。
@@ -338,8 +380,18 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
     return map;
   }
 
-  private quoteKey(exchange: string, market: 'spot' | 'future', coin: string) {
-    return `${String(exchange || 'BINANCE').toUpperCase()}:${market}:${coin.toUpperCase()}`;
+  private quoteKey(
+    exchange: string,
+    market: 'spot' | 'future',
+    coin: string,
+    apiCode?: string,
+    equalCoinName?: string,
+  ) {
+    const code = String(apiCode || '').trim().toLowerCase();
+    const equal = String(equalCoinName || '').trim().toUpperCase();
+    const base = `${String(exchange || 'BINANCE').toUpperCase()}:${market}:${coin.toUpperCase()}`;
+    const withEqual = equal ? `${base}:${equal}` : base;
+    return code ? `${withEqual}:${code}` : withEqual;
   }
 
   private putQuote(
@@ -348,9 +400,14 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
     coin: string,
     price: number,
     updatedAt = Date.now(),
+    apiCode?: string,
+    equalCoinName?: string,
   ) {
     if (!(price > 0)) return;
-    this.exchangeQuotes.set(this.quoteKey(exchange, market, coin), { price, updatedAt });
+    this.exchangeQuotes.set(this.quoteKey(exchange, market, coin, apiCode, equalCoinName), {
+      price,
+      updatedAt,
+    });
   }
 
   /**
@@ -360,6 +417,10 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
     exchange: Exchange;
     coinName: string;
     accountType?: string;
+    /** 信号 apiCode。不传则永续用该所 USDT 永续码，现货用该所现货码 */
+    apiCode?: string;
+    /** 信号计价：永续 PC，现货 USDT/USDC，交割为周期 */
+    equalCoinName?: string;
   }): number | null {
     const market: 'spot' | 'future' =
       String(opts.accountType || '').toLowerCase() === 'spot' ? 'spot' : 'future';
@@ -368,12 +429,23 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
       .toUpperCase()
       .replace(/USDT$/i, '');
     if (!coin) return null;
-    const cached = this.getPrice(coin, opts.exchange, { market });
+    const explicit = String(opts.apiCode || '').trim().toLowerCase();
+    const equal = String(opts.equalCoinName || '').trim().toUpperCase() || undefined;
+    const cached = this.getPrice(coin, opts.exchange, {
+      market,
+      apiCode: explicit || undefined,
+      equalCoinName: equal,
+    });
     if (cached && cached > 0) return cached;
-    const apiCode = toApiCode(opts.exchange, market === 'spot' ? 'spot' : 'future');
-    const mid = lookupDepthMid(this.peekDepthMap(), { coinName: coin, apiCode, market });
+    const apiCode = explicit || toApiCode(opts.exchange, market === 'spot' ? 'spot' : 'future');
+    const mid = lookupPerpMarkMid(this.peekDepthMap(), {
+      coinName: coin,
+      apiCode,
+      equalCoinName: equal,
+      market,
+    });
     if (mid && mid > 0) {
-      this.putQuote(opts.exchange, market, coin, mid);
+      this.putQuote(opts.exchange, market, coin, mid, Date.now(), explicit || undefined, equal);
       return mid;
     }
     return null;
@@ -392,21 +464,34 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
   getPrice(
     asset: string,
     exchange?: string,
-    opts?: { market?: 'spot' | 'future' },
+    opts?: { market?: 'spot' | 'future'; apiCode?: string; equalCoinName?: string },
   ): number | null {
     const a = String(asset || '').trim().toUpperCase();
     if (!a) return null;
     if (a === 'USDT' || a === 'USD' || a === 'USDC') return 1;
 
     const market = opts?.market === 'spot' ? 'spot' : 'future';
+    const apiCode = String(opts?.apiCode || '').trim().toLowerCase() || undefined;
+    const equal = String(opts?.equalCoinName || '').trim().toUpperCase() || undefined;
     if (exchange) {
-      const hit = this.exchangeQuotes.get(this.quoteKey(exchange, market, a));
+      const hit = this.exchangeQuotes.get(this.quoteKey(exchange, market, a, apiCode, equal));
       if (hit && hit.price > 0) return hit.price;
-      // 同所另一市场兜底（仍属该所缓存，不跨所）
-      const alt = this.exchangeQuotes.get(
-        this.quoteKey(exchange, market === 'spot' ? 'future' : 'spot', a),
-      );
-      if (alt && alt.price > 0) return alt.price;
+      const code =
+        apiCode ||
+        toApiCode(
+          String(exchange).toUpperCase() as Exchange,
+          market === 'spot' ? 'spot' : 'future',
+        );
+      const mid = lookupPerpMarkMid(this.peekDepthMap(), {
+        coinName: a,
+        apiCode: code,
+        equalCoinName: equal,
+        market,
+      });
+      if (mid && mid > 0) {
+        this.putQuote(exchange, market, a, mid, Date.now(), apiCode, equal);
+        return mid;
+      }
       return null;
     }
 
@@ -424,7 +509,9 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
     if (!coin || coin === 'USDT' || coin === 'USD' || coin === 'USDC') return null;
     const exchange = String(q.exchange || 'BINANCE').trim().toUpperCase() || 'BINANCE';
     const market = q.market === 'spot' ? 'spot' : 'future';
-    return { exchange, coinName: coin, market };
+    const apiCode = String(q.apiCode || '').trim().toLowerCase() || undefined;
+    const equalCoinName = String(q.equalCoinName || '').trim().toUpperCase() || undefined;
+    return { exchange, coinName: coin, market, apiCode, equalCoinName };
   }
 
   /**
@@ -441,7 +528,13 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
     for (const raw of queries) {
       const q = this.normalizeQuery(raw);
       if (!q) continue;
-      const key = this.quoteKey(q.exchange, q.market || 'future', q.coinName);
+      const key = this.quoteKey(
+        q.exchange,
+        q.market || 'future',
+        q.coinName,
+        q.apiCode,
+        q.equalCoinName,
+      );
       if (seen.has(key)) continue;
       seen.add(key);
       const hit = this.exchangeQuotes.get(key);
@@ -451,7 +544,8 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
     }
     if (!need.length) return;
 
-    const depthMap = this.peekDepthMap();
+    let depthMap = this.peekDepthMap();
+    if (!depthMap) depthMap = await this.refreshDepthCache();
     if (!depthMap) return;
 
     for (const q of need) {
@@ -462,10 +556,24 @@ export class MarketService implements OnModuleInit, OnModuleDestroy {
         .toUpperCase()
         .replace(/USDT$/i, '');
       if (!coin) continue;
-      const apiCode = toApiCode(exchange, market === 'spot' ? 'spot' : 'future');
-      const mid = lookupDepthMid(depthMap, { coinName: coin, apiCode, market });
+      const explicit = String(q.apiCode || '').trim().toLowerCase();
+      const apiCode = explicit || toApiCode(exchange, market === 'spot' ? 'spot' : 'future');
+      const mid = lookupPerpMarkMid(depthMap, {
+        coinName: coin,
+        apiCode,
+        equalCoinName: q.equalCoinName,
+        market,
+      });
       if (mid && mid > 0) {
-        this.putQuote(q.exchange, market, coin, mid);
+        this.putQuote(
+          q.exchange,
+          market,
+          coin,
+          mid,
+          Date.now(),
+          explicit || undefined,
+          q.equalCoinName,
+        );
       }
     }
   }

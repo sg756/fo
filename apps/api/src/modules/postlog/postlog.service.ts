@@ -10,6 +10,11 @@ const POST_LOG_RETENTION_DAYS = Number(process.env.POST_LOG_RETENTION_DAYS || 7)
 const POST_LOG_BODY_OMIT_MAX = Number(process.env.POST_LOG_BODY_OMIT_MAX || 65_536);
 /** 数组或字典键数达到此值视为大包，不再 JSON.stringify 原文 */
 const POST_LOG_COLLECTION_OMIT = Number(process.env.POST_LOG_COLLECTION_OMIT || 500);
+/** QueryPosition 等持仓数组日志最多保留前 N 条，其余截断 */
+const POST_LOG_POSITIONS_KEEP = Math.max(
+  1,
+  Number(process.env.POST_LOG_POSITIONS_KEEP || 20),
+);
 
 function endpointPath(endpoint: string): string {
   return String(endpoint || '')
@@ -35,9 +40,18 @@ function isAlwaysOmitEndpoint(endpoint: string): boolean {
   return p === 'mapi/CryptoSymbolList' || p === 'mapi/GetDepth' || p.startsWith('mapi/GetDepth');
 }
 
+function positionsArrayOf(v: any): any[] | null {
+  if (!v || typeof v !== 'object') return null;
+  if (Array.isArray(v.positions)) return v.positions;
+  if (v.data && Array.isArray(v.data.positions)) return v.data.positions;
+  return null;
+}
+
 function collectionSize(v: any): number | undefined {
   if (Array.isArray(v)) return v.length;
   if (!v || typeof v !== 'object') return undefined;
+  const pos = positionsArrayOf(v);
+  if (pos) return pos.length;
   if (Array.isArray(v.data)) return v.data.length;
   if (v.data && typeof v.data === 'object' && !Array.isArray(v.data)) {
     return Object.keys(v.data).length;
@@ -55,19 +69,67 @@ function omitBodySummary(v: any, reason: string, bytes?: number): string {
   });
 }
 
-/** 小包原文；大数组/大字典/超长 JSON 只记摘要，不落几 MB body */
+/** 持仓大包：保留前 N 条 + 截断标记，避免整表 positions 撑爆 post_logs */
+function truncatePositionsPayload(v: any): any {
+  if (v == null || typeof v !== 'object') return v;
+  try {
+    const clone = JSON.parse(JSON.stringify(v));
+    const apply = (obj: any) => {
+      if (!obj || !Array.isArray(obj.positions)) return;
+      const total = obj.positions.length;
+      if (total <= POST_LOG_POSITIONS_KEEP) return;
+      obj.positions = [
+        ...obj.positions.slice(0, POST_LOG_POSITIONS_KEEP),
+        {
+          _truncated: true,
+          kept: POST_LOG_POSITIONS_KEEP,
+          total,
+          omitted: total - POST_LOG_POSITIONS_KEEP,
+        },
+      ];
+    };
+    apply(clone);
+    if (clone.data && typeof clone.data === 'object') apply(clone.data);
+    return clone;
+  } catch {
+    return v;
+  }
+}
+
+/** 小包原文；持仓数组先截断；仍过大则只记摘要 */
 function toLogBody(v: any, forceOmit = false): string | null {
   if (v == null) return null;
+  const posArr = positionsArrayOf(v);
+  const shrunk =
+    posArr && posArr.length > POST_LOG_POSITIONS_KEEP ? truncatePositionsPayload(v) : v;
   const n = collectionSize(v);
-  if (forceOmit || (n != null && n >= POST_LOG_COLLECTION_OMIT)) {
+  // 持仓类走截断样本，不因条数直接整包省略
+  if (forceOmit || (n != null && n >= POST_LOG_COLLECTION_OMIT && !posArr)) {
     return omitBodySummary(
       v,
       forceOmit ? 'large endpoint body omitted' : 'large collection omitted',
     );
   }
   try {
-    const s = typeof v === 'string' ? v : JSON.stringify(v);
+    const s = typeof shrunk === 'string' ? shrunk : JSON.stringify(shrunk);
     if (s.length <= POST_LOG_BODY_OMIT_MAX) return s;
+    // 截断后仍超长：再压一档只留摘要 + 前几条
+    if (positionsArrayOf(v)) {
+      const tight = truncatePositionsPayload(v);
+      const keep = Math.min(5, POST_LOG_POSITIONS_KEEP);
+      const applyTight = (obj: any) => {
+        if (!obj || !Array.isArray(obj.positions)) return;
+        const total = collectionSize(v) || obj.positions.length;
+        obj.positions = [
+          ...obj.positions.slice(0, keep),
+          { _truncated: true, kept: keep, total, omitted: Math.max(0, total - keep) },
+        ];
+      };
+      applyTight(tight);
+      if (tight?.data) applyTight(tight.data);
+      const s2 = JSON.stringify(tight);
+      if (s2.length <= POST_LOG_BODY_OMIT_MAX) return s2;
+    }
     return omitBodySummary(v, 'body too large', s.length);
   } catch {
     return JSON.stringify({ _omitted: true, reason: 'unserializable' });

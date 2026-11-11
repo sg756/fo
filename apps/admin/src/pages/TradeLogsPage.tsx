@@ -6,9 +6,8 @@ import { Pagination } from '../components/Pagination';
 import { SearchSelect } from '../components/SearchSelect';
 import { toast } from '../components/Toast';
 import { usePager, normalizePaged } from '../hooks/usePager';
-import { useCoinOptions, useUserOptions, useMiddlewareAccounts, MARKET_PERIOD_OPTIONS, marketPeriodLabel, accountGidLabel, accountGidTitle, USER_FILTER_PLACEHOLDER, USER_FILTER_EMPTY_HINT } from '../hooks/useSearchFilterOptions';
-
-const EXCHANGES = ['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'];
+import { useCoinOptions, useUserOptions, useMiddlewareAccounts, MARKET_PERIOD_OPTIONS, settlementCoinLabel, contractPeriodLabel, accountGidLabel, accountGidTitle, USER_FILTER_PLACEHOLDER, USER_FILTER_EMPTY_HINT } from '../hooks/useSearchFilterOptions';
+import { EXCHANGES } from '../exchanges';
 
 function canAdminCancel(r: any) {
   // 撤单失败仍视为在途挂单，可重试撤单
@@ -29,6 +28,15 @@ function parseJsonSafe(raw: unknown): any {
   } catch {
     return {};
   }
+}
+
+function positionSideLabel(r: any): string {
+  const req = parseJsonSafe(r.requestBody);
+  const raw = String(r.positionSide || req.positionSide || '').trim().toLowerCase();
+  if (!raw) return '—';
+  if (raw.includes('short') || raw === '空' || raw === '2') return '空';
+  if (raw.includes('long') || raw === '多' || raw === '1') return '多';
+  return '—';
 }
 
 function openCloseLabel(r: any): string {
@@ -362,8 +370,10 @@ export function TradeLogsPage() {
               <th>交易所</th>
               <th>币名</th>
               <th>开/平</th>
+              <th>多空</th>
               <th>挂单价</th>
-              <th>类型</th>
+              <th>结算币</th>
+              <th>周期</th>
               <th>状态</th>
               <th>订单号</th>
               <th>说明</th>
@@ -419,8 +429,24 @@ export function TradeLogsPage() {
                       );
                     })()}
                   </td>
+                  <td>
+                    {(() => {
+                      const dir = positionSideLabel(r);
+                      return (
+                        <span
+                          className="badge"
+                          style={{
+                            color: dir === '多' ? '#16a34a' : dir === '空' ? '#dc2626' : undefined,
+                          }}
+                        >
+                          {dir}
+                        </span>
+                      );
+                    })()}
+                  </td>
                   <td className="mono nowrap">{orderPriceOf(r)}</td>
-                  <td>{marketPeriodLabel(r)}</td>
+                  <td className="nowrap">{settlementCoinLabel(r)}</td>
+                  <td className="nowrap">{contractPeriodLabel(r)}</td>
                   <td>
                     <span
                       className="badge"

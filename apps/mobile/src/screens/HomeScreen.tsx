@@ -19,26 +19,7 @@ import { useAuth } from '../auth/AuthContext';
 import { useSafeRefresh } from '../hooks/useSafeRefresh';
 import { useTheme } from '../theme/ThemeContext';
 import type { RootStackParamList } from '../navigation/types';
-
-function parseAmount(raw?: string): number {
-  const n = Number(String(raw || '').replace(/,/g, ''));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function fmtMoney(n: number): string {
-  if (!Number.isFinite(n)) return '0.00';
-  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function fmtSignedMoney(n: number): string {
-  const abs = Math.abs(n).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-  if (n > 0) return `+${abs}`;
-  if (n < 0) return `-${abs}`;
-  return abs;
-}
+import { positionCoin, positionProductLabel } from '../utils/positionQuote';
 
 function sideLabel(side?: string) {
   const s = String(side || '').toLowerCase();
@@ -105,17 +86,6 @@ export function HomeScreen() {
   const name = data?.user?.name || user?.nickname || user?.email?.split('@')[0] || '用户';
   const initial = name.slice(0, 1).toUpperCase();
   const followOn = data?.user?.followEnabled ?? user?.followEnabled;
-  const followPnl = parseAmount(data?.totalIncome);
-  const commissionAmt = parseAmount(data?.commission);
-  const earningsAmt = followPnl + commissionAmt;
-  const pointAmt = parseAmount(data?.pointCard ?? String(data?.pointBalance ?? 0));
-  const totalAssetsAmt = earningsAmt + pointAmt;
-  const pendingCommissionAmt = parseAmount(data?.commissionPending);
-  const claimableCommissionAmt = parseAmount(data?.commissionClaimable);
-  const claimedCommissionAmt = parseAmount(
-    data?.commissionClaimed ??
-      String(Math.max(0, commissionAmt - claimableCommissionAmt - pendingCommissionAmt)),
-  );
 
   return (
     <ScrollView
@@ -136,7 +106,7 @@ export function HomeScreen() {
         <View style={{ flex: 1, marginLeft: 10 }}>
           <Text style={{ color: theme.text, fontWeight: '700', fontSize: 16 }}>{name}</Text>
           <Text style={{ color: theme.textSecondary, fontSize: 12, marginTop: 2 }}>
-            {followOn ? '跟单运行中' : '智能跟单已就绪'}
+            {followOn ? '合约运行中' : '智能合约已就绪'}
           </Text>
         </View>
         {user?.role === 'ADMIN' ? (
@@ -147,19 +117,21 @@ export function HomeScreen() {
       </View>
 
       <LinearGradientLike style={styles.banner} from={theme.bannerFrom} to={theme.bannerTo}>
-        <View style={styles.bannerRow}>
-          <View style={{ flex: 1, paddingRight: 10 }}>
-            <Text style={styles.bannerTitle}>智能跟单</Text>
-            <Text style={styles.bannerSub} numberOfLines={1}>
-              多平台 · 信号自动同步
-            </Text>
-          </View>
+        <Text style={styles.bannerTitle}>智能合约</Text>
+        <Text style={styles.bannerSub}>多平台 · 信号自动同步</Text>
+        <View style={styles.bannerActions}>
           <Pressable
             onPress={() => navigation.navigate('StartTrading')}
             style={styles.bannerBtn}
           >
-            <Text style={{ color: theme.primary, fontWeight: '700', fontSize: 13 }}>
-              {followOn ? '跟单状态' : '开启跟单'}
+            <Text style={[styles.bannerBtnText, { color: theme.primary }]}>合约状态</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => navigation.navigate('TradeSettings')}
+            style={styles.bannerBtn}
+          >
+            <Text style={[styles.bannerBtnText, { color: theme.primary }]}>
+              {followOn ? '合约设置' : '开启合约'}
             </Text>
           </Pressable>
         </View>
@@ -179,105 +151,33 @@ export function HomeScreen() {
             <StatTile label="今日收益" value={data?.today ?? '0.00'} accent />
             <StatTile label="7日收益" value={data?.week ?? '0.00'} accent />
             <StatTile
-              label="累计跟单收益"
+              label="累计合约收益"
               value={data?.totalIncome ?? '0.00'}
               accent
               onPress={() => navigation.navigate('ProfitRecords')}
             />
-            <StatTile
-              label="收益"
-              value={fmtSignedMoney(earningsAmt)}
-              accent
-            />
-          </View>
-
-          <View style={[styles.pointCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-            <View style={{ flex: 1, paddingRight: 12 }}>
+            <View style={[styles.pointCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <Text style={{ color: theme.textSecondary, fontSize: 12 }}>点卡余额</Text>
-              <Text
-                style={{
-                  color:
-                    Number(data?.pointBalance ?? 0) < 0 ? theme.danger : theme.text,
-                  fontSize: 22,
-                  fontWeight: '800',
-                  marginTop: 4,
-                }}
-              >
-                {data?.pointCard ?? '0.00'}
-              </Text>
+              <View style={styles.pointRow}>
+                <Text
+                  style={{
+                    flex: 1,
+                    color: Number(data?.pointBalance ?? 0) < 0 ? theme.danger : theme.text,
+                    fontSize: 16,
+                    fontWeight: '700',
+                  }}
+                  numberOfLines={1}
+                >
+                  {data?.pointCard ?? '0.00'}
+                </Text>
+                <Pressable
+                  onPress={() => navigation.navigate('Recharge')}
+                  style={[styles.rechargeBtn, { backgroundColor: theme.primary }]}
+                >
+                  <Text style={{ color: '#fff', fontWeight: '700', fontSize: 12 }}>充值</Text>
+                </Pressable>
+              </View>
             </View>
-            <Pressable
-              onPress={() => navigation.navigate('Recharge')}
-              style={[styles.rechargeBtn, { backgroundColor: theme.primary }]}
-            >
-              <Text style={{ color: '#fff', fontWeight: '700' }}>充值</Text>
-            </Pressable>
-          </View>
-
-          <View style={styles.subStats}>
-            <Pressable
-              onPress={() => navigation.navigate('MyWallet')}
-              style={[styles.subCard, { backgroundColor: theme.card, borderColor: theme.border }]}
-            >
-              <Text style={{ color: theme.textSecondary, fontSize: 12 }}>总资产</Text>
-              <Text
-                style={{
-                  color: totalAssetsAmt < 0 ? theme.danger : theme.text,
-                  fontWeight: '700',
-                  marginTop: 4,
-                }}
-              >
-                {fmtMoney(totalAssetsAmt)} USDT
-              </Text>
-            </Pressable>
-          </View>
-
-          <View style={styles.subStats}>
-            <Pressable
-              onPress={() => navigation.navigate('Commission')}
-              style={[styles.subCard, { backgroundColor: theme.card, borderColor: theme.border }]}
-            >
-              <Text style={{ color: theme.textSecondary, fontSize: 12 }}>待审佣金</Text>
-              <Text
-                style={{
-                  color: pendingCommissionAmt < 0 ? theme.danger : theme.text,
-                  fontWeight: '700',
-                  marginTop: 4,
-                }}
-              >
-                {fmtMoney(pendingCommissionAmt)} USDT
-              </Text>
-            </Pressable>
-            <Pressable
-              onPress={() => navigation.navigate('Withdraw')}
-              style={[styles.subCard, { backgroundColor: theme.card, borderColor: theme.border }]}
-            >
-              <Text style={{ color: theme.textSecondary, fontSize: 12 }}>可领佣金</Text>
-              <Text
-                style={{
-                  color: claimableCommissionAmt < 0 ? theme.danger : theme.success,
-                  fontWeight: '700',
-                  marginTop: 4,
-                }}
-              >
-                {fmtMoney(claimableCommissionAmt)} USDT
-              </Text>
-            </Pressable>
-            <Pressable
-              onPress={() => navigation.navigate('Commission')}
-              style={[styles.subCard, { backgroundColor: theme.card, borderColor: theme.border }]}
-            >
-              <Text style={{ color: theme.textSecondary, fontSize: 12 }}>已领佣金</Text>
-              <Text
-                style={{
-                  color: claimedCommissionAmt < 0 ? theme.danger : theme.text,
-                  fontWeight: '700',
-                  marginTop: 4,
-                }}
-              >
-                {fmtMoney(claimedCommissionAmt)} USDT
-              </Text>
-            </Pressable>
           </View>
 
           <View style={styles.sectionHead}>
@@ -306,7 +206,9 @@ export function HomeScreen() {
               positions.slice(0, 10).map((p) => (
                 <AssetRow
                   key={p.id}
-                  symbol={`${p.pair || p.symbol}${sideLabel(p.side) ? ` · ${sideLabel(p.side)}` : ''}`}
+                  symbol={[positionCoin(p), positionProductLabel(p), sideLabel(p.side)]
+                    .filter(Boolean)
+                    .join(' · ')}
                   color={theme.primary}
                   amount={p.amount}
                   hint={p.entryPrice ? `开仓 ${p.entryPrice}` : undefined}
@@ -325,30 +227,29 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, marginBottom: 16 },
   avatar: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
   vip: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
-  banner: { marginHorizontal: 16, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 14, marginBottom: 10 },
-  bannerRow: { flexDirection: 'row', alignItems: 'center' },
+  banner: { marginHorizontal: 16, borderRadius: 12, paddingVertical: 14, paddingHorizontal: 14, marginBottom: 10 },
   bannerTitle: { color: '#fff', fontSize: 16, fontWeight: '800' },
   bannerSub: { color: 'rgba(255,255,255,0.85)', marginTop: 2, fontSize: 12, lineHeight: 16 },
+  bannerActions: { flexDirection: 'row', gap: 8, marginTop: 12 },
   bannerBtn: {
+    flex: 1,
     backgroundColor: '#fff',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
     borderRadius: 8,
   },
+  bannerBtnText: { fontWeight: '700', fontSize: 13 },
   stats: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', paddingHorizontal: 16 },
   pointCard: {
-    marginHorizontal: 16,
-    marginTop: 0,
+    width: '48%',
     borderRadius: 12,
+    padding: 12,
     borderWidth: 1,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    flexDirection: 'row',
-    alignItems: 'center',
+    marginBottom: 6,
   },
-  rechargeBtn: { paddingHorizontal: 18, paddingVertical: 10, borderRadius: 10 },
-  subStats: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingHorizontal: 16, marginTop: 6 },
-  subCard: { flex: 1, minWidth: 0, borderRadius: 12, borderWidth: 1, paddingVertical: 10, paddingHorizontal: 12 },
+  pointRow: { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
+  rechargeBtn: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 8 },
   sectionHead: {
     paddingHorizontal: 16,
     marginTop: 14,

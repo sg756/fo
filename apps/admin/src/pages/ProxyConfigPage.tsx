@@ -9,7 +9,15 @@ export function ProxyConfigPage() {
   const [msg, setMsg] = useState('');
   const [loading, setLoading] = useState(false);
   const [capacity, setCapacity] = useState<any>(null);
-  const [cfg, setCfg] = useState({ usersPerProxy: 10, idleNoFillDays: 14, idleFollowOffDays: 14 });
+  const [cfg, setCfg] = useState({
+    usersPerProxy: 10,
+    idleNoFillDays: 14,
+    idleFollowOffDays: 14,
+    probeEnabled: true,
+  });
+  const [downloadUrl, setDownloadUrl] = useState('');
+  const [h5Url, setH5Url] = useState('');
+  const [savingDownload, setSavingDownload] = useState(false);
 
   const loadCapacity = useCallback(() => {
     setErr('');
@@ -43,15 +51,26 @@ export function ProxyConfigPage() {
           usersPerProxy: c.usersPerProxy ?? 10,
           idleNoFillDays: c.idleNoFillDays ?? 14,
           idleFollowOffDays: c.idleFollowOffDays ?? 14,
+          probeEnabled: c.probeEnabled !== false,
         }),
       )
+      .catch(() => {});
+  }, []);
+
+  const loadDownload = useCallback(() => {
+    AdminApi.appDownloadUrl()
+      .then((r) => {
+        setDownloadUrl(r?.url || '');
+        setH5Url(r?.h5Url || '');
+      })
       .catch(() => {});
   }, []);
 
   useEffect(() => {
     loadCapacity();
     loadConfig();
-  }, [loadCapacity, loadConfig]);
+    loadDownload();
+  }, [loadCapacity, loadConfig, loadDownload]);
 
   async function saveConfig() {
     setMsg('');
@@ -61,12 +80,37 @@ export function ProxyConfigPage() {
         usersPerProxy: Number(cfg.usersPerProxy) || 10,
         idleNoFillDays: Number(cfg.idleNoFillDays) || 14,
         idleFollowOffDays: Number(cfg.idleFollowOffDays) || 14,
+        probeEnabled: cfg.probeEnabled,
       });
-      setCfg(c);
+      setCfg({
+        usersPerProxy: c.usersPerProxy ?? 10,
+        idleNoFillDays: c.idleNoFillDays ?? 14,
+        idleFollowOffDays: c.idleFollowOffDays ?? 14,
+        probeEnabled: c.probeEnabled !== false,
+      });
       setMsg('配置已保存');
       loadCapacity();
     } catch (e: any) {
       setErr(e.message);
+    }
+  }
+
+  async function saveDownload() {
+    setMsg('');
+    setErr('');
+    setSavingDownload(true);
+    try {
+      const r = await AdminApi.setAppDownloadUrl(downloadUrl.trim(), h5Url.trim());
+      setDownloadUrl(r?.url || '');
+      setH5Url(r?.h5Url || '');
+      const parts: string[] = [];
+      if (r?.url) parts.push('APK');
+      if (r?.h5Url) parts.push('Apple');
+      setMsg(parts.length ? `${parts.join('、')} 地址已保存` : '下载地址已清空');
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setSavingDownload(false);
     }
   }
 
@@ -185,11 +229,55 @@ export function ProxyConfigPage() {
               style={{ width: 70 }}
             />
           </label>
+          <label style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={cfg.probeEnabled}
+              onChange={(e) => setCfg({ ...cfg, probeEnabled: e.target.checked })}
+              style={{ width: 16, height: 16 }}
+            />
+            代理检查
+          </label>
           <button onClick={saveConfig}>保存配置</button>
           <button className="ghost" onClick={runReclaim} disabled={loading}>
             {loading ? '回收中…' : '立即回收闲置'}
           </button>
         </div>
+        <p className="hint" style={{ margin: '8px 0 0' }}>
+          代理检查：勾选后每 5 分钟用一个可跟单用户查询不健康代理的持仓，查通则只标为健康，不迁移用户。取消勾选后停止检查。还没保存过时默认开启。
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>客户端下载</h3>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 72, flexShrink: 0 }}>APK 地址</span>
+            <input
+              value={downloadUrl}
+              onChange={(e) => setDownloadUrl(e.target.value)}
+              placeholder="https://.../app.apk"
+              style={{ flex: 1, minWidth: 180 }}
+            />
+          </label>
+          <label style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ width: 72, flexShrink: 0 }}>Apple</span>
+            <input
+              value={h5Url}
+              onChange={(e) => setH5Url(e.target.value)}
+              placeholder="https://apps.apple.com/..."
+              style={{ flex: 1, minWidth: 180 }}
+            />
+          </label>
+          <div>
+            <button onClick={() => void saveDownload()} disabled={savingDownload}>
+              {savingDownload ? '保存中…' : '保存'}
+            </button>
+          </div>
+        </div>
+        <p className="hint" style={{ margin: '8px 0 0' }}>
+          APK / Apple 填写完整 http/https 链接。对应项留空后点保存会清空该项。
+        </p>
       </div>
     </div>
   );

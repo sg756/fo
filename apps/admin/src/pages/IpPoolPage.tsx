@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { AdminApi } from '../api';
 import { DateField } from '../components/DateField';
 import { Pagination } from '../components/Pagination';
+import { toast } from '../components/Toast';
 import { SearchSelect } from '../components/SearchSelect';
 import { usePager, normalizePaged } from '../hooks/usePager';
 import { useUserOptions, USER_FILTER_PLACEHOLDER, USER_FILTER_EMPTY_HINT } from '../hooks/useSearchFilterOptions';
@@ -10,6 +11,7 @@ const RECLAIM_REASON: Record<string, string> = {
   idle_no_fill: '开启中无成交',
   follow_off_stale: '关闭跟单过久仍占坑',
   evacuate_no_slot: '疏散时无空位',
+  proxy_transport: '代理连续超时或断网',
   manual: '手动',
 };
 
@@ -43,6 +45,8 @@ export function IpPoolPage() {
   const reclaimUserOpts = useUserOptions(reclaimUserText, reclaimUserId);
   const [reflowLogs, setReflowLogs] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [evacuateCounts, setEvacuateCounts] = useState<Record<string, string>>({});
+  const [evacuateTargets, setEvacuateTargets] = useState<Record<string, string>>({});
   const pager = usePager(20);
   const reclaimPager = usePager(20);
   const reflowPager = usePager(20);
@@ -56,9 +60,9 @@ export function IpPoolPage() {
         setItems(Array.isArray(r.items) ? r.items : []);
         if (r.syncError) {
           setMsg('');
-          setErr(
-            `中间件同步失败${r.syncErrorStatus != null ? ` (HTTP ${r.syncErrorStatus})` : ''}：${r.syncError}`,
-          );
+          const fail = `刷新失败${r.syncErrorStatus != null ? ` (HTTP ${r.syncErrorStatus})` : ''}：${r.syncError}`;
+          setErr(fail);
+          if (opts?.force) toast(fail, 'err', 5000);
           if (r.syncErrorBody != null) {
             setErrBody(
               typeof r.syncErrorBody === 'string'
@@ -68,10 +72,15 @@ export function IpPoolPage() {
           }
         } else if (opts?.force) {
           const n = Array.isArray(r.items) ? r.items.length : 0;
-          setMsg(`已从中间件同步 ${n} 个代理`);
+          setMsg('');
+          toast(`刷新成功，已同步 ${n} 个代理`, 'ok');
         }
       })
-      .catch((e) => setErr(e.message))
+      .catch((e) => {
+        const fail = e?.message || '从中间件刷新失败';
+        setErr(fail);
+        if (opts?.force) toast(fail, 'err', 5000);
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -189,6 +198,31 @@ export function IpPoolPage() {
     }
   }
 
+  async function rebindUnassigned() {
+    setErr('');
+    setMsg('');
+    const ok = window.confirm(
+      '把「正在跟单但没有绑定记录」的用户，以及「疏散无空位已移除」的用户，补绑到有空位的健康代理？\n\n继续？',
+    );
+    if (!ok) return;
+    setLoading(true);
+    try {
+      const r = await AdminApi.rebindUnassignedProxies();
+      const text =
+        r.rebound > 0
+          ? `补绑完成：跟单丢失绑定 ${r.reboundOrphans} 人，已移除回流 ${r.reboundPaused} 人`
+          : '没有需要补绑的用户（或健康代理已满）';
+      setMsg(text);
+      toast(text, r.rebound > 0 ? 'ok' : 'err');
+      setLoading(false);
+      await load();
+    } catch (e: any) {
+      setErr(e.message || '补绑失败');
+      toast(e.message || '补绑失败', 'err');
+      setLoading(false);
+    }
+  }
+
   return (
     <div className="page-list">
       {err ? <p className="err">{err}</p> : null}
@@ -259,15 +293,22 @@ export function IpPoolPage() {
             <div className="row" style={{ flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
               <h3 style={{ margin: 0, flex: 1 }}>代理列表</h3>
               {inactiveCount > 0 ? (
-                <span className="hint">失效 {inactiveCount} 个（绑定约 {inactiveBound}）</span>
+                <button
+                  className="ghost"
+                  onClick={cleanupInactive}
+                  disabled={loading}
+                  title="历史遗留的已停用代理：迁走绑定后删除"
+                >
+                  清理遗留代理（{inactiveCount}）
+                </button>
               ) : null}
               <button
                 className="ghost"
-                onClick={cleanupInactive}
-                disabled={loading || inactiveCount === 0}
-                title="先刷新中间件并确保有健康空位，再清理"
+                onClick={() => void rebindUnassigned()}
+                disabled={loading}
+                title="跟单中无绑定、或疏散无空位的用户，补绑到健康代理"
               >
-                清理失效代理
+                补绑未分配用户
               </button>
               <button
                 className="ghost"
@@ -283,7 +324,6 @@ export function IpPoolPage() {
                   <th>公网IP</th>
                   <th>代理地址</th>
                   <th>绑定</th>
-                  <th>状态</th>
                   <th>健康</th>
                   <th></th>
                 </tr>
@@ -292,7 +332,7 @@ export function IpPoolPage() {
                 {items
                   .slice((pager.page - 1) * pager.pageSize, pager.page * pager.pageSize)
                   .map((p) => (
-                    <tr key={p.id} style={!p.active ? { opacity: 0.75 } : undefined}>
+                    <tr key={p.id}>
                       <td style={{ fontFamily: 'monospace' }}>{p.egressIp || p.name}</td>
                       <td style={{ fontFamily: 'monospace', fontSize: 12 }}>
                         {Number(p.port) > 0 ? `${p.host}:${p.port}` : p.host || '—'}
@@ -301,45 +341,132 @@ export function IpPoolPage() {
                         {p.assignedCount ?? 0}/{usersPerProxy}
                       </td>
                       <td>
-                        <span className={`badge ${p.active ? 'ok' : 'danger'}`}>
-                          {p.active ? '启用' : '失效'}
-                        </span>
-                      </td>
-                      <td>
                         <span className={`badge ${p.healthy ? 'ok' : 'warn'}`}>
                           {p.healthy ? '健康' : '异常'}
                         </span>
                       </td>
                       <td>
-                        {!p.active && (p.assignedCount ?? 0) > 0 ? (
+                        {!p.healthy ? (
                           <button
                             className="ghost"
-                            style={{ fontSize: 12 }}
+                            style={{ fontSize: 12, marginRight: 6 }}
                             disabled={loading}
                             onClick={async () => {
-                              if (
-                                !window.confirm(
-                                  `疏散 ${p.egressIp || p.name} 上 ${p.assignedCount} 个绑定？`,
-                                )
-                              )
+                              const label = p.egressIp || p.name;
+                              if (!window.confirm(`确认将 ${label} 恢复为健康？已迁走的用户不会自动回来。`)) {
                                 return;
+                              }
                               setLoading(true);
                               setErr('');
                               try {
-                                const r = await AdminApi.evacuateProxy(p.id);
-                                setMsg(
-                                  `已疏散：迁 ${r.movedUsers}，停跟单 ${r.pausedUsers}`,
-                                );
+                                await AdminApi.restoreProxyHealth(p.id);
+                                const text = `${label} 已恢复健康`;
+                                setMsg(text);
+                                toast(text, 'ok');
                                 setLoading(false);
                                 await load();
                               } catch (e: any) {
                                 setErr(e.message);
+                                toast(e.message || '恢复健康失败', 'err');
                                 setLoading(false);
                               }
                             }}
                           >
-                            疏散
+                            恢复健康
                           </button>
+                        ) : null}
+                        {(p.assignedCount ?? 0) > 0 ? (
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            <select
+                              value={evacuateTargets[p.id] ?? ''}
+                              disabled={loading}
+                              style={{ width: 168, fontSize: 12 }}
+                              onChange={(e) =>
+                                setEvacuateTargets((s) => ({ ...s, [p.id]: e.target.value }))
+                              }
+                            >
+                              <option value="">有空位的健康代理</option>
+                              {items
+                                .filter((o) => o.id !== p.id && o.healthy && o.active !== false)
+                                .map((o) => (
+                                  <option key={o.id} value={o.id}>
+                                    {o.egressIp || o.name}（{o.assignedCount ?? 0}/{usersPerProxy}）
+                                  </option>
+                                ))}
+                            </select>
+                            <input
+                              type="number"
+                              min={1}
+                              max={Math.min(p.assignedCount ?? 0, usersPerProxy)}
+                              value={evacuateCounts[p.id] ?? ''}
+                              placeholder="全部"
+                              disabled={loading}
+                              style={{ width: 72 }}
+                              onChange={(e) =>
+                                setEvacuateCounts((s) => ({ ...s, [p.id]: e.target.value }))
+                              }
+                            />
+                            <button
+                              className="ghost"
+                              style={{ fontSize: 12 }}
+                              disabled={loading}
+                              onClick={async () => {
+                                const bound = p.assignedCount ?? 0;
+                                const targetId = evacuateTargets[p.id] || '';
+                                const target = items.find((o) => o.id === targetId);
+                                const room = target
+                                  ? Math.max(0, usersPerProxy - (target.assignedCount ?? 0))
+                                  : usersPerProxy;
+                                const max = Math.min(bound, usersPerProxy, room);
+                                const typed = String(evacuateCounts[p.id] ?? '').trim();
+                                const n = typed === '' ? bound : Number(typed);
+                                if (target && room < 1) {
+                                  const tip = '目标代理已满';
+                                  setErr(tip);
+                                  toast(tip, 'err');
+                                  return;
+                                }
+                                if (!Number.isInteger(n) || n < 1 || n > max) {
+                                  const tip = target
+                                    ? `疏散个数须为 1～${max}，目标还能再绑 ${room} 人`
+                                    : `疏散个数须为 1～${max}，不能超过每台阈值 ${usersPerProxy}`;
+                                  setErr(tip);
+                                  toast(tip, 'err');
+                                  return;
+                                }
+                                const label = p.egressIp || p.name;
+                                const dest = target
+                                  ? target.egressIp || target.name
+                                  : '其他有空位的健康代理';
+                                const left = bound - n;
+                                if (
+                                  !window.confirm(
+                                    left === 0
+                                      ? `从 ${label} 疏散全部 ${n} 人到 ${dest}？完成后这台绑定应为 0/${usersPerProxy}。`
+                                      : `从 ${label} 疏散 ${n} 人到 ${dest}？这台还会留下 ${left} 人。`,
+                                  )
+                                )
+                                  return;
+                                setLoading(true);
+                                setErr('');
+                                try {
+                                  const r = await AdminApi.evacuateProxy(p.id, n, targetId || undefined);
+                                  const text = `已疏散：迁 ${r.movedUsers}，停跟单 ${r.pausedUsers}`;
+                                  setMsg(text);
+                                  toast(text, 'ok');
+                                  setEvacuateCounts((s) => ({ ...s, [p.id]: '' }));
+                                  setLoading(false);
+                                  await load();
+                                } catch (e: any) {
+                                  setErr(e.message);
+                                  toast(e.message || '疏散失败', 'err');
+                                  setLoading(false);
+                                }
+                              }}
+                            >
+                              疏散
+                            </button>
+                          </span>
                         ) : null}
                       </td>
                     </tr>

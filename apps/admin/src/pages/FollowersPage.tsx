@@ -11,13 +11,18 @@ import {
   USER_FILTER_EMPTY_HINT,
 } from '../hooks/useSearchFilterOptions';
 
-const EXCHANGES = ['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'];
+import { EXCHANGES } from '../exchanges';
 
-function readyOnlyFromUrl(raw: string | null | undefined) {
-  const s = String(raw ?? '').trim().toLowerCase();
-  if (s === '0' || s === 'false' || s === 'no') return false;
-  if (s === '1' || s === 'true' || s === 'yes') return true;
-  return true;
+type ReadyFilter = 'ready' | 'blocked' | 'all';
+
+function readyFilterFromUrl(params: URLSearchParams): ReadyFilter {
+  const ready = String(params.get('ready') || '').trim().toLowerCase();
+  if (ready === 'blocked' || ready === 'no') return 'blocked';
+  if (ready === 'all') return 'all';
+  if (ready === 'ready' || ready === '1') return 'ready';
+  const legacy = String(params.get('readyOnly') ?? '').trim().toLowerCase();
+  if (legacy === '0' || legacy === 'false' || legacy === 'no') return 'all';
+  return 'ready';
 }
 
 function fmtRatio(r: number | null | undefined) {
@@ -33,16 +38,16 @@ function fmtAmt(v: number | null | undefined) {
 /** 满足 / 接近自动跟单条件的用户 */
 export function FollowersPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const urlReadyOnly = readyOnlyFromUrl(searchParams.get('readyOnly'));
+  const urlReady = readyFilterFromUrl(searchParams);
   const [rows, setRows] = useState<any[]>([]);
   const [openMin, setOpenMin] = useState(0);
   const [exchange, setExchange] = useState('');
-  const [readyOnly, setReadyOnly] = useState(urlReadyOnly);
+  const [ready, setReady] = useState<ReadyFilter>(urlReady);
   const [userText, setUserText] = useState('');
   const [userId, setUserId] = useState('');
   const [applied, setApplied] = useState({
     exchange: '',
-    readyOnly: urlReadyOnly,
+    ready: urlReady,
     q: '',
     userId: '',
   });
@@ -62,7 +67,7 @@ export function FollowersPage() {
       try {
         const res = await AdminApi.followers({
           exchange: applied.exchange || undefined,
-          readyOnly: applied.readyOnly,
+          ready: applied.ready,
           q: !applied.userId && applied.q ? applied.q : undefined,
           userId: applied.userId || undefined,
           skip: (p - 1) * size,
@@ -89,45 +94,46 @@ export function FollowersPage() {
   }, [load]);
 
   useEffect(() => {
-    const next = readyOnlyFromUrl(searchParams.get('readyOnly'));
-    setReadyOnly(next);
-    setApplied((prev) => (prev.readyOnly === next ? prev : { ...prev, readyOnly: next }));
+    const next = readyFilterFromUrl(searchParams);
+    setReady(next);
+    setApplied((prev) => (prev.ready === next ? prev : { ...prev, ready: next }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams.get('readyOnly')]);
+  }, [searchParams.get('ready'), searchParams.get('readyOnly')]);
 
-  function writeReadyOnlyParam(next: boolean) {
+  function writeReadyParam(next: ReadyFilter) {
     const p = new URLSearchParams(searchParams);
-    if (next) p.delete('readyOnly');
-    else p.set('readyOnly', '0');
+    p.delete('readyOnly');
+    if (next === 'ready') p.delete('ready');
+    else p.set('ready', next);
     setSearchParams(p, { replace: true });
   }
 
   function search() {
-    writeReadyOnlyParam(readyOnly);
+    writeReadyParam(ready);
     pager.goFirst();
     setApplied({
       exchange,
-      readyOnly,
+      ready,
       q: userText.trim(),
       userId,
     });
   }
 
   function resetFilters() {
-    writeReadyOnlyParam(true);
+    writeReadyParam('ready');
     setExchange('');
-    setReadyOnly(true);
+    setReady('ready');
     setUserText('');
     setUserId('');
     pager.goFirst();
-    setApplied({ exchange: '', readyOnly: true, q: '', userId: '' });
+    setApplied({ exchange: '', ready: 'ready', q: '', userId: '' });
   }
 
   return (
     <div className="page-list">
       <p className="hint">
-        展示已开启跟单且满足条件的用户（按交易所一行）。默认仅看「可自动跟单」：审核通过、已开始交易、已绑
-        Key、已选模板并填写投入本金。开仓另需点卡 ≥ {openMin || 0}。
+        按用户、交易所一行。条件下拉选可自动跟单（已审核、已开始交易、已绑 Key、已选模板）、不可自动跟单，或全部。状态列写明缺什么。开仓倍数
+        = 模板最少投入总本金 ÷ 基准本金。开仓另需点卡 ≥ {openMin || 0}。
       </p>
       {err ? <p className="err">{err}</p> : null}
 
@@ -155,14 +161,21 @@ export function FollowersPage() {
               </option>
             ))}
           </select>
-          <label style={{ margin: 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            <input
-              type="checkbox"
-              checked={readyOnly}
-              onChange={(e) => setReadyOnly(e.target.checked)}
-            />
-            仅可自动跟单
-          </label>
+          <label style={{ margin: 0, whiteSpace: 'nowrap' }}>条件</label>
+          <select
+            value={ready}
+            onChange={(e) => {
+              const next = e.target.value as ReadyFilter;
+              setReady(next);
+              writeReadyParam(next);
+              pager.goFirst();
+              setApplied((prev) => ({ ...prev, ready: next }));
+            }}
+          >
+            <option value="ready">可自动跟单</option>
+            <option value="blocked">不可自动跟单</option>
+            <option value="all">全部</option>
+          </select>
           <button onClick={search} disabled={loading}>
             {loading ? '查询中…' : '查询'}
           </button>
@@ -186,14 +199,14 @@ export function FollowersPage() {
                 <th style={{ width: 180 }}>邮箱</th>
                 <th style={{ width: 88 }}>交易所</th>
                 <th style={{ width: 140 }}>所选模板</th>
-                <th style={{ width: 96 }}>投入本金</th>
+                <th style={{ width: 96 }}>最少投入</th>
                 <th style={{ width: 96 }}>基准本金</th>
                 <th style={{ width: 88 }}>开仓比例</th>
                 <th style={{ width: 88 }}>点卡</th>
                 <th style={{ width: 110 }}>开仓</th>
                 <th style={{ width: 160 }}>状态</th>
                 <th style={{ width: 160 }}>开启时间</th>
-                <th style={{ width: 160 }} title="用户最近保存投入本金/模板的时间">
+                <th style={{ width: 160 }} title="用户最近保存模板的时间">
                   数据更新时间
                 </th>
               </tr>

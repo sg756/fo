@@ -6,6 +6,8 @@ type Props = {
   value: string;
   suffix?: string;
   accent?: boolean;
+  /** 独占一行 */
+  fill?: boolean;
   onPress?: () => void;
 };
 
@@ -14,7 +16,7 @@ function parseAmount(raw: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-export function StatTile({ label, value, suffix = 'USDT', accent, onPress }: Props) {
+export function StatTile({ label, value, suffix = 'USDT', accent, fill, onPress }: Props) {
   const { theme } = useTheme();
   const n = parseAmount(value);
   const valueColor = n < 0 ? theme.danger : accent ? theme.success : theme.text;
@@ -31,14 +33,14 @@ export function StatTile({ label, value, suffix = 'USDT', accent, onPress }: Pro
     return (
       <Pressable
         onPress={onPress}
-        style={[styles.tile, { backgroundColor: theme.card, borderColor: theme.border }]}
+        style={[styles.tile, fill && styles.tileFill, { backgroundColor: theme.card, borderColor: theme.border }]}
       >
         {body}
       </Pressable>
     );
   }
   return (
-    <View style={[styles.tile, { backgroundColor: theme.card, borderColor: theme.border }]}>
+    <View style={[styles.tile, fill && styles.tileFill, { backgroundColor: theme.card, borderColor: theme.border }]}>
       {body}
     </View>
   );
@@ -76,6 +78,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginBottom: 6,
   },
+  tileFill: { width: '100%' },
   btn: {
     height: 48,
     borderRadius: 12,

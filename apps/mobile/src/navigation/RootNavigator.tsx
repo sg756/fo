@@ -1,4 +1,6 @@
+import { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { DarkTheme, DefaultTheme, NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -31,16 +33,28 @@ import { SecurityScreen } from '../screens/SecurityScreen';
 import { ChangePasswordScreen } from '../screens/ChangePasswordScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { HelpScreen } from '../screens/HelpScreen';
+import { NoticesScreen } from '../screens/NoticesScreen';
 import { useAuth } from '../auth/AuthContext';
+import { AccountApi } from '../api/endpoints';
 import type { MainTabParamList, RootStackParamList } from './types';
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
-function TabItem({ icon, label, color }: { icon: string; label: string; color: string }) {
+const TAB_ICON_SIZE = 22;
+
+function TabItem({
+  icon,
+  label,
+  color,
+}: {
+  icon: keyof typeof Ionicons.glyphMap;
+  label: string;
+  color: string;
+}) {
   return (
     <View style={tabStyles.item}>
-      <Text style={[tabStyles.icon, { color }]}>{icon}</Text>
+      <Ionicons name={icon} size={TAB_ICON_SIZE} color={color} />
       <Text style={[tabStyles.label, { color }]} numberOfLines={1}>
         {label}
       </Text>
@@ -52,6 +66,25 @@ function MainTabs() {
   const { theme } = useTheme();
   const insets = useSafeAreaInsets();
   const bottomPad = Math.max(insets.bottom, 10);
+  const [unread, setUnread] = useState(0);
+
+  useEffect(() => {
+    let stop = false;
+    const load = async () => {
+      try {
+        const r = await AccountApi.noticeUnread();
+        if (!stop) setUnread(Number(r.unread) || 0);
+      } catch {
+        if (!stop) setUnread(0);
+      }
+    };
+    load();
+    const timer = setInterval(load, 20000);
+    return () => {
+      stop = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   return (
     <Tab.Navigator
@@ -74,21 +107,23 @@ function MainTabs() {
         name="Home"
         component={HomeScreen}
         options={{
-          tabBarIcon: ({ color }) => <TabItem icon="⌂" label="首页" color={color} />,
+          tabBarIcon: ({ color }) => <TabItem icon="home-outline" label="首页" color={color} />,
         }}
       />
       <Tab.Screen
         name="Trade"
         component={TradeScreen}
         options={{
-          tabBarIcon: ({ color }) => <TabItem icon="◈" label="交易" color={color} />,
+          tabBarIcon: ({ color }) => <TabItem icon="stats-chart-outline" label="交易" color={color} />,
         }}
       />
       <Tab.Screen
         name="Me"
         component={MeScreen}
         options={{
-          tabBarIcon: ({ color }) => <TabItem icon="☺" label="我的" color={color} />,
+          tabBarBadge: unread > 0 ? unread : undefined,
+          tabBarBadgeStyle: { backgroundColor: theme.danger, fontSize: 10 },
+          tabBarIcon: ({ color }) => <TabItem icon="person-outline" label="我的" color={color} />,
         }}
       />
     </Tab.Navigator>
@@ -100,11 +135,6 @@ const tabStyles = StyleSheet.create({
     width: 64,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  icon: {
-    fontSize: 18,
-    lineHeight: 22,
-    textAlign: 'center',
   },
   label: {
     fontSize: 11,
@@ -170,6 +200,7 @@ export function RootNavigator() {
             <Stack.Screen name="ChangePassword" component={ChangePasswordScreen} />
             <Stack.Screen name="Settings" component={SettingsScreen} />
             <Stack.Screen name="Help" component={HelpScreen} />
+            <Stack.Screen name="Notices" component={NoticesScreen} />
           </>
         )}
       </Stack.Navigator>

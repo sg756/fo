@@ -12,7 +12,7 @@ import {
   forwardRef,
 } from '@nestjs/common';
 import { UserRole } from '../../common/auth-role';
-import { IsBoolean, IsInt, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsInt, IsOptional, IsString, Min } from 'class-validator';
 import { JwtAuthGuard, RolesGuard } from '../../common/guards';
 import { Roles } from '../../common/decorators';
 import { IpPoolService } from './ippool.service';
@@ -49,12 +49,21 @@ class AssignDto {
 
 class EvacuateDto {
   @IsOptional() @IsString() toProxyId?: string;
+  /** 本次疏散人数，不能超过每台阈值，也不能超过当前绑定数 */
+  @IsInt() @Min(1) count: number;
 }
 
 class PoolConfigDto {
   @IsOptional() @IsInt() usersPerProxy?: number;
   @IsOptional() @IsInt() idleNoFillDays?: number;
   @IsOptional() @IsInt() idleFollowOffDays?: number;
+  @IsOptional() @IsBoolean() probeEnabled?: boolean;
+}
+
+class AppDownloadDto {
+  @IsOptional() @IsString() url?: string;
+  /** Apple 下载/商店地址 */
+  @IsOptional() @IsString() h5Url?: string;
 }
 
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -140,6 +149,16 @@ export class IpPoolController {
     return this.svc.setPoolConfig(dto);
   }
 
+  @Get('app-download')
+  appDownload() {
+    return this.svc.getAppDownloadUrl();
+  }
+
+  @Post('app-download')
+  setAppDownload(@Body() dto: AppDownloadDto) {
+    return this.svc.setAppDownloadUrl(dto.url || '', dto.h5Url || '');
+  }
+
   @Post('reclaim-idle')
   reclaimIdle() {
     return this.svc.reclaimIdle();
@@ -149,6 +168,12 @@ export class IpPoolController {
   @Post('cleanup-inactive')
   cleanupInactive() {
     return this.svc.cleanupInactiveProxies();
+  }
+
+  /** 跟单中无绑定 / 疏散无空位：补绑到有空位的健康代理 */
+  @Post('rebind-unassigned')
+  rebindUnassigned() {
+    return this.svc.rebindUnassignedFollowers();
   }
 
   @Get('reclaims')
@@ -219,7 +244,16 @@ export class IpPoolController {
 
   @Post(':id/evacuate')
   evacuate(@Param('id') id: string, @Body() dto: EvacuateDto) {
-    return this.svc.evacuate(id, dto.toProxyId);
+    return this.svc.evacuate(id, dto.toProxyId, undefined, {
+      count: dto.count,
+      keepHealthy: true,
+      strictTarget: !!dto.toProxyId,
+    });
+  }
+
+  @Post(':id/restore-health')
+  restoreHealth(@Param('id') id: string) {
+    return this.svc.restoreHealth(id);
   }
 }
 

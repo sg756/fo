@@ -40,21 +40,27 @@ export function normalizeFutureEqualCoin(raw: string | null | undefined): string
   return e;
 }
 
+/**
+ * QueryPosition 多空（文档/实盘只有 holdType + holdTypeName）：
+ * - holdTypeName：「做多」「做空」优先
+ * - holdType：0=做多、1=做空
+ * 不含下单 PositionSide；解析结果仍用内部字段名 positionSide=long|short 写入本地仓。
+ */
 export function parseHoldSide(row: {
   holdType?: unknown;
   holdTypeName?: unknown;
-  positionSide?: unknown;
   positionAmt?: unknown;
 }): 'long' | 'short' {
   const name = String(row.holdTypeName || '').trim();
-  if (/空|short/i.test(name)) return 'short';
+  if (/空|short/i.test(name) && !/多/.test(name)) return 'short';
   if (/多|long/i.test(name)) return 'long';
-  const side = String(row.positionSide || '').toLowerCase();
-  if (side.includes('short') || side === '2') return 'short';
-  if (side.includes('long') || side === '1') return 'long';
+
   const ht = row.holdType;
-  if (ht === 2 || ht === '2' || String(ht).toLowerCase() === 'short') return 'short';
-  if (ht === 1 || ht === '1' || String(ht).toLowerCase() === 'long') return 'long';
+  if (ht === 1 || ht === '1') return 'short';
+  if (ht === 0 || ht === '0') return 'long';
+  if (String(ht).toLowerCase() === 'short') return 'short';
+  if (String(ht).toLowerCase() === 'long') return 'long';
+
   const amt = Number(row.positionAmt);
   if (Number.isFinite(amt) && amt < 0) return 'short';
   return 'long';
@@ -93,11 +99,22 @@ function pickPositiveMargin(row: Record<string, unknown>): number | null {
 }
 
 function asRecord(v: unknown): Record<string, unknown> {
-  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return {};
+  const src = v as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(src)) {
+    out[k] = val;
+    const camel = k.length ? k.charAt(0).toLowerCase() + k.slice(1) : k;
+    if (out[camel] == null) out[camel] = val;
+  }
+  return out;
 }
 
 /** 从 QueryPosition data 抽出持仓行；errorMsg 非空时由调用方当失败，不要拿空表去废弃本地仓 */
-export function parseQueryPositionPayload(data: unknown): QueryPositionParsed[] {
+export function parseQueryPositionPayload(
+  data: unknown,
+  opts?: { spot?: boolean },
+): QueryPositionParsed[] {
   const root = asRecord(data);
   const nested = asRecord(root.data);
   const rawList =
@@ -114,9 +131,9 @@ export function parseQueryPositionPayload(data: unknown): QueryPositionParsed[] 
       .toUpperCase()
       .trim();
     if (!coinName) continue;
-    const equalCoinName = normalizeFutureEqualCoin(
-      String(row.equalCoinName || parsed.equalCoin || 'PC'),
-    );
+    const equalCoinName = opts?.spot
+      ? String(row.equalCoinName || parsed.equalCoin || 'USDT').toUpperCase().trim() || 'USDT'
+      : normalizeFutureEqualCoin(String(row.equalCoinName || parsed.equalCoin || 'PC'));
     const amtRaw = Number(row.positionAmt ?? row.positionSize ?? row.size ?? 0);
     if (!Number.isFinite(amtRaw) || amtRaw === 0) continue;
     const positionAmt = Math.abs(amtRaw);
@@ -128,7 +145,6 @@ export function parseQueryPositionPayload(data: unknown): QueryPositionParsed[] 
       positionSide: parseHoldSide({
         holdType: row.holdType,
         holdTypeName: row.holdTypeName,
-        positionSide: row.positionSide,
         positionAmt: amtRaw,
       }),
       positionAmt,

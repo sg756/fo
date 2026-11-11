@@ -19,6 +19,7 @@ import { useTheme } from '../theme/ThemeContext';
 import type { RootStackParamList } from '../navigation/types';
 import { fmtDateTimeOrDash, fmtPriceOrDash } from '../utils/format';
 import { filterPositions } from '../utils/positionFilter';
+import { positionCoin, positionProductLabel } from '../utils/positionQuote';
 import { PositionFilterBar } from '../components/PositionFilterBar';
 
 type Tab = 'positions' | 'orders';
@@ -67,15 +68,6 @@ export function TradeScreen() {
       <View style={styles.top}>
         <Text style={{ color: theme.text, fontSize: 20, fontWeight: '800', lineHeight: 24 }}>交易</Text>
         <View style={styles.topActions}>
-          <Pressable
-            onPress={() => navigation.navigate('TradeSettings')}
-            style={[styles.marketBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
-          >
-            <Ionicons name="settings-outline" size={15} color={theme.primary} />
-            <Text style={{ color: theme.primary, fontWeight: '600', marginLeft: 6, fontSize: 13 }}>
-              交易设置
-            </Text>
-          </Pressable>
           <Pressable
             onPress={() => navigation.navigate('Market')}
             style={[styles.marketBtn, { backgroundColor: theme.card, borderColor: theme.border }]}
@@ -160,7 +152,7 @@ export function TradeScreen() {
               <View key={p.id} style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <View style={styles.cardTop}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
-                    <Text style={{ color: theme.text, fontWeight: '800', fontSize: 16 }}>{p.pair}</Text>
+                    <Text style={{ color: theme.text, fontWeight: '800', fontSize: 16 }}>{positionCoin(p)}</Text>
                     <View
                       style={[
                         styles.tag,
@@ -182,7 +174,7 @@ export function TradeScreen() {
                     </View>
                   </View>
                   <Text style={{ color: theme.textMuted, fontSize: 12 }}>
-                    {p.exchange} · {p.mode}
+                    {[p.exchange, positionProductLabel(p)].filter(Boolean).join(' · ')}
                   </Text>
                 </View>
                 <View style={styles.grid}>

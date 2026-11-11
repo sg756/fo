@@ -9,6 +9,8 @@ import { SearchSelect } from '../components/SearchSelect';
 import { normalizePaged, usePager } from '../hooks/usePager';
 import {
   useUserOptions,
+  settlementCoinLabel,
+  contractPeriodLabel,
   USER_FILTER_PLACEHOLDER,
   USER_FILTER_EMPTY_HINT,
 } from '../hooks/useSearchFilterOptions';
@@ -380,12 +382,13 @@ export function CommissionRecordsPage() {
                   平仓挂单
                 </span>
                 <span className="v">
-                  {sourceDetail.closeLog.coinName || '—'}
-                  {sourceDetail.closeLog.equalCoinName
-                    ? `/${sourceDetail.closeLog.equalCoinName}`
-                    : ''}{' '}
-                  · {sourceDetail.closeLog.positionSide || '—'} · {sourceDetail.closeLog.status}
+                  {sourceDetail.closeLog.coinName || '—'} · {sourceDetail.closeLog.positionSide || '—'} ·{' '}
+                  {sourceDetail.closeLog.status}
                 </span>
+                <span className="k">结算币</span>
+                <span className="v">{settlementCoinLabel(sourceDetail.closeLog)}</span>
+                <span className="k">周期</span>
+                <span className="v">{contractPeriodLabel(sourceDetail.closeLog)}</span>
                 <span className="k">成交量 / 均价</span>
                 <span className="v mono">
                   {sourceDetail.closeLog.filledAmt || '—'} @ {sourceDetail.closeLog.avgPrice || '—'}
@@ -412,7 +415,7 @@ export function CommissionRecordsPage() {
                   {sourceDetail.openLots.map((o, i) => (
                     <div key={o.id} style={{ marginBottom: i < sourceDetail.openLots.length - 1 ? 8 : 0 }}>
                       <div>
-                        {o.coinName || '—'} · 开 · {o.status}
+                        {o.coinName || '—'} · 开 · {settlementCoinLabel(o)} · {contractPeriodLabel(o)} · {o.status}
                         {o.profitConsumed ? ' · 已配完' : ''}
                       </div>
                       <div className="mono hint" style={{ fontSize: 11 }}>

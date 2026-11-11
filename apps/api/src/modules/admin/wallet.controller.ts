@@ -33,6 +33,8 @@ class GasWalletDto {
 
 class FundGasDto {
   @IsOptional() @IsString() chain?: string;
+  /** 一次补多条链；不传 chain / chains 时补全部已开通链 */
+  @IsOptional() @IsArray() @IsString({ each: true }) chains?: string[];
   @IsOptional() @IsArray() @IsString({ each: true }) walletIds?: string[];
 }
 
@@ -42,10 +44,16 @@ class GasFeeTierDto {
 }
 
 class HotWalletTransferDto {
-  @IsString() token: string; // USDT | ETH
+  @IsString() token: string; // USDT | ETH | BNB
   @IsString() toAddress: string;
   @IsNumber() amount: number;
   @IsString() totpCode: string;
+  /** 同一把地址在多条链上转出时指定网络；不传则用钱包记录上的链 */
+  @IsOptional() @IsString() chain?: string;
+}
+
+class CollectionAutoDto {
+  @IsBoolean() enabled: boolean;
 }
 
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -344,13 +352,15 @@ export class WalletAdminController {
     @CurrentUser('sub') actorId: string,
   ) {
     await this.totp.assertValidCode(actorId, dto.totpCode);
-    const token = String(dto.token || 'USDT').toUpperCase() === 'ETH' ? 'ETH' : 'USDT';
+    const rawToken = String(dto.token || 'USDT').toUpperCase();
+    const token = rawToken === 'ETH' || rawToken === 'BNB' ? rawToken : 'USDT';
     const res = await this.collection.transferFromGasWallet({
       gasWalletId: id,
       token,
       toAddress: dto.toAddress,
       amount: Number(dto.amount),
       actorId,
+      chain: dto.chain,
     });
     await this.audit.log({
       actorId,
@@ -359,6 +369,7 @@ export class WalletAdminController {
       targetId: id,
       detail: {
         token,
+        chain: dto.chain,
         amount: dto.amount,
         toAddress: dto.toAddress,
         txHash: (res as any).txHash,
@@ -387,11 +398,12 @@ export class WalletAdminController {
     return res;
   }
 
-  /** 批量给缺 Gas 的托管地址补 ETH */
+  /** 批量给缺 Gas 的托管地址补原生币；可一次指定多条链 */
   @Post('collection/fund-gas')
   async fundGas(@Body() dto: FundGasDto, @CurrentUser('sub') actorId: string) {
     const res = await this.collection.fundGasBatch({
       chain: dto.chain,
+      chains: dto.chains,
       walletIds: dto.walletIds,
     });
     await this.audit.log({
@@ -400,6 +412,7 @@ export class WalletAdminController {
       targetType: 'CollectionConfig',
       detail: {
         chain: dto.chain,
+        chains: dto.chains,
         started: (res as any).started,
         message: (res as any).message,
       },
@@ -442,8 +455,8 @@ export class WalletAdminController {
     const where: any = {};
     if (status) where.status = status;
     const tok = token?.trim().toUpperCase();
-    if (tok === 'ETH') where.tokenSymbol = 'ETH';
-    else if (tok === 'USDT') where.tokenSymbol = { not: 'ETH' };
+    if (tok === 'ETH' || tok === 'BNB' || tok === 'GAS') where.tokenSymbol = { in: ['ETH', 'BNB'] };
+    else if (tok === 'USDT') where.tokenSymbol = 'USDT';
 
     if (from || to) {
       where.createdAt = {};
@@ -503,6 +516,20 @@ export class WalletAdminController {
   @Get('collection/status')
   collectionStatus() {
     return this.collection.adminStatus();
+  }
+
+  /** 自动归集开关。打开后每 10 分钟归集，不自动补 Gas */
+  @Post('collection/auto')
+  async setCollectionAuto(@Body() dto: CollectionAutoDto, @CurrentUser('sub') actorId: string) {
+    const res = await this.collection.setCollectionAuto(!!dto.enabled);
+    await this.audit.log({
+      actorId,
+      action: 'COLLECTION_AUTO_SET',
+      targetType: 'SystemConfig',
+      targetId: 'collection_auto',
+      detail: { enabled: res.collectionAuto },
+    });
+    return res;
   }
 
   /** 立即归集：后台异步执行，立即返回；进度见 collection/status.collectJob */

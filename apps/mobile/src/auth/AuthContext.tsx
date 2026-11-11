@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { AuthApi, MeUser } from '../api/endpoints';
 import { loadToken, setToken } from '../api/client';
+import { unregisterPushToken } from '../push/registerPush';
 
 type AuthContextValue = {
   authed: boolean;
@@ -60,9 +61,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       },
       register: async (body) => {
         const resp = await AuthApi.register(body);
+        // 注册已直接 ACTIVE：紧接着登录，进入主页，无需后台审核
+        const loginResp = await AuthApi.login({
+          email: body.account,
+          password: body.password,
+        });
+        await setToken(loginResp.accessToken);
+        const me = await AuthApi.me();
+        setUser(me);
+        setAuthed(true);
         return { status: resp.status, message: resp.message, inviteCode: resp.inviteCode };
       },
       logout: async () => {
+        await unregisterPushToken();
         await setToken(null);
         setUser(null);
         setAuthed(false);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AdminApi } from '../api';
+import { useKeepAliveActive } from '../components/KeepAliveOutlet';
 import { toast } from '../components/Toast';
 
 export function TradeConfigPage() {
@@ -11,8 +12,13 @@ export function TradeConfigPage() {
   const [qpIntervalMin, setQpIntervalMin] = useState('5');
   const [chaseOnExpire, setChaseOnExpire] = useState(false);
   const [marketOpenClose, setMarketOpenClose] = useState(false);
-  const [followHalted, setFollowHalted] = useState(false);
+  const [followHalted, setFollowHalted] = useState(true);
+  const [userCustomEnabled, setUserCustomEnabled] = useState(false);
+  const [globalApplied, setGlobalApplied] = useState(false);
+  const [globalTemplateName, setGlobalTemplateName] = useState('');
+  const [customBusy, setCustomBusy] = useState(false);
   const [err, setErr] = useState('');
+  const pageActive = useKeepAliveActive();
 
   const load = useCallback(async () => {
     setErr('');
@@ -27,14 +33,18 @@ export function TradeConfigPage() {
       setChaseOnExpire(!!c.chaseOnExpire);
       setMarketOpenClose(!!c.marketOpenClose);
       setFollowHalted(!!c.followHalted);
+      setUserCustomEnabled(!!c.userCustomEnabled);
+      setGlobalApplied(!!c.globalApplied);
+      setGlobalTemplateName(c.globalTemplate?.name || '');
     } catch (e: any) {
       setErr(e.message);
     }
   }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (!pageActive) return;
+    void load();
+  }, [pageActive, load]);
 
   async function save() {
     setErr('');
@@ -63,9 +73,43 @@ export function TradeConfigPage() {
     }
   }
 
+  async function saveUserCustom() {
+    setErr('');
+    setCustomBusy(true);
+    try {
+      await AdminApi.setUserCustomTemplate(userCustomEnabled);
+      toast('已保存');
+      await load();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setCustomBusy(false);
+    }
+  }
+
   return (
     <div>
       {err ? <p className="err">{err}</p> : null}
+
+      <div className="card tpl-custom-bar">
+        <label style={{ cursor: globalApplied ? 'not-allowed' : 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={globalApplied ? false : userCustomEnabled}
+            disabled={globalApplied || customBusy}
+            onChange={(e) => setUserCustomEnabled(e.target.checked)}
+          />
+          用户自选模板
+        </label>
+        <span className="hint">
+          {globalApplied
+            ? `全局模板${globalTemplateName ? `「${globalTemplateName}」` : ''}已应用，自选已关闭。重新打开请先取消应用。`
+            : '勾选后用户使用自己的合约模板。全局模板应用后会自动取消。'}
+        </span>
+        <button onClick={saveUserCustom} disabled={globalApplied || customBusy}>
+          {customBusy ? '保存中…' : '保存'}
+        </button>
+      </div>
 
       <div className="card">
         <h3>采集参数</h3>
@@ -111,7 +155,7 @@ export function TradeConfigPage() {
               </span>
               <span className="hint" style={{ display: 'block', marginTop: 4 }}>
                 勾选后全站自动跟单不再开任何新单（含开仓/平仓信号、过期市价追入）。
-                保存后立即生效，默认不勾选。
+                保存后立即生效。还没保存过这项时，默认勾选（跟单关闭）。
               </span>
             </span>
           </label>

@@ -7,12 +7,12 @@ import { usePager } from '../hooks/usePager';
 import {
   useMiddlewareAccounts,
   useUserOptions,
-  marketPeriodLabel,
+  settlementCoinLabel,
+  contractPeriodLabel,
   USER_FILTER_PLACEHOLDER,
   USER_FILTER_EMPTY_HINT,
 } from '../hooks/useSearchFilterOptions';
-
-const EXCHANGES = ['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'];
+import { EXCHANGES } from '../exchanges';
 
 const MATCH_OPTS = [
   { value: 'all', label: '全部对齐' },
@@ -166,7 +166,7 @@ export function PositionsComparePage() {
     <div className="page-list">
       <p className="hint" style={{ marginTop: 0 }}>
         对比「账户列表」主账户实时持仓与本地跟单持仓。按币 / 周期 / 方向对齐；预期数量 =
-        账户数量 × 开仓比例（投入本金 / 模板基准本金）。只读，不自动平仓。
+        账户数量 × 开仓比例（模板最少投入总本金 / 基准本金）。只读，不自动平仓。
       </p>
       {err ? <p className="err">{err}</p> : null}
       {signalError ? <p className="err">拉取账户持仓失败：{signalError}</p> : null}
@@ -257,7 +257,8 @@ export function PositionsComparePage() {
                 <th style={{ width: 140 }}>用户</th>
                 <th style={{ width: 88 }}>交易所</th>
                 <th style={{ width: 72 }}>币</th>
-                <th style={{ width: 88 }}>类型</th>
+                <th style={{ width: 72 }}>结算币</th>
+                <th style={{ width: 88 }}>周期</th>
                 <th style={{ width: 56 }}>方向</th>
                 <th style={{ width: 96 }}>账户数量</th>
                 <th style={{ width: 96 }}>本地数量</th>
@@ -271,7 +272,7 @@ export function PositionsComparePage() {
             <tbody>
               {!loading && pageRows.length === 0 ? (
                 <tr>
-                  <td colSpan={13} style={{ textAlign: 'center', padding: '48px 16px', color: 'var(--muted)' }}>
+                  <td colSpan={14} style={{ textAlign: 'center', padding: '48px 16px', color: 'var(--muted)' }}>
                     {applied.accountGid ? '无对比结果' : '请选择主账户后查询'}
                   </td>
                 </tr>
@@ -284,7 +285,8 @@ export function PositionsComparePage() {
                     </td>
                     <td>{r.exchange || '—'}</td>
                     <td className="nowrap">{r.coinName}</td>
-                    <td>{marketPeriodLabel({ equalCoinName: r.equalCoinName })}</td>
+                    <td className="nowrap">{settlementCoinLabel(r)}</td>
+                    <td className="nowrap">{contractPeriodLabel(r)}</td>
                     <td>
                       <span
                         className="badge"

@@ -3,7 +3,8 @@ import { StatusBar } from 'expo-status-bar';
 import * as Updates from 'expo-updates';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { ThemeProvider, useTheme } from './src/theme/ThemeContext';
-import { AuthProvider } from './src/auth/AuthContext';
+import { AuthProvider, useAuth } from './src/auth/AuthContext';
+import { registerPushToken } from './src/push/registerPush';
 import { RootNavigator } from './src/navigation/RootNavigator';
 import { AppDialogHost } from './src/components/AppDialog';
 
@@ -17,6 +18,15 @@ async function applyOtaUpdate() {
   } catch {
     /* 无网/配额用尽时沿用当前包 */
   }
+}
+
+function PushRegistrar() {
+  const { authed } = useAuth();
+  useEffect(() => {
+    if (!authed) return;
+    void registerPushToken().catch(() => undefined);
+  }, [authed]);
+  return null;
 }
 
 function AppInner() {
@@ -38,6 +48,7 @@ export default function App() {
     <SafeAreaProvider>
       <ThemeProvider>
         <AuthProvider>
+          <PushRegistrar />
           <AppInner />
         </AuthProvider>
       </ThemeProvider>

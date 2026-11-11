@@ -1,10 +1,16 @@
 import { useCallback, useState } from 'react';
-import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { ScreenHeader } from '../components/ScreenHeader';
 import { PrimaryButton } from '../components/StatTile';
-import { FollowConfigSection } from '../components/FollowConfigSection';
 import { TradeApi, TradeChecklist } from '../api/endpoints';
 import { ApiError } from '../api/client';
 import { useTheme } from '../theme/ThemeContext';
@@ -41,15 +47,15 @@ export function StartTradingScreen() {
   const items = [
     {
       ok: !!check?.approved,
-      label: '账号已审核通过',
+      label: '账号状态正常',
       tip: check?.status && check.status !== 'ACTIVE' ? `当前状态: ${check.status}` : '',
     },
     { ok: !!check?.apiKey, label: '交易所 API Key', tip: check ? `${check.apiKeyCount} 所已配置` : '' },
     { ok: !!check?.ipWhitelist, label: 'IP 白名单已配置', tip: check ? `${check.ipCount} 个公网 IP` : '' },
     {
       ok: !!check?.followConfigReady,
-      label: '投入本金与跟单模板',
-      tip: check?.followConfigHint || '每所选择 1 个模板并填写声明本金（不算余额）',
+      label: '合约模板',
+      tip: check?.followConfigHint || '请先选择合约模板，选择后才能跟随合约',
     },
     {
       ok: minPoint <= 0 || !!check?.pointEnough,
@@ -63,18 +69,11 @@ export function StartTradingScreen() {
   const ready = !!check?.canStart;
   const following = !!check?.followEnabled;
   const needSetup = !ready && !following;
+  /** 曾开启过一次后，底部大按钮不再出现，改用右上角小开关 */
+  const hasToggledOnce = !!check?.followStartedAt || following;
 
   const toggle = async () => {
     if (needSetup) {
-      if (!check?.apiKey) {
-        navigation.navigate('TradeSettings');
-        return;
-      }
-      // Key 已有但缺本金/模板：留在本页配置
-      if (!check?.followConfigReady) {
-        notify('请先配置', check?.followConfigHint || '请选择模板并填写投入总本金');
-        return;
-      }
       navigation.navigate('TradeSettings');
       return;
     }
@@ -82,13 +81,13 @@ export function StartTradingScreen() {
     try {
       if (following) {
         await TradeApi.stop();
-        notify('已停止', '已关闭自动跟单，后台将不再为你跟单');
+        notify('已停止', '已关闭自动合约，后台将不再为你合约');
       } else {
         await TradeApi.start();
         const tip =
           minPoint > 0 && !check?.pointEnough
-            ? `已开启自动跟单。当前点卡 ${pointBal} 低于开仓门槛 ${minPoint}，暂不会跟开仓信号，平仓信号仍会跟；充值达标后自动可接开仓。`
-            : '已开启自动跟单。后台采集信号后将为你自动开/平仓，App 仅作状态展示。';
+            ? `已开启自动合约。当前点卡 ${pointBal} 低于开仓门槛 ${minPoint}，暂不会跟开仓信号，平仓信号仍会跟；充值达标后自动可接开仓。`
+            : '已开启自动合约。后台采集信号后将为你自动开/平仓。';
         notify('已开启', tip);
       }
       await load();
@@ -99,21 +98,50 @@ export function StartTradingScreen() {
     }
   };
 
+  const headerToggle = hasToggledOnce ? (
+    <Pressable
+      onPress={toggle}
+      disabled={busy}
+      hitSlop={8}
+      style={[
+        styles.headerBtn,
+        {
+          borderColor: following ? theme.danger : theme.primary,
+          opacity: busy ? 0.55 : 1,
+        },
+      ]}
+    >
+      {busy ? (
+        <ActivityIndicator size="small" color={following ? theme.danger : theme.primary} />
+      ) : (
+        <Text
+          style={{
+            color: following ? theme.danger : theme.primary,
+            fontSize: 12,
+            fontWeight: '700',
+          }}
+        >
+          {following ? '关闭' : '开启'}
+        </Text>
+      )}
+    </Pressable>
+  ) : null;
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
-      <ScreenHeader title="开始交易" onBack={() => navigation.goBack()} />
+      <ScreenHeader
+        title="合约状态"
+        onBack={() => navigation.goBack()}
+        right={headerToggle}
+      />
       <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: 40 }}>
-        <View style={[styles.hero, { backgroundColor: theme.primarySoft }]}>
-          <View style={[styles.rocket, { backgroundColor: following ? theme.success : theme.primary }]} />
-          <View style={[styles.flame, { backgroundColor: theme.warning }]} />
-        </View>
-        <Text style={{ color: theme.text, fontSize: 22, fontWeight: '800', textAlign: 'center', marginTop: 8 }}>
-          {following ? '自动跟单已开启' : '准备开启自动跟单？'}
+        <Text style={{ color: theme.text, fontSize: 22, fontWeight: '800', textAlign: 'center' }}>
+          {following ? '自动合约已开启' : '准备开启自动合约？'}
         </Text>
         <Text style={{ color: theme.textSecondary, textAlign: 'center', marginTop: 8, lineHeight: 20 }}>
           {following
-            ? 'App 仅展示状态；开仓/平仓由后台按模板比例自动执行（开仓需点卡达标）'
-            : '开启前请声明投入总本金并选择模板；后台按比例跟单，不校验交易所余额。'}
+            ? '开仓/平仓由后台按模板比例自动执行（开仓需点卡达标）'
+            : '请先在首页「开启合约」里配置 API Key 和合约模板，再回到这里打开开关。'}
         </Text>
 
         {loading ? (
@@ -145,52 +173,38 @@ export function StartTradingScreen() {
           </View>
         )}
 
-        <View style={{ marginTop: 20 }}>
-          <Text style={{ color: theme.text, fontSize: 15, fontWeight: '700', marginBottom: 10 }}>
-            配置投入本金与模板
-          </Text>
-          <FollowConfigSection compact onChanged={load} />
-        </View>
-
         {following && check?.followStartedAt ? (
           <Text style={{ color: theme.success, fontSize: 12, marginTop: 12, textAlign: 'center' }}>
             开启时间：{new Date(check.followStartedAt).toLocaleString()}
           </Text>
         ) : null}
 
-        {check?.proxyEgress ? (
-          <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 8, textAlign: 'center' }}>
-            当前调度公网 IP：{check.proxyEgress}
-          </Text>
+        {!hasToggledOnce ? (
+          <View style={{ marginTop: 24 }}>
+            {busy ? (
+              <ActivityIndicator color={theme.primary} />
+            ) : (
+              <PrimaryButton
+                title={ready ? '开启自动合约' : '前往开启合约'}
+                onPress={toggle}
+              />
+            )}
+          </View>
         ) : null}
-
-        <View style={{ marginTop: 24 }}>
-          {busy ? (
-            <ActivityIndicator color={theme.primary} />
-          ) : (
-            <PrimaryButton
-              title={
-                following
-                  ? '关闭自动跟单'
-                  : ready
-                    ? '开启自动跟单'
-                    : !check?.apiKey
-                      ? '去完善交易设置'
-                      : '请先保存本金与模板'
-              }
-              onPress={toggle}
-            />
-          )}
-        </View>
       </ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  hero: { height: 140, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
-  rocket: { width: 36, height: 56, borderRadius: 18 },
-  flame: { width: 16, height: 16, borderRadius: 8, marginTop: -6 },
   card: { borderRadius: 12, borderWidth: 1, paddingHorizontal: 14 },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 14 },
+  headerBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });

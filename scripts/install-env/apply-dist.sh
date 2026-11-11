@@ -146,13 +146,14 @@ case "${PRISMA_MODE}" in
     fi
     ;;
   push)
-    echo "==> 修复 users.user_no（回填空值 + AUTO_INCREMENT）"
+    # 持仓 api_code / 跟单模板范围等迁移脚本不在这里跑：只在导旧库时手动执行。
+    echo "==> 修复 users.user_no，再 prisma db push"
     if [[ "${RUN_AS_ROOT_NPM}" -eq 1 ]]; then
       (cd "${API_DIR}" && node scripts/fix-user-no.js)
-      (cd "${API_DIR}" && npx prisma db push)
+      (cd "${API_DIR}" && npx prisma db push --accept-data-loss)
     else
       sudo -u "${RUN_USER}" env HOME="${NPM_CACHE}" bash -c "cd '${API_DIR}' && node scripts/fix-user-no.js"
-      sudo -u "${RUN_USER}" env HOME="${NPM_CACHE}" bash -c "cd '${API_DIR}' && npx prisma db push"
+      sudo -u "${RUN_USER}" env HOME="${NPM_CACHE}" bash -c "cd '${API_DIR}' && npx prisma db push --accept-data-loss"
     fi
     ;;
   skip|none) echo "    跳过 Prisma" ;;

@@ -22,13 +22,12 @@ export class AdminAuthService {
     if (!account) return null;
     const byNick = await this.prisma.admin.findFirst({ where: { nickname: account } });
     if (byNick) return byNick;
-    const email = account.includes('@') ? account.toLowerCase() : null;
-    if (email) {
-      const byEmail = await this.prisma.admin.findUnique({ where: { email } });
-      if (byEmail) return byEmail;
-    }
+    const lowered = account.toLowerCase();
+    const byEmail = await this.prisma.admin.findUnique({ where: { email: lowered } });
+    if (byEmail) return byEmail;
+    if (lowered.includes('@')) return null;
     const byInternal = await this.prisma.admin.findUnique({
-      where: { email: `${account.toLowerCase()}@admin.local` },
+      where: { email: `${lowered}@admin.local` },
     });
     if (byInternal) return byInternal;
     return this.prisma.admin.findFirst({

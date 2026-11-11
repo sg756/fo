@@ -24,7 +24,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
-import { Exchange } from '@prisma/client';
+import { Exchange, FollowOrderStatus, Prisma } from '@prisma/client';
 import { JwtAuthGuard, RolesGuard } from '../../common/guards';
 import { CurrentUser, Roles } from '../../common/decorators';
 import { TradeService } from './trade.service';
@@ -47,6 +47,10 @@ class PlaceOrderBody {
   @IsOptional() @IsString() clientOrderId?: string;
   @IsOptional() @IsObject() extra?: Record<string, any>;
   @IsOptional() @IsString() tradePassword?: string;
+  /** 合约 apiCode，如 USDT 永续 bac、USDC 永续 bab；不传则按账户类型默认 bac */
+  @IsOptional() @IsString() apiCode?: string;
+  @IsOptional() @IsString() coinName?: string;
+  @IsOptional() @IsString() equalCoinName?: string;
 }
 
 class SignalTimeoutDto {
@@ -95,6 +99,11 @@ class MiddlewareConfigDto {
 
 class OpenMinPointDto {
   @IsNumber() @Min(0) amount: number;
+}
+
+class StatsResetBody {
+  @IsIn(['1m', '3m', 'all'])
+  range!: '1m' | '3m' | 'all';
 }
 
 class PurgeFollowLogsBody {
@@ -150,6 +159,8 @@ class AdminCancelByOrderIdDto {
   @IsOptional() @IsString() coinName?: string;
   @IsOptional() @IsString() equalCoinName?: string;
   @IsOptional() @IsString() accountType?: string;
+  /** USDC 永续为 bab，不传时按 future 默认 bac（USDT） */
+  @IsOptional() @IsString() apiCode?: string;
 }
 
 class AdminClosePositionDto {
@@ -163,6 +174,7 @@ class AdminClosePositionDto {
   @IsOptional() @IsString() accountType?: string;
   @IsOptional() @IsString() accountGid?: string;
   @IsOptional() @IsString() accountName?: string;
+  @IsOptional() @IsString() apiCode?: string;
   @IsOptional() @Allow() leverage?: number | string;
 }
 
@@ -174,29 +186,56 @@ class AdminDiscardLocalPositionsDto {
   ids: string[];
 }
 
+/** 按主账户清理本地未平仓。不传 accountGid 则清理全部主账户。 */
+class PurgePositionsByAccountDto {
+  @IsOptional() @IsString() accountGid?: string;
+}
+
+/** 已平仓记录：按列表筛选删除。字段为空表示该条件不限制。 */
+class ClearClosedRecordsDto {
+  @IsOptional() @IsString() accountGid?: string;
+  @IsOptional() @IsString() userId?: string;
+  @IsOptional() @IsString() q?: string;
+  @IsOptional() @IsString() exchange?: string;
+  @IsOptional() @IsString() coinName?: string;
+  @IsOptional() @IsString() period?: string;
+  /** all | partial | full | discard；all 或不传 = 利润明细 + 死仓 */
+  @IsOptional() @IsString() closedKind?: string;
+  @IsOptional() @IsString() recordId?: string;
+  @IsOptional() @IsString() from?: string;
+  @IsOptional() @IsString() to?: string;
+}
+
 class UpsertFollowTemplateDto {
   @IsOptional() @IsString() id?: string;
   @IsString() @MinLength(1) name: string;
-  @IsEnum(Exchange) exchange: Exchange;
-  /** 中间?MultiAccountList 账户 GUID */
-  @IsString() @MinLength(1) accountGid: string;
-  /** 中间件账户名称（展示?*/
-  @IsOptional() @IsString() accountName?: string;
+  /** 显式跟全部交易所；为 true 时忽略 exchanges */
+  @IsOptional() @IsBoolean() allExchanges?: boolean;
+  @IsOptional() @IsArray() @IsEnum(Exchange, { each: true }) exchanges?: Exchange[];
+  /** 显式跟全部主账户；为 true 时忽略 accounts */
+  @IsOptional() @IsBoolean() allAccounts?: boolean;
+  @IsOptional() @IsArray() accounts?: { accountGid?: string; accountName?: string }[];
   /** 单笔最小金?*/
   @IsNumber() @Min(0) unitAmount: number;
-  /** 比例基准本金（用户声明投?/ 本?= 开仓比例） */
+  /** 比例基准本金（开仓倍数 = 最少投入总本金 / 本值） */
   @IsNumber() @Min(0) maxPrincipal: number;
-  /** 最少投入总本金（用户声明投入下限?=不限制） */
+  /** 最少投入总本金（开仓倍数分子，须大于 0） */
   @IsOptional() @IsNumber() @Min(0) minInvestAmount?: number;
   @IsOptional() @IsBoolean() active?: boolean;
+  /** 设为全系统唯一的全局模板 */
+  @IsOptional() @IsBoolean() isGlobal?: boolean;
   @IsOptional() @IsString() remark?: string;
+}
+
+class UserCustomTemplateDto {
+  @IsBoolean() enabled: boolean;
 }
 
 class UpsertUserFollowConfigDto {
   @IsEnum(Exchange) exchange: Exchange;
   @IsString() @MinLength(1) templateId: string;
-  /** 用户声明投入总本金；仅算开仓比例，不校验交易所余额 */
-  @IsNumber() @Min(0) investAmount: number;
+  /** 已废弃：开仓倍数由模板计算，客户端可不传 */
+  @IsOptional() @IsNumber() @Min(0) investAmount?: number;
 }
 
 @UseGuards(JwtAuthGuard)
@@ -232,7 +271,7 @@ export class TradeController {
     return this.trade.listActiveFollowTemplates(exchange);
   }
 
-  /** 用户按交易所的跟单配置（模板 + 声明本金?*/
+  /** 用户按交易所的跟单配置（只选模板） */
   @Get('follow-configs')
   listFollowConfigs(@CurrentUser('sub') userId: string) {
     return this.trade.listUserFollowConfigs(userId);
@@ -379,11 +418,14 @@ export class TradeAdminController {
     return this.trade.middlewareTest();
   }
 
-  /** 主账户列表：默认只读 1 分钟缓存；force=1 才同步刷新 */
+  /** 主账户列表：默认只读 1 分钟缓存；force=1 才同步刷新并写入中间件日志 */
   @Get('middleware/accounts')
   middlewareAccounts(@Query('force') force?: string) {
+    const refresh = force === '1' || force === 'true';
     return this.trade.multiAccountList({
-      force: force === '1' || force === 'true',
+      force: refresh,
+      // 后台刷新不记日志；只有管理端「拉取账户列表」记一条 GET
+      skipLog: !refresh,
     });
   }
 
@@ -418,7 +460,23 @@ export class TradeAdminController {
   async followerConfig() {
     const cfg = await this.follower.getConfig();
     const qp = await this.queryPos.publicConfig();
-    return { ...cfg, ...qp };
+    const policy = await this.trade.followTemplatePolicy();
+    return { ...cfg, ...qp, ...policy };
+  }
+
+  /** 跟单配置：用户自选模板。全局模板已应用时不能打开。 */
+  @Post('follower/user-custom-template')
+  async setUserCustomTemplate(
+    @Body() dto: UserCustomTemplateDto,
+    @CurrentUser('sub') actorId: string,
+  ) {
+    const res = await this.trade.setUserCustomTemplate(dto.enabled === true);
+    await this.audit.log({
+      actorId,
+      action: 'FOLLOW_USER_CUSTOM_TEMPLATE',
+      detail: res,
+    });
+    return res;
   }
 
   /** 设置信号超时毫秒 (默认 60000；也可传 seconds 兼容旧客户端) */
@@ -676,26 +734,35 @@ export class TradeAdminController {
   }
 
   /**
-   * 跟单用户列表（管理端?   * query: exchange / q / readyOnly(默认 true，仅返回满足自动跟单条件的行)
+   * 跟单用户列表（管理端?   * query: exchange / q / ready=ready|blocked|all（默认 ready）
+   * readyOnly=0 仍表示全部，兼容旧链接。
    */
   @Get('followers')
   followers(
     @Query('exchange') exchange?: Exchange,
     @Query('q') q?: string,
     @Query('userId') userId?: string,
+    @Query('ready') ready?: string,
     @Query('readyOnly') readyOnly?: string,
     @Query('skip') skip?: string,
     @Query('take') take?: string,
   ) {
-    const ready =
-      readyOnly == null || readyOnly === ''
-        ? true
-        : !['0', 'false', 'no'].includes(String(readyOnly).toLowerCase());
+    const picked = String(ready || '').trim().toLowerCase();
+    const legacyAll =
+      readyOnly != null &&
+      readyOnly !== '' &&
+      ['0', 'false', 'no'].includes(String(readyOnly).toLowerCase());
+    const filter =
+      picked === 'blocked' || picked === 'no'
+        ? 'blocked'
+        : picked === 'all' || legacyAll
+          ? 'all'
+          : 'ready';
     return this.trade.listAdminFollowers({
       exchange,
       q,
       userId,
-      readyOnly: ready,
+      ready: filter,
       skip: skip != null && skip !== '' ? Number(skip) : undefined,
       take: take != null && take !== '' ? Number(take) : undefined,
     });
@@ -734,6 +801,7 @@ export class TradeAdminController {
     @Query('coinName') coinName?: string,
     @Query('equalCoinName') equalCoinName?: string,
     @Query('positionSide') positionSide?: string,
+    @Query('apiCode') apiCode?: string,
   ) {
     return this.trade.getOpenFollowDetail({
       userId: userId || '',
@@ -741,6 +809,7 @@ export class TradeAdminController {
       coinName: coinName || '',
       equalCoinName,
       positionSide,
+      apiCode,
     });
   }
 
@@ -886,20 +955,125 @@ export class TradeAdminController {
     return res;
   }
 
+  /**
+   * 清理持仓预览：列出将要清掉的主账户及笔数。
+   * 传 accountGid 只看该主账户；不传则列出全部仍有未平仓的主账户。
+   */
+  @Post('positions/purge-preview')
+  previewPurgePositions(@Body() dto: PurgePositionsByAccountDto) {
+    return this.trade.previewPurgeLocalPositions(dto?.accountGid);
+  }
+
+  /**
+   * 按主账户把本地未平仓标为死仓（不对交易所下单）。
+   * 不传 accountGid 则清理全部主账户下的未平仓。
+   */
+  @Post('positions/purge')
+  async purgePositions(
+    @Body() dto: PurgePositionsByAccountDto,
+    @CurrentUser('sub') actorId: string,
+  ) {
+    const res = await this.trade.purgeLocalPositionsByAccount(dto?.accountGid);
+    await this.audit.log({
+      actorId,
+      action: 'ADMIN_PURGE_POSITIONS_BY_ACCOUNT',
+      targetType: 'UserPosition',
+      detail: {
+        accountGid: dto?.accountGid || null,
+        discarded: res.discarded,
+        accounts: res.accounts,
+      },
+    });
+    return res;
+  }
+
+  /**
+   * 已平仓清理预览：按当前筛选统计将删除的账户与笔数。
+   * 条件都空则统计全部平仓记录。
+   */
+  @Post('positions/clear-closed-preview')
+  previewClearClosed(@Body() dto: ClearClosedRecordsDto) {
+    return this.trade.previewClearClosedRecords(dto || {});
+  }
+
+  /** 按筛选删除已平仓记录（利润明细 + 符合条件的死仓）。已入账佣金余额不退回。 */
+  @Post('positions/clear-closed')
+  async clearClosed(
+    @Body() dto: ClearClosedRecordsDto,
+    @CurrentUser('sub') actorId: string,
+  ) {
+    const res = await this.trade.clearClosedRecords(dto || {});
+    await this.audit.log({
+      actorId,
+      action: 'ADMIN_CLEAR_CLOSED_RECORDS',
+      targetType: 'ProfitRecord',
+      detail: {
+        filters: dto || {},
+        deleted: res.deleted,
+        profitDeleted: res.profitDeleted,
+        discardDeleted: res.discardDeleted,
+        accounts: res.accounts,
+      },
+    });
+    return res;
+  }
+
   /** 跟单模板列表 */
   @Get('follow-templates')
   async listFollowTemplates() {
     const items = await this.prisma.followTemplate.findMany({
       orderBy: [{ active: 'desc' }, { updatedAt: 'desc' }],
+      include: {
+        exchanges: { select: { exchange: true }, orderBy: { exchange: 'asc' } },
+        accounts: {
+          select: { accountGid: true, accountName: true },
+          orderBy: { accountName: 'asc' },
+        },
+      },
     });
+    const policy = await this.trade.followTemplatePolicy();
     return {
-      items: items.map((t) => ({
-        ...t,
-        unitAmount: Number(t.unitAmount),
-        maxPrincipal: Number(t.maxPrincipal),
-        minInvestAmount: Number(t.minInvestAmount),
-      })),
+      items: items.map((t) => this.serializeFollowTemplate(t)),
       total: items.length,
+      globalApplied: policy.globalApplied,
+      userCustomEnabled: policy.userCustomEnabled,
+    };
+  }
+
+  private serializeFollowTemplate(t: {
+    id: string;
+    name: string;
+    allExchanges: boolean;
+    allAccounts: boolean;
+    unitAmount: unknown;
+    maxPrincipal: unknown;
+    minInvestAmount: unknown;
+    active: boolean;
+    isGlobal: boolean;
+    remark: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+    exchanges: { exchange: Exchange }[];
+    accounts: { accountGid: string; accountName: string | null }[];
+  }) {
+    return {
+      id: t.id,
+      name: t.name,
+      allExchanges: t.allExchanges,
+      allAccounts: t.allAccounts,
+      exchanges: t.exchanges.map((e) => e.exchange),
+      accounts: t.accounts.map((a) => ({
+        accountGid: a.accountGid,
+        accountName: a.accountName,
+      })),
+      unitAmount: Number(t.unitAmount),
+      maxPrincipal: Number(t.maxPrincipal),
+      minInvestAmount: Number(t.minInvestAmount),
+      active: t.active,
+      isGlobal: t.isGlobal,
+      remark: t.remark,
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
     };
   }
 
@@ -910,57 +1084,112 @@ export class TradeAdminController {
     @CurrentUser('sub') actorId: string,
   ) {
     const name = dto.name.trim();
-    const accountGid = String(dto.accountGid || '').trim();
     if (!name) throw new BadRequestException('请填写模板名');
-    if (!accountGid) throw new BadRequestException('请选择交易账户');
+    const allExchanges = dto.allExchanges === true;
+    const exchanges = allExchanges
+      ? []
+      : Array.from(new Set((dto.exchanges || []).filter((x): x is Exchange => !!x)));
+    if (!allExchanges && exchanges.length === 0) {
+      throw new BadRequestException('请选择交易所，或选择全部');
+    }
+    const allAccounts = dto.allAccounts === true;
+    const rawAccounts = allAccounts ? [] : dto.accounts || [];
+    const accountMap = new Map<string, string | null>();
+    for (const a of rawAccounts) {
+      const gid = String(a?.accountGid || '').trim();
+      if (!gid) continue;
+      const nameText = String(a?.accountName || '').trim() || null;
+      if (!accountMap.has(gid)) accountMap.set(gid, nameText);
+    }
+    if (!allAccounts && accountMap.size === 0) {
+      throw new BadRequestException('请选择交易账户，或选择全部账户');
+    }
     if (!Number.isFinite(dto.unitAmount) || dto.unitAmount < 0) {
       throw new BadRequestException('单笔最小金额无效');
     }
-    if (!Number.isFinite(dto.maxPrincipal) || dto.maxPrincipal < 0) {
+    if (!Number.isFinite(dto.maxPrincipal) || dto.maxPrincipal <= 0) {
       throw new BadRequestException('比例基准本金无效');
     }
     const minInvest = Number(dto.minInvestAmount ?? 0);
-    if (!Number.isFinite(minInvest) || minInvest < 0) {
-      throw new BadRequestException('最少投入总本金无效');
+    if (!Number.isFinite(minInvest) || minInvest <= 0) {
+      throw new BadRequestException('最少投入总本金须大于 0，用于计算开仓倍数');
     }
     if (dto.maxPrincipal > 0 && dto.unitAmount > dto.maxPrincipal) {
       throw new BadRequestException('单笔最小金额不能大于比例基准本金');
     }
+    const isGlobal = dto.isGlobal === true;
+    await this.trade.assertGlobalTemplateMark(dto.id, isGlobal);
 
-    // 优先用前端传来的 name；若空则尝试从中间件列表回填
-    let accountName = String(dto.accountName || '').trim() || null;
-    if (!accountName) {
-      try {
-        const { items } = await this.trade.multiAccountList();
-        const hit = (items || []).find(
-          (a: any) => String(a.value ?? a.gid ?? '').trim() === accountGid,
-        );
-        if (hit) accountName = String(hit.name || '').trim() || null;
-      } catch {
-        /* 列表失败不阻断保存?*/
+    if (!allAccounts) {
+      const live = await this.trade.liveMiddlewareAccounts();
+      if (!live) {
+        throw new BadRequestException('无法核对中间件交易账户，请稍后再保存');
+      }
+      const gone = [...accountMap.keys()].filter((gid) => !live.gids.has(gid));
+      if (gone.length) {
+        const labels = gone.map((gid) => accountMap.get(gid) || gid);
+        throw new BadRequestException(`交易账户已不存在：${labels.join('、')}`);
+      }
+      for (const gid of accountMap.keys()) {
+        const name = live.names.get(gid);
+        if (name) accountMap.set(gid, name);
       }
     }
 
     const data = {
       name,
-      exchange: dto.exchange,
-      accountGid,
-      accountName,
+      allExchanges,
+      allAccounts,
       unitAmount: dto.unitAmount,
       maxPrincipal: dto.maxPrincipal,
       minInvestAmount: minInvest,
       active: dto.active ?? true,
+      isGlobal,
       remark: dto.remark?.trim() || null,
     };
 
-    let row;
-    if (dto.id) {
-      const old = await this.prisma.followTemplate.findUnique({ where: { id: dto.id } });
-      if (!old) throw new NotFoundException('模板不存在');
-      row = await this.prisma.followTemplate.update({ where: { id: dto.id }, data });
-    } else {
-      row = await this.prisma.followTemplate.create({ data });
-    }
+    const row = await this.prisma.$transaction(async (tx) => {
+      let saved;
+      if (dto.id) {
+        const old = await tx.followTemplate.findUnique({ where: { id: dto.id } });
+        if (!old) throw new NotFoundException('模板不存在');
+        saved = await tx.followTemplate.update({ where: { id: dto.id }, data });
+      } else {
+        saved = await tx.followTemplate.create({ data });
+      }
+      await tx.followTemplateExchange.deleteMany({ where: { templateId: saved.id } });
+      await tx.followTemplateAccount.deleteMany({ where: { templateId: saved.id } });
+      if (exchanges.length) {
+        await tx.followTemplateExchange.createMany({
+          data: exchanges.map((exchange) => ({ templateId: saved.id, exchange })),
+        });
+      }
+      if (accountMap.size) {
+        await tx.followTemplateAccount.createMany({
+          data: [...accountMap.entries()].map(([accountGid, accountName]) => ({
+            templateId: saved.id,
+            accountGid,
+            accountName,
+          })),
+        });
+      }
+      if (isGlobal) {
+        await tx.followTemplate.updateMany({
+          where: { isGlobal: true, id: { not: saved.id } },
+          data: { isGlobal: false },
+        });
+      }
+      return tx.followTemplate.findUniqueOrThrow({
+        where: { id: saved.id },
+        include: {
+          exchanges: { select: { exchange: true }, orderBy: { exchange: 'asc' } },
+          accounts: {
+            select: { accountGid: true, accountName: true },
+            orderBy: { accountName: 'asc' },
+          },
+        },
+      });
+    });
 
     await this.audit.log({
       actorId,
@@ -969,9 +1198,10 @@ export class TradeAdminController {
       targetId: row.id,
       detail: {
         name: row.name,
-        exchange: row.exchange,
-        accountGid: row.accountGid,
-        accountName: row.accountName,
+        allExchanges: row.allExchanges,
+        exchanges: row.exchanges.map((e) => e.exchange),
+        allAccounts: row.allAccounts,
+        accounts: row.accounts.map((a) => a.accountGid),
         unitAmount: Number(row.unitAmount),
         maxPrincipal: Number(row.maxPrincipal),
         minInvestAmount: Number(row.minInvestAmount),
@@ -979,28 +1209,59 @@ export class TradeAdminController {
       },
     });
 
-    return {
-      ...row,
-      unitAmount: Number(row.unitAmount),
-      maxPrincipal: Number(row.maxPrincipal),
-      minInvestAmount: Number(row.minInvestAmount),
-    };
+    return this.serializeFollowTemplate(row);
   }
 
   /** 删除跟单模板 */
   @Delete('follow-templates/:id')
   async deleteFollowTemplate(@Param('id') id: string, @CurrentUser('sub') actorId: string) {
-    const old = await this.prisma.followTemplate.findUnique({ where: { id } });
+    const old = await this.prisma.followTemplate.findUnique({
+      where: { id },
+      include: { exchanges: { select: { exchange: true } } },
+    });
     if (!old) throw new NotFoundException('模板不存在');
+    if (old.isGlobal) await this.trade.assertGlobalTemplateMark(old.id, false);
     await this.prisma.followTemplate.delete({ where: { id } });
     await this.audit.log({
       actorId,
       action: 'FOLLOW_TEMPLATE_DELETE',
       targetType: 'FollowTemplate',
       targetId: id,
-      detail: { name: old.name, exchange: old.exchange },
+      detail: {
+        name: old.name,
+        allExchanges: old.allExchanges,
+        exchanges: old.exchanges.map((e) => e.exchange),
+      },
     });
     return { ok: true };
+  }
+
+  /** 全局模板应用到所有用户（含之后新增的用户） */
+  @Post('follow-templates/:id/apply')
+  async applyGlobalTemplate(@Param('id') id: string, @CurrentUser('sub') actorId: string) {
+    const res = await this.trade.applyGlobalTemplate(id);
+    await this.audit.log({
+      actorId,
+      action: 'FOLLOW_TEMPLATE_APPLY',
+      targetType: 'FollowTemplate',
+      targetId: id,
+      detail: res,
+    });
+    return res;
+  }
+
+  /** 取消全局模板应用，之后用户走各自的自定义模板 */
+  @Post('follow-templates/:id/cancel-apply')
+  async cancelGlobalTemplate(@Param('id') id: string, @CurrentUser('sub') actorId: string) {
+    const res = await this.trade.cancelGlobalTemplate(id);
+    await this.audit.log({
+      actorId,
+      action: 'FOLLOW_TEMPLATE_CANCEL_APPLY',
+      targetType: 'FollowTemplate',
+      targetId: id,
+      detail: res,
+    });
+    return res;
   }
 
   /**
@@ -1191,6 +1452,122 @@ export class TradeAdminController {
       if (ids.length < batch) break;
     }
     return { ok: true as const, deleted };
+  }
+
+  /**
+   * 总览跟踪数据：挂单日志（已结束）+ 平仓利润 + 佣金记录。
+   * 1m / 3m 只删该时间点之前的；all 全删。未结束挂单保留。不改点卡余额。
+   */
+  @Post('stats-reset')
+  async resetTrackingStats(
+    @Body() body: StatsResetBody,
+    @CurrentUser('sub') actorId: string,
+  ) {
+    const range = body.range;
+    const cutoff =
+      range === 'all'
+        ? null
+        : (() => {
+            const d = new Date();
+            d.setMonth(d.getMonth() - (range === '1m' ? 1 : 3));
+            return d;
+          })();
+    const before = cutoff ? { lt: cutoff } : undefined;
+    const finishedLog: Prisma.SignalFollowLogWhereInput = {
+      status: {
+        in: [FollowOrderStatus.FILLED, FollowOrderStatus.CANCELLED, FollowOrderStatus.FAILED],
+      },
+      ...(before ? { createdAt: before } : {}),
+    };
+    const profitWhere = before ? { closedAt: before } : {};
+
+    const [logs, profits, commissions] = await Promise.all([
+      this.prisma.signalFollowLog.count({ where: finishedLog }),
+      this.prisma.profitRecord.count({ where: profitWhere }),
+      this.prisma.commissionRecord.count({
+        where: before ? { profit: { closedAt: before } } : {},
+      }),
+    ]);
+
+    const commissionDeleted = await this.prisma.commissionRecord.deleteMany({
+      where: before ? { profit: { closedAt: before } } : {},
+    });
+    const profitDeleted = await this.prisma.profitRecord.deleteMany({ where: profitWhere });
+    await this.prisma.followFillSlice.deleteMany({
+      where: { followLog: finishedLog },
+    });
+    const logDeleted = await this.prisma.signalFollowLog.deleteMany({ where: finishedLog });
+
+    const result = {
+      ok: true as const,
+      range,
+      cutoff: cutoff ? cutoff.toISOString() : null,
+      deleted: {
+        logs: logDeleted.count,
+        profits: profitDeleted.count,
+        commissions: commissionDeleted.count,
+      },
+      matched: { logs, profits, commissions },
+    };
+    await this.audit.log({
+      actorId,
+      action: 'STATS_RESET',
+      detail: result,
+    });
+    return result;
+  }
+
+  /**
+   * 资金流水（点卡流水）。1m / 3m 只删该时间点之前的；all 全删。
+   * 不改点卡余额，不删充值单和提现。充值单上指向已删流水的编号清空。
+   */
+  @Post('fund-flow-reset')
+  async resetFundFlow(
+    @Body() body: StatsResetBody,
+    @CurrentUser('sub') actorId: string,
+  ) {
+    const range = body.range;
+    const cutoff =
+      range === 'all'
+        ? null
+        : (() => {
+            const d = new Date();
+            d.setMonth(d.getMonth() - (range === '1m' ? 1 : 3));
+            return d;
+          })();
+    const where = cutoff ? { createdAt: { lt: cutoff } } : {};
+    const batch = 2000;
+    let deleted = 0;
+    for (;;) {
+      const rows = await this.prisma.pointCardTx.findMany({
+        where,
+        select: { id: true },
+        take: batch,
+      });
+      if (rows.length === 0) break;
+      const ids = rows.map((row) => row.id);
+      await this.prisma.rechargeOrder.updateMany({
+        where: { pointTxId: { in: ids } },
+        data: { pointTxId: null },
+      });
+      const removed = await this.prisma.pointCardTx.deleteMany({
+        where: { id: { in: ids } },
+      });
+      deleted += removed.count;
+      if (rows.length < batch) break;
+    }
+    const result = {
+      ok: true as const,
+      range,
+      cutoff: cutoff ? cutoff.toISOString() : null,
+      deleted,
+    };
+    await this.audit.log({
+      actorId,
+      action: 'FUND_FLOW_RESET',
+      detail: result,
+    });
+    return result;
   }
 
   /** 手动录入平仓利润 (联调/补录), 入库后自动结算佣?*/

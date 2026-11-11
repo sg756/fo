@@ -33,6 +33,13 @@ enum Exchange {
   BITGET
   BYBIT
   GATE
+  HUOBI
+  KUCOIN
+  HYPERLIQUID
+  HASHKEY
+  BACKPACK
+  ASTER
+  LIGHTER
 }
 
 // 跟单委托生命周期
@@ -191,6 +198,8 @@ model User {
   postLogs         PostLog[]
   signalFollows    SignalFollowLog[]
   positions        UserPosition[]
+  pushTokens       DevicePushToken[]
+  notices          UserNotice[]
 
   @@index([status])
   @@index([parentId])
@@ -337,9 +346,45 @@ model PointCard {
   // 可提佣金（平仓分润入账；仅此可提现）
   commissionBalance Decimal @default(0) @db.Decimal(30, 10)
   commissionFrozen  Decimal @default(0) @db.Decimal(30, 10)
+  // 累计入账佣金：分润入账时累加，提现不扣；不依赖流水
+  commissionEarned  Decimal @default(0) @db.Decimal(30, 10)
+  /// 本轮已推过「低于 100」。余额回到 100 及以上后清掉，下次再跌破才再推
+  low100Notified Boolean @default(false) @map("low100_notified")
+  /// 本轮已推过「低于 10」。余额回到 10 及以上后清掉
+  low10Notified  Boolean @default(false) @map("low10_notified")
   updatedAt DateTime @updatedAt
 
   @@map("point_cards")
+}
+
+/// App 设备的 Expo 推送令牌。同一台手机换号登录时改挂到新用户
+model DevicePushToken {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique @db.VarChar(255)
+  platform  String   @db.VarChar(16)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@map("device_push_tokens")
+}
+
+/// App / H5 站内消息。点开为已读；登录满 1 天仍未点开的、登录前就存在的消息自动已读
+model UserNotice {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String    @db.Text
+  kind      String    @default("point_low") @db.VarChar(32)
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@map("user_notices")
 }
 
 model PointCardTx {
@@ -367,7 +412,7 @@ model Wallet {
   user          User     @relation(fields: [userId], references: [id])
   // 平台托管充值地址: 资金归平台, 仅用于识别该用户的链上转入
   chain         String   @default("ETH")
-  address       String   @unique
+  address       String
   derivIndex    Int? // HD 派生索引
   encPrivateKey String?  @db.Text // AES-256-GCM 加密私钥 (平台保管)
   createdAt     DateTime @default(now())
@@ -375,6 +420,8 @@ model Wallet {
   rechargeOrders    RechargeOrder[]
   collectionRecords CollectionRecord[]
 
+  @@unique([userId, chain])
+  @@unique([chain, address])
   @@index([userId])
   @@map("wallets")
 }
@@ -414,7 +461,7 @@ model CollectionConfig {
   @@map("collection_configs")
 }
 
-// 归集目标地址簿：可增删，归集时从中选用
+// 归集目标地址簿：一个 0x 只存一行，ARB 与 BSC 共用
 model CollectionAddress {
   id        String   @id @default(cuid())
   chain     String   @default("ARB")
@@ -422,8 +469,7 @@ model CollectionAddress {
   label     String?
   createdAt DateTime @default(now())
 
-  @@unique([chain, address])
-  @@index([chain])
+  @@unique([address])
   @@map("collection_addresses")
 }
 
@@ -479,13 +525,13 @@ model CollectionRecord {
   status        CollectionStatus @default(PENDING)
   /// 失败真实原因（可查）
   failReason    String?          @db.Text
-  /// 失败时预估需 Gas（ETH）
+  /// 失败时预估需 Gas（原生币，ETH 或 BNB）
   gasRequired   Decimal?         @db.Decimal(30, 18)
-  /// 失败时地址 ETH 余额
+  /// 失败时地址原生币余额
   gasHave       Decimal?         @db.Decimal(30, 18)
-  /// 失败时 Gas 缺口（需 - 有，ETH）
+  /// 失败时 Gas 缺口（需 - 有，原生币）
   gasDeficit    Decimal?         @db.Decimal(30, 18)
-  /// 本次尝试已损耗的 Gas（ETH）；未上链则为 0
+  /// 本次尝试已损耗的 Gas（原生币）；未上链则为 0
   gasLost       Decimal?         @db.Decimal(30, 18)
   createdAt     DateTime         @default(now())
   updatedAt     DateTime         @updatedAt
@@ -761,12 +807,14 @@ model UserPosition {
   userId        String             @map("user_id")
   user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
   exchange      Exchange
-  coinName      String             @map("coin_name")
-  equalCoinName String             @default("") @map("equal_coin_name")
-  positionSide  String             @map("position_side") // long / short
+  coinName      String             @map("coin_name") @db.VarChar(64)
+  equalCoinName String             @default("") @map("equal_coin_name") @db.VarChar(64)
+  positionSide  String             @map("position_side") @db.VarChar(64) // long / short
   accountType   String?            @map("account_type")
   accountGid    String?            @map("account_gid")
   accountName   String?            @map("account_name")
+  /// 开仓信号 apiCode（现货 ba、USDT 永续 bac、USDC 永续 bab）。唯一键用它区分产品，交易所列只供筛选。
+  apiCode       String             @default("") @map("api_code") @db.VarChar(32)
   qty           Decimal            @default(0) @db.Decimal(30, 10)
   entryPrice    Decimal            @default(0) @db.Decimal(30, 10) @map("entry_price")
   leverage      Decimal?           @db.Decimal(10, 4)
@@ -795,7 +843,7 @@ model UserPosition {
   createdAt     DateTime           @default(now()) @map("created_at")
   updatedAt     DateTime           @updatedAt @map("updated_at")
 
-  @@unique([userId, exchange, coinName, equalCoinName, positionSide], name: "user_pos_uniq")
+  @@unique([userId, apiCode, coinName, equalCoinName, positionSide], name: "user_pos_uniq")
   @@index([userId, status])
   @@index([status])
   @@index([status, abnormal])
@@ -813,31 +861,60 @@ model UserPosition {
 model FollowTemplate {
   id           String   @id @default(cuid())
   name         String // 模板名
-  exchange     Exchange
-  /// 中间件 MultiAccountList 账户 GUID（value）
-  accountGid   String   @default("") @map("account_gid")
-  /// 中间件账户名称（name，展示用）
-  accountName  String?  @map("account_name")
+  /// 显式跟全部交易所。未勾选时必须在 exchanges 里至少有一行
+  allExchanges Boolean  @default(false) @map("all_exchanges")
+  /// 显式跟全部主账户。未勾选时必须在 accounts 里至少有一行
+  allAccounts  Boolean  @default(false) @map("all_accounts")
   /// 单笔最小金额（名义金额下限，低于则跳过开仓）
   unitAmount   Decimal  @db.Decimal(30, 10) @map("unit_amount")
-  /// 比例基准本金：用户声明投入 / 本值 = 开仓数量比例
+  /// 比例基准本金：开仓倍数 = 最少投入总本金 / 本值
   maxPrincipal Decimal  @db.Decimal(30, 10) @map("max_principal")
-  /// 最少投入总本金：用户声明投入不得低于此值（0=不限制）
+  /// 最少投入总本金：开仓倍数的分子，须大于 0
   minInvestAmount Decimal @default(0) @db.Decimal(30, 10) @map("min_invest_amount")
   active       Boolean  @default(true)
+  /// 全系统唯一的全局模板。是否对所有人生效由系统配置 follow_global_applied 决定
+  isGlobal     Boolean  @default(false) @map("is_global")
   remark       String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  exchanges   FollowTemplateExchange[]
+  accounts    FollowTemplateAccount[]
   userConfigs UserFollowConfig[]
 
-  @@index([exchange])
   @@index([active])
-  @@index([accountGid])
+  @@index([isGlobal])
   @@map("follow_templates")
 }
 
-/// 用户按交易所的跟单配置：每所最多 1 个模板；投入本金仅本地声明，用于开仓比例，不校验交易所余额
+/// 模板适用的交易所。allExchanges 为 true 时不写行
+model FollowTemplateExchange {
+  id         String         @id @default(cuid())
+  templateId String         @map("template_id")
+  template   FollowTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  exchange   Exchange
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  @@unique([templateId, exchange])
+  @@index([exchange])
+  @@map("follow_template_exchanges")
+}
+
+/// 模板跟的中间件主账户。allAccounts 为 true 时不写行
+model FollowTemplateAccount {
+  id          String         @id @default(cuid())
+  templateId  String         @map("template_id")
+  template    FollowTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  accountGid  String         @map("account_gid")
+  accountName String?        @map("account_name")
+  createdAt   DateTime       @default(now()) @map("created_at")
+
+  @@unique([templateId, accountGid])
+  @@index([accountGid])
+  @@map("follow_template_accounts")
+}
+
+/// 用户按交易所的跟单配置：每所最多 1 个模板；开仓倍数取模板，不由用户填写
 model UserFollowConfig {
   id           String         @id @default(cuid())
   userId       String         @map("user_id")
@@ -845,7 +922,7 @@ model UserFollowConfig {
   exchange     Exchange
   templateId   String         @map("template_id")
   template     FollowTemplate @relation(fields: [templateId], references: [id])
-  /// 用户声明的投入总本金（仅算开仓比例，不校验余额）
+  /// 保存时写入模板最少投入总本金（列保留，开仓倍数不读此列）
   investAmount Decimal        @db.Decimal(30, 10) @map("invest_amount")
   /// 限价跟单过期撤单且未成交时，是否按原方向市价追一笔
   chaseOnExpire Boolean       @default(false) @map("chase_on_expire")

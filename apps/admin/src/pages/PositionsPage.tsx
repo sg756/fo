@@ -6,6 +6,7 @@ import { ListLoading } from '../components/ListLoading';
 import { Pagination } from '../components/Pagination';
 import { SearchSelect } from '../components/SearchSelect';
 import { confirmDialog } from '../components/ConfirmDialog';
+import { ModalCloseButton } from '../components/ModalCloseButton';
 import { toast } from '../components/Toast';
 import { CopyMonoCell } from '../components/CopyMonoCell';
 import { normalizePaged, usePager } from '../hooks/usePager';
@@ -14,14 +15,14 @@ import {
   useUserOptions,
   useMiddlewareAccounts,
   MARKET_PERIOD_OPTIONS,
-  marketPeriodLabel,
+  settlementCoinLabel,
+  contractPeriodLabel,
   accountGidLabel,
   accountGidTitle,
   USER_FILTER_PLACEHOLDER,
   USER_FILTER_EMPTY_HINT,
 } from '../hooks/useSearchFilterOptions';
-
-const EXCHANGES = ['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'];
+import { EXCHANGES } from '../exchanges';
 
 type PosTab = 'OPEN' | 'ABNORMAL' | 'CLOSED';
 
@@ -136,10 +137,26 @@ export function PositionsPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [discarding, setDiscarding] = useState(false);
   const [aligning, setAligning] = useState(false);
+  const [purgeTarget, setPurgeTarget] = useState<'open' | 'closed'>('open');
+  const [purgeOpen, setPurgeOpen] = useState(false);
+  const [purgeLoading, setPurgeLoading] = useState(false);
+  const [purgeBusy, setPurgeBusy] = useState(false);
+  const [purgeErr, setPurgeErr] = useState('');
+  const [purgePreview, setPurgePreview] = useState<{
+    scope?: 'account' | 'all' | 'outside';
+    accountGid?: string | null;
+    accounts: { accountGid: string; accountName: string; count: number }[];
+    total: number;
+    blocked?: string | null;
+    profitCount?: number;
+    discardCount?: number;
+  } | null>(null);
   const [signalDetail, setSignalDetail] = useState<{
     rowKey: string;
     coinName?: string | null;
     equalCoinName?: string | null;
+    apiCode?: string | null;
+    accountType?: string | null;
     signal?: any;
     orderIds?: string[];
     loading?: boolean;
@@ -262,6 +279,8 @@ export function PositionsPage() {
       rowKey: key,
       coinName: r.coinName,
       equalCoinName: r.equalCoinName,
+      apiCode: r.apiCode,
+      accountType: r.accountType,
       signal: null,
       orderIds: [],
       loading: true,
@@ -272,6 +291,8 @@ export function PositionsPage() {
         rowKey: key,
         coinName: r.coinName,
         equalCoinName: r.equalCoinName,
+        apiCode: r.apiCode,
+        accountType: r.accountType,
         signal: r.lastFollowSignal,
         orderIds: Array.isArray(r.orderIds) && r.orderIds.length ? r.orderIds : r.orderId ? [r.orderId] : [],
         loading: false,
@@ -284,6 +305,8 @@ export function PositionsPage() {
         rowKey: key,
         coinName: r.coinName,
         equalCoinName: r.equalCoinName,
+        apiCode: r.apiCode,
+        accountType: r.accountType,
         signal: null,
         orderIds: [],
         loading: false,
@@ -298,6 +321,7 @@ export function PositionsPage() {
         coinName: r.coinName,
         equalCoinName: r.equalCoinName || undefined,
         positionSide: r.side,
+        apiCode: r.apiCode || undefined,
       });
       setSignalDetail((prev) => {
         if (!prev || prev.rowKey !== key) return prev;
@@ -305,6 +329,8 @@ export function PositionsPage() {
           rowKey: key,
           coinName: r.coinName,
           equalCoinName: r.equalCoinName,
+          apiCode: r.apiCode,
+          accountType: r.accountType,
           signal: res.lastFollowSignal,
           orderIds: res.orderIds || (res.orderId ? [res.orderId] : []),
           loading: false,
@@ -318,6 +344,8 @@ export function PositionsPage() {
           rowKey: key,
           coinName: r.coinName,
           equalCoinName: r.equalCoinName,
+          apiCode: r.apiCode,
+          accountType: r.accountType,
           signal: null,
           orderIds: [],
           loading: false,
@@ -399,6 +427,127 @@ export function PositionsPage() {
       toast(e.message || '入队失败', 'err');
     } finally {
       setAligning(false);
+    }
+  }
+
+  function purgeAccountLabel(row: { accountGid: string; accountName: string }) {
+    const gid = String(row.accountGid || '').trim();
+    if (!gid) return '未绑定主账户';
+    const name =
+      row.accountName ||
+      mwAccounts.find((a) => a.gid === gid)?.name ||
+      '';
+    return name && name !== gid ? name : gid;
+  }
+
+  function closedClearBody() {
+    const coin = (coinValue || coinText).trim();
+    return {
+      from: from || undefined,
+      to: to || undefined,
+      recordId: recordId.trim() || undefined,
+      userId: userId || undefined,
+      q: !userId && userText.trim() ? userText.trim() : undefined,
+      exchange: exchange || undefined,
+      period: period || undefined,
+      accountGid: accountGid.trim() || undefined,
+      coinName: coin || undefined,
+      closedKind: closedKind || 'all',
+    };
+  }
+
+  function closedFilterLabels() {
+    const parts: string[] = [];
+    if (from || to) parts.push(`平仓时间 ${from || '不限'} 至 ${to || '不限'}`);
+    if (recordId.trim()) parts.push(`编号 ${recordId.trim()}`);
+    if (userId || userText.trim()) parts.push(`用户 ${userText.trim() || userId}`);
+    if (exchange) parts.push(exchange);
+    if (period) {
+      parts.push(MARKET_PERIOD_OPTIONS.find((o) => o.value === period)?.label || period);
+    }
+    if (accountGid.trim()) {
+      const known = mwAccounts.find((a) => a.gid === accountGid.trim());
+      parts.push(known?.name || accountGid.trim());
+    }
+    const coin = (coinValue || coinText).trim();
+    if (coin) parts.push(coin);
+    if (closedKind === 'partial') parts.push('部分成交');
+    else if (closedKind === 'full') parts.push('完全成交');
+    else if (closedKind === 'discard') parts.push('死仓删除');
+    return parts;
+  }
+
+  async function openPurge() {
+    if (isClosed) return;
+    const gid = accountGid.trim();
+    setPurgeTarget('open');
+    setPurgeOpen(true);
+    setPurgeErr('');
+    setPurgePreview(null);
+    setPurgeLoading(true);
+    try {
+      const res = await AdminApi.previewPurgePositions(gid || undefined);
+      setPurgePreview(res);
+    } catch (e: any) {
+      setPurgeErr(e.message || '统计失败');
+    } finally {
+      setPurgeLoading(false);
+    }
+  }
+
+  async function openClearClosed() {
+    if (!isClosed) return;
+    setPurgeTarget('closed');
+    setPurgeOpen(true);
+    setPurgeErr('');
+    setPurgePreview(null);
+    setPurgeLoading(true);
+    try {
+      const res = await AdminApi.previewClearClosed(closedClearBody());
+      setPurgePreview(res);
+    } catch (e: any) {
+      setPurgeErr(e.message || '统计失败');
+    } finally {
+      setPurgeLoading(false);
+    }
+  }
+
+  function closePurge() {
+    if (purgeBusy) return;
+    setPurgeOpen(false);
+  }
+
+  async function confirmPurge() {
+    if (!purgePreview || purgePreview.total <= 0 || purgeBusy) return;
+    const gid = accountGid.trim();
+    setPurgeBusy(true);
+    setPurgeErr('');
+    try {
+      if (purgeTarget === 'closed') {
+        const res = await AdminApi.clearClosedRecords(closedClearBody());
+        toast(
+          res.deleted > 0 ? `已删除 ${res.deleted} 条平仓记录` : '没有可删除的平仓记录',
+          res.deleted > 0 ? 'ok' : 'info',
+        );
+      } else {
+        const res = await AdminApi.purgePositions(gid || undefined);
+        toast(
+          res.blocked
+            ? res.blocked
+            : res.discarded > 0
+              ? `已清理 ${res.discarded} 笔列表外持仓`
+              : '没有可清理的列表外持仓',
+          res.discarded > 0 ? 'ok' : 'info',
+        );
+      }
+      setPurgeOpen(false);
+      setSelected(new Set());
+      await load();
+    } catch (e: any) {
+      setPurgeErr(e.message || '清理失败');
+      toast(e.message || '清理失败', 'err');
+    } finally {
+      setPurgeBusy(false);
     }
   }
 
@@ -490,6 +639,7 @@ export function PositionsPage() {
         equalCoinName: r.equalCoinName || undefined,
         symbol: r.symbol || undefined,
         accountType: r.accountType || 'future',
+        apiCode: r.apiCode || undefined,
         // 仅写入平仓流水展示用；下单仍用用户自身 Key，不会带入 PlaceOrder.account
         accountGid: r.accountGid || undefined,
         accountName: r.accountName || undefined,
@@ -644,9 +794,30 @@ export function PositionsPage() {
           {!isClosed ? (
             <button
               className="ghost"
+              style={{ color: 'var(--danger, #c0392b)' }}
+              onClick={() => void openPurge()}
+              disabled={purgeLoading || purgeBusy || loading}
+              title="只删除不在当前账户列表里的持仓。列表中的主账户不会动"
+            >
+              清理持仓
+            </button>
+          ) : (
+            <button
+              className="ghost"
+              style={{ color: 'var(--danger, #c0392b)' }}
+              onClick={() => void openClearClosed()}
+              disabled={purgeLoading || purgeBusy || loading}
+              title="按当前筛选删除平仓记录。条件都没选则删除全部"
+            >
+              清理所有记录
+            </button>
+          )}
+          {!isClosed ? (
+            <button
+              className="ghost"
               onClick={() => void enqueueAlign()}
               disabled={aligning || loading}
-              title="加入对齐队列，由独立线程按代理串行查询交易所持仓，不堵当前页"
+              title="加入对齐队列：按交易所 QueryPosition 对齐，并废弃不在当前主账户列表的本地仓（列表拉取失败则不动）"
             >
               {aligning
                 ? '入队中…'
@@ -741,7 +912,8 @@ export function PositionsPage() {
               {isClosed ? (
                 <th style={{ width: 160 }} title="来自平仓记录">订单号</th>
               ) : null}
-              <th style={{ width: 120 }}>类型</th>
+              <th style={{ width: 72 }}>结算币</th>
+              <th style={{ width: 88 }}>周期</th>
               <th style={{ width: 56 }}>方向</th>
               <th style={{ width: 88 }}>数量</th>
               <th style={{ width: 96 }} title={isClosed ? '本次平仓配对用的开仓均价，不是当前剩余仓' : undefined}>
@@ -899,7 +1071,8 @@ export function PositionsPage() {
                     {orderLabel}
                   </td>
                   ) : null}
-                  <td>{r.mode || marketPeriodLabel(r)}</td>
+                  <td className="nowrap">{settlementCoinLabel(r)}</td>
+                  <td className="nowrap">{contractPeriodLabel(r)}</td>
                   <td>
                     <span
                       className="badge"
@@ -1082,12 +1255,11 @@ export function PositionsPage() {
         {signalDetail ? (
           <div className="float-kv">
             <span className="k">币</span>
-            <span className="v">
-              {signalDetail.signal?.coinName || signalDetail.coinName || '—'}
-              {(signalDetail.signal?.equalCoinName || signalDetail.equalCoinName)
-                ? `/${signalDetail.signal?.equalCoinName || signalDetail.equalCoinName}`
-                : ''}
-            </span>
+            <span className="v">{signalDetail.signal?.coinName || signalDetail.coinName || '—'}</span>
+            <span className="k">结算币</span>
+            <span className="v">{settlementCoinLabel(signalDetail)}</span>
+            <span className="k">周期</span>
+            <span className="v">{contractPeriodLabel(signalDetail)}</span>
             <span className="k">价格</span>
             <span className="v">
               {signalDetail.signal?.signalPrice != null && signalDetail.signal.signalPrice !== ''
@@ -1149,6 +1321,83 @@ export function PositionsPage() {
           </div>
         ) : null}
       </DraggableFloatPanel>
+      {purgeOpen ? (
+        <div className="modal-backdrop confirm-backdrop" role="presentation" onClick={closePurge}>
+          <div
+            className="modal-panel purge-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="purge-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3 id="purge-title">
+                {purgeTarget === 'closed' ? '清理平仓记录' : '清理列表外持仓'}
+              </h3>
+              <ModalCloseButton disabled={purgeBusy} onClick={closePurge} />
+            </div>
+            <p className="confirm-message">
+              {purgeTarget === 'closed'
+                ? closedFilterLabels().length
+                  ? `将按当前筛选删除平仓记录：${closedFilterLabels().join('，')}。没填的条件不限制。`
+                  : '当前没有筛选条件，将删除全部平仓记录。'
+                : '只删除不在当前账户列表里的持仓（换过主账户后留下的旧仓）。列表里的主账户不会动。不对交易所下单。'}
+            </p>
+            {purgeLoading ? (
+              <p className="hint">正在统计账户…</p>
+            ) : purgeErr || (purgeTarget === 'open' && purgePreview?.blocked) ? (
+              <p className="hint" style={{ color: 'var(--danger, #c0392b)' }}>
+                {purgeErr || purgePreview?.blocked}
+              </p>
+            ) : purgePreview && purgePreview.accounts.length > 0 ? (
+              <ul className="purge-account-list">
+                {purgePreview.accounts.map((a) => (
+                  <li key={a.accountGid || '__none__'}>
+                    <div>
+                      <div className="purge-account-name">{purgeAccountLabel(a)}</div>
+                      {a.accountGid ? (
+                        <div className="purge-account-gid">{a.accountGid}</div>
+                      ) : null}
+                    </div>
+                    <div className="purge-account-count">{a.count} 笔</div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="hint">
+                {purgeTarget === 'closed'
+                  ? '没有符合当前筛选的平仓记录。'
+                  : '账户列表外没有可删除的持仓。'}
+              </p>
+            )}
+            {purgePreview && purgePreview.total > 0 ? (
+              <p className="hint" style={{ marginTop: 0 }}>
+                合计 {purgePreview.accounts.length} 个账户，{purgePreview.total} 笔
+                {purgeTarget === 'closed' ? '。关联的佣金明细会一起删掉，已经入账的余额不退回。' : ''}
+              </p>
+            ) : null}
+            <div className="confirm-actions">
+              <button type="button" className="ghost" disabled={purgeBusy} onClick={closePurge}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="danger"
+                disabled={
+                  purgeBusy ||
+                  purgeLoading ||
+                  !purgePreview ||
+                  purgePreview.total <= 0 ||
+                  (purgeTarget === 'open' && !!purgePreview.blocked)
+                }
+                onClick={() => void confirmPurge()}
+              >
+                {purgeBusy ? '清理中…' : purgeTarget === 'closed' ? '确认删除' : '确认清理'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

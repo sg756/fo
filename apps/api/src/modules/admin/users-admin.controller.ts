@@ -26,6 +26,7 @@ import { JwtAuthGuard, RolesGuard } from '../../common/guards';
 import { CurrentUser, Roles } from '../../common/decorators';
 import { AuditService } from '../../common/audit.service';
 import { PointCardService } from './pointcard.service';
+import { WalletService } from '../deposit/wallet.service';
 
 class RejectDto {
   @IsOptional() @IsString() reason?: string;
@@ -70,6 +71,7 @@ export class UsersAdminController {
     private prisma: PrismaService,
     private audit: AuditService,
     private pointCard: PointCardService,
+    private wallets: WalletService,
   ) {}
 
   /** ???????????????? */
@@ -417,8 +419,16 @@ export class UsersAdminController {
       });
     }
 
+    await this.wallets.ensureEnabledChainWallets(user.id);
+    const wallets = await this.prisma.wallet.findMany({
+      where: { userId: user.id },
+      select: { id: true, chain: true, address: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
     return {
       ...user,
+      wallets,
       l1: user.parent,
       l2,
       directCount: user._count.children,
@@ -730,7 +740,7 @@ export class AdminsAdminController {
     const account = dto.account.trim();
     if (account.length < 6) throw new BadRequestException('???? 6 ?');
     const isEmailLike = account.includes('@');
-    const email = isEmailLike ? account.toLowerCase() : `${account.toLowerCase()}@admin.local`;
+    const email = account.toLowerCase();
     const nickname = (dto.nickname || (isEmailLike ? account.split('@')[0] : account)).trim();
 
     const exists = await this.prisma.admin.findFirst({

@@ -74,7 +74,7 @@ export function LoginPage() {
         <input
           value={email}
           onChange={(e) => setEmail(e.target.value)}
-          placeholder="邮箱 / 昵称 / 邮箱前缀"
+          placeholder="账号"
           autoComplete="username"
         />
         <label>密码</label>

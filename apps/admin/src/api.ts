@@ -377,17 +377,25 @@ export const AdminApi = {
   saveFollowTemplate: (body: {
     id?: string;
     name: string;
-    exchange: string;
-    accountGid: string;
-    accountName?: string;
+    allExchanges?: boolean;
+    exchanges?: string[];
+    allAccounts?: boolean;
+    accounts?: { accountGid: string; accountName?: string }[];
     unitAmount: number;
     maxPrincipal: number;
     minInvestAmount?: number;
     active?: boolean;
+    isGlobal?: boolean;
     remark?: string;
   }) => api('/admin/trade/follow-templates', { method: 'POST', body }),
   deleteFollowTemplate: (id: string) =>
     api(`/admin/trade/follow-templates/${id}`, { method: 'DELETE' }),
+  applyGlobalTemplate: (id: string) =>
+    api(`/admin/trade/follow-templates/${id}/apply`, { method: 'POST' }),
+  cancelGlobalTemplate: (id: string) =>
+    api(`/admin/trade/follow-templates/${id}/cancel-apply`, { method: 'POST' }),
+  setUserCustomTemplate: (enabled: boolean) =>
+    api('/admin/trade/follower/user-custom-template', { method: 'POST', body: { enabled } }),
   followLogs: (params?: {
     status?: string;
     exchange?: string;
@@ -424,6 +432,18 @@ export const AdminApi = {
     return api<{ items: any[]; total: number }>(`/admin/trade/follow-logs?${p}`);
   },
   followLogStats: () => api('/admin/trade/follow-logs/stats'),
+  resetTrackingStats: (range: '1m' | '3m' | 'all') =>
+    api<{
+      ok: boolean;
+      range: string;
+      cutoff: string | null;
+      deleted: { logs: number; profits: number; commissions: number };
+    }>('/admin/trade/stats-reset', { method: 'POST', body: { range } }),
+  resetFundFlow: (range: '1m' | '3m' | 'all') =>
+    api<{ ok: boolean; range: string; cutoff: string | null; deleted: number }>(
+      '/admin/trade/fund-flow-reset',
+      { method: 'POST', body: { range } },
+    ),
   purgeFollowLogs: (body: {
     mode: 'all' | 'range' | 'ids';
     from?: string;
@@ -438,7 +458,7 @@ export const AdminApi = {
     exchange?: string;
     q?: string;
     userId?: string;
-    readyOnly?: boolean;
+    ready?: 'ready' | 'blocked' | 'all';
     skip?: number;
     take?: number;
   }) => {
@@ -446,7 +466,7 @@ export const AdminApi = {
     if (params?.exchange) p.set('exchange', params.exchange);
     if (params?.q) p.set('q', params.q);
     if (params?.userId) p.set('userId', params.userId);
-    if (params?.readyOnly != null) p.set('readyOnly', params.readyOnly ? '1' : '0');
+    if (params?.ready) p.set('ready', params.ready);
     if (params?.skip != null) p.set('skip', String(params.skip));
     if (params?.take != null) p.set('take', String(params.take));
     const qs = p.toString();
@@ -454,7 +474,8 @@ export const AdminApi = {
       items: any[];
       total: number;
       openMinPointBalance: number;
-      readyOnly: boolean;
+      ready?: 'ready' | 'blocked' | 'all';
+      readyOnly?: boolean;
     }>(`/admin/trade/followers${qs ? `?${qs}` : ''}`);
   },
   /** 管理端持仓列表（本地 user_positions；status=OPEN|CLOSED；
@@ -510,6 +531,7 @@ export const AdminApi = {
     coinName: string;
     equalCoinName?: string;
     positionSide?: string;
+    apiCode?: string;
   }) => {
     const p = new URLSearchParams();
     p.set('userId', params.userId);
@@ -517,6 +539,7 @@ export const AdminApi = {
     p.set('coinName', params.coinName);
     if (params.equalCoinName) p.set('equalCoinName', params.equalCoinName);
     if (params.positionSide) p.set('positionSide', params.positionSide);
+    if (params.apiCode) p.set('apiCode', params.apiCode);
     return api<{
       orderId: string | null;
       orderIds: string[];
@@ -563,6 +586,7 @@ export const AdminApi = {
     equalCoinName?: string;
     symbol?: string;
     accountType?: string;
+    apiCode?: string;
     accountGid?: string;
     accountName?: string;
     leverage?: number | string;
@@ -578,6 +602,70 @@ export const AdminApi = {
       method: 'POST',
       body: { ids },
     }),
+  /** 清理持仓预览：选了主账户只列该账户，否则列出全部仍有未平仓的主账户 */
+  previewPurgePositions: (accountGid?: string) =>
+    api<{
+      accountGid: string | null;
+      scope: 'account' | 'outside';
+      accounts: { accountGid: string; accountName: string; count: number }[];
+      total: number;
+      blocked?: string | null;
+    }>('/admin/trade/positions/purge-preview', {
+      method: 'POST',
+      body: accountGid ? { accountGid } : {},
+    }),
+  /** 按主账户把本地未平仓标为死仓，不对交易所下单 */
+  purgePositions: (accountGid?: string) =>
+    api<{
+      ok: boolean;
+      discarded: number;
+      total: number;
+      accounts: { accountGid: string; accountName: string; count: number }[];
+      blocked?: string | null;
+    }>('/admin/trade/positions/purge', {
+      method: 'POST',
+      body: accountGid ? { accountGid } : {},
+    }),
+  /** 已平仓：按筛选预览将删除的账户与笔数。条件为空表示不限制 */
+  previewClearClosed: (body: {
+    accountGid?: string;
+    userId?: string;
+    q?: string;
+    exchange?: string;
+    coinName?: string;
+    period?: string;
+    closedKind?: string;
+    recordId?: string;
+    from?: string;
+    to?: string;
+  }) =>
+    api<{
+      accounts: { accountGid: string; accountName: string; count: number }[];
+      total: number;
+      profitCount: number;
+      discardCount: number;
+    }>('/admin/trade/positions/clear-closed-preview', { method: 'POST', body }),
+  /** 按同样筛选删除已平仓记录 */
+  clearClosedRecords: (body: {
+    accountGid?: string;
+    userId?: string;
+    q?: string;
+    exchange?: string;
+    coinName?: string;
+    period?: string;
+    closedKind?: string;
+    recordId?: string;
+    from?: string;
+    to?: string;
+  }) =>
+    api<{
+      ok: boolean;
+      deleted: number;
+      profitDeleted: number;
+      discardDeleted: number;
+      total: number;
+      accounts: { accountGid: string; accountName: string; count: number }[];
+    }>('/admin/trade/positions/clear-closed', { method: 'POST', body }),
   followerSignals: () => api('/admin/trade/follower/signals'),
   runOnce: () => api('/admin/trade/follower/run-once', { method: 'POST', body: {} }),
   syncFills: () => api('/admin/trade/follower/sync-fills', { method: 'POST', body: {} }),
@@ -804,9 +892,15 @@ export const AdminApi = {
     api(`/admin/wallet/collection-gas-wallets/${id}/select-collection`, { method: 'POST', body: {} }),
   transferCollectionGasWallet: (
     id: string,
-    body: { token: 'USDT' | 'ETH'; toAddress: string; amount: number; totpCode: string },
+    body: {
+      token: 'USDT' | 'ETH' | 'BNB';
+      toAddress: string;
+      amount: number;
+      totpCode: string;
+      chain?: string;
+    },
   ) => api(`/admin/wallet/collection-gas-wallets/${id}/transfer`, { method: 'POST', body }),
-  fundCollectionGas: (body?: { chain?: string; walletIds?: string[] }) =>
+  fundCollectionGas: (body?: { chain?: string; chains?: string[]; walletIds?: string[] }) =>
     api('/admin/wallet/collection/fund-gas', { method: 'POST', body: body || {} }),
   collectionGasFeeTier: () =>
     api<{ gasFeeTier: 'standard' | 'fast' }>('/admin/wallet/collection/gas-fee-tier'),
@@ -849,8 +943,10 @@ export const AdminApi = {
     );
   },
   collectionStatus: () => api('/admin/wallet/collection/status'),
+  setCollectionAuto: (enabled: boolean) =>
+    api('/admin/wallet/collection/auto', { method: 'POST', body: { enabled } }),
   runCollection: (chain?: string) =>
-    api('/admin/wallet/collection/run', { method: 'POST', body: { chain } }),
+    api('/admin/wallet/collection/run', { method: 'POST', body: chain ? { chain } : {} }),
   walletsWithBalance: (
     chain?: string,
     q?: string,
@@ -1044,6 +1140,8 @@ export const AdminApi = {
         signalKey: string | null;
         coinName: string | null;
         equalCoinName: string | null;
+        accountType?: string | null;
+        apiCode?: string | null;
         positionSide: string | null;
         filledAmt: string | null;
         consumedAmt: string | null;
@@ -1058,6 +1156,9 @@ export const AdminApi = {
         status: string;
         orderId: string | null;
         coinName: string | null;
+        equalCoinName?: string | null;
+        accountType?: string | null;
+        apiCode?: string | null;
         filledAmt: string | null;
         consumedAmt: string | null;
         avgPrice: string | null;
@@ -1165,14 +1266,24 @@ export const AdminApi = {
       syncErrorStatus?: number | null;
     }>('/admin/ip-pool/capacity'),
   ipPoolConfig: () =>
-    api<{ usersPerProxy: number; idleNoFillDays: number; idleFollowOffDays: number }>(
-      '/admin/ip-pool/config',
-    ),
+    api<{
+      usersPerProxy: number;
+      idleNoFillDays: number;
+      idleFollowOffDays: number;
+      probeEnabled: boolean;
+    }>('/admin/ip-pool/config'),
   setIpPoolConfig: (body: {
     usersPerProxy?: number;
     idleNoFillDays?: number;
     idleFollowOffDays?: number;
+    probeEnabled?: boolean;
   }) => api('/admin/ip-pool/config', { method: 'POST', body }),
+  appDownloadUrl: () => api<{ url: string; h5Url: string }>('/admin/ip-pool/app-download'),
+  setAppDownloadUrl: (url: string, h5Url = '') =>
+    api<{ url: string; h5Url: string }>('/admin/ip-pool/app-download', {
+      method: 'POST',
+      body: { url, h5Url },
+    }),
   reclaimIdleProxies: () =>
     api<{ reclaimed: number; details: any[] }>('/admin/ip-pool/reclaim-idle', {
       method: 'POST',
@@ -1214,8 +1325,13 @@ export const AdminApi = {
     api('/admin/ip-pool/assign', { method: 'POST', body: { userId, proxyId, reason } }),
   clearProxyAssign: (userId: string) =>
     api(`/admin/ip-pool/assign/${userId}`, { method: 'DELETE' }),
-  evacuateProxy: (id: string, toProxyId?: string) =>
-    api(`/admin/ip-pool/${id}/evacuate`, { method: 'POST', body: { toProxyId } }),
+  evacuateProxy: (id: string, count: number, toProxyId?: string) =>
+    api<{ movedUsers: number; pausedUsers: number }>(`/admin/ip-pool/${id}/evacuate`, {
+      method: 'POST',
+      body: { count, toProxyId },
+    }),
+  restoreProxyHealth: (id: string) =>
+    api(`/admin/ip-pool/${id}/restore-health`, { method: 'POST' }),
   cleanupInactiveProxies: () =>
     api<{
       inactiveFound: number;
@@ -1224,6 +1340,11 @@ export const AdminApi = {
       pausedUsers: number;
       details: any[];
     }>('/admin/ip-pool/cleanup-inactive', { method: 'POST' }),
+  rebindUnassignedProxies: () =>
+    api<{ rebound: number; reboundOrphans: number; reboundPaused: number }>(
+      '/admin/ip-pool/rebind-unassigned',
+      { method: 'POST' },
+    ),
 
   exchangeKeys: (params?: { userId?: string; q?: string; skip?: number; take?: number }) => {
     const p = new URLSearchParams();

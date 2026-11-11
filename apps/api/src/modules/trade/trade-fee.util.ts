@@ -6,13 +6,21 @@
  *   市价（含市价开和平、现价追入、对账/手动市价平）→ 官方市价档（taker 列）
  *   委托/限价 → 官方委托档（maker 列）
  *
- * 核对日期 2026-09-14，来源为各所官方帮助/费率页 Regular·VIP0。
- * 只覆盖普通现货、普通 U 本位加密永续；不含 VIP、BNB/OKB 抵扣、TradFi Perps、活动档。
- *   Binance 合约 委托 0.020% / 市价 0.050%；现货 0.100% / 0.100%
- *   OKX     合约 委托 0.020% / 市价 0.050%；现货 0.080% / 0.100%
- *   Bybit   合约 委托 0.020% / 市价 0.055%；现货 0.100% / 0.100%
- *   Bitget  合约 委托 0.020% / 市价 0.060%；现货 0.100% / 0.100%
- *   Gate    合约 委托 0.020% / 市价 0.050%；现货 0.100% / 0.100%
+ * 前五所核对日期 2026-09-14；后七所 2026-10-13。来源为各所官方 Regular / VIP0 / Tier0，
+ * 不含 VIP、平台币抵扣、质押折扣、TradFi / RWA、活动档。
+ *   Binance      合约 0.020% / 0.050%；现货 0.100% / 0.100%
+ *   OKX          合约 0.020% / 0.050%；现货 0.080% / 0.100%
+ *   Bybit        合约 0.020% / 0.055%；现货 0.100% / 0.100%
+ *   Bitget       合约 0.020% / 0.060%；现货 0.100% / 0.100%
+ *   Gate         合约 0.020% / 0.050%；现货 0.100% / 0.100%
+ *   火必 HTX     Prime0，不吃 HTX 抵扣。现货 0.200% / 0.200%；U 本位合约 0.020% / 0.060%
+ *   KuCoin       VIP0。现货 Class A 0.100% / 0.100%；合约 0.020% / 0.060%
+ *   HyperLiquid  Tier 0，不吃质押折扣。合约 0.015% / 0.045%；现货 0.040% / 0.070%
+ *   Backpack     Tier 1（0 质押、0 成交额）。合约 0.020% / 0.050%；现货 0.080% / 0.100%
+ *   Aster        普通加密。合约挂单 0、市价 0.040%；现货 0.005% / 0.040%
+ *   Lighter      Standard 账户，合约和现货都是 0 / 0（Plus、Premium 不采用）
+ *   HashKey      香港站 2026-08-01 的 VIP0 表只在公告图片里，正文没有数字，附件读不到。
+ *                下面两行仍是占位，不是官方档，也不要用百慕大 Global 的 0.120% / 0.025% / 0.060%。
  */
 
 import { Exchange } from '@prisma/client';
@@ -30,6 +38,14 @@ export const DEFAULT_FUTURES_FEE: Record<Exchange, UserFeeRates> = {
   BYBIT: { maker: 0.0002, taker: 0.00055 },
   BITGET: { maker: 0.0002, taker: 0.0006 },
   GATE: { maker: 0.0002, taker: 0.0005 },
+  HUOBI: { maker: 0.0002, taker: 0.0006 },
+  KUCOIN: { maker: 0.0002, taker: 0.0006 },
+  HYPERLIQUID: { maker: 0.00015, taker: 0.00045 },
+  // 香港站没有合约；官方 VIP0 表读不到，此行只为补齐类型
+  HASHKEY: { maker: 0.0002, taker: 0.0005 },
+  BACKPACK: { maker: 0.0002, taker: 0.0005 },
+  ASTER: { maker: 0, taker: 0.0004 },
+  LIGHTER: { maker: 0, taker: 0 },
 };
 
 /** 现货 Regular / VIP0（与合约分表，不能混用） */
@@ -39,6 +55,14 @@ export const DEFAULT_SPOT_FEE: Record<Exchange, UserFeeRates> = {
   BYBIT: { maker: 0.001, taker: 0.001 },
   BITGET: { maker: 0.001, taker: 0.001 },
   GATE: { maker: 0.001, taker: 0.001 },
+  HUOBI: { maker: 0.002, taker: 0.002 },
+  KUCOIN: { maker: 0.001, taker: 0.001 },
+  HYPERLIQUID: { maker: 0.0004, taker: 0.0007 },
+  // 香港站现货 VIP0 官方表读不到，此行仍是占位
+  HASHKEY: { maker: 0.001, taker: 0.001 },
+  BACKPACK: { maker: 0.0008, taker: 0.001 },
+  ASTER: { maker: 0.00005, taker: 0.0004 },
+  LIGHTER: { maker: 0, taker: 0 },
 };
 
 export function defaultFeeRates(

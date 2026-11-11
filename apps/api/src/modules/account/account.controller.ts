@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { IsNumber, IsOptional, IsString, Min } from 'class-validator';
 import { PointTxType, Prisma, UserStatus } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -9,6 +9,8 @@ import { WalletService } from '../deposit/wallet.service';
 import { DepositService } from '../deposit/deposit.service';
 import { DepositChain, depositNetworkOptions, resolveDepositChain } from '../deposit/chain.config';
 import { allocUniqueInviteCode, isNumericInviteCode } from '../../common/invite-code';
+import { PointAlertService } from './point-alert.service';
+import { NoticeService } from './notice.service';
 
 class WithdrawDto {
   @IsNumber() @Min(0.0001) amount: number;
@@ -20,6 +22,11 @@ class WithdrawAddressDto {
   @IsOptional() @IsString() label?: string;
 }
 
+class PushTokenDto {
+  @IsString() token: string;
+  @IsOptional() @IsString() platform?: string;
+}
+
 @UseGuards(JwtAuthGuard)
 @Controller('account')
 export class AccountController {
@@ -28,13 +35,82 @@ export class AccountController {
     private withdraw: WithdrawService,
     private wallets: WalletService,
     private deposit: DepositService,
+    private pointAlert: PointAlertService,
+    private notices: NoticeService,
   ) {}
+
+  /** App 上报 Expo 推送令牌。登录后调用，换号会改挂到当前用户 */
+  @Post('push-token')
+  registerPushToken(@CurrentUser('sub') userId: string, @Body() dto: PushTokenDto) {
+    return this.pointAlert.registerToken(userId, dto.token, dto.platform || '');
+  }
+
+  /** 退出登录时卸下这台设备的推送令牌 */
+  @Delete('push-token')
+  removePushToken(@CurrentUser('sub') userId: string, @Body() dto: PushTokenDto) {
+    return this.pointAlert.removeToken(userId, dto.token);
+  }
+
+  /** 站内消息。登录满 1 天仍未点开的旧消息会在这里标成已读 */
+  @Get('notices')
+  noticesList(@CurrentUser('sub') userId: string) {
+    return this.notices.list(userId);
+  }
+
+  @Get('notices/unread-count')
+  noticeUnread(@CurrentUser('sub') userId: string) {
+    return this.notices.unreadCount(userId);
+  }
+
+  @Post('notices/:id/read')
+  noticeRead(@CurrentUser('sub') userId: string, @Param('id') id: string) {
+    return this.notices.markRead(userId, id);
+  }
 
   @Get('point-card')
   async pointCard(@CurrentUser('sub') userId: string) {
     const card =
       (await this.prisma.pointCard.findUnique({ where: { userId } })) ??
       (await this.prisma.pointCard.create({ data: { userId } }));
+
+    const [withdrawByStatus, rechargeAgg] = await Promise.all([
+      this.prisma.withdrawRequest.groupBy({
+        by: ['status'],
+        where: {
+          userId,
+          status: { in: ['PENDING', 'APPROVED', 'SETTLED', 'RELEASED'] },
+        },
+        _sum: { amount: true, fee: true },
+      }),
+      this.prisma.rechargeOrder.aggregate({
+        where: { userId, status: 'CREDITED' },
+        _sum: { amount: true },
+      }),
+    ]);
+
+    const withdrawSum = (statuses: string[]) =>
+      withdrawByStatus
+        .filter((row) => statuses.includes(row.status))
+        .reduce(
+          (n, row) => n + Number(row._sum.amount ?? 0) + Number(row._sum.fee ?? 0),
+          0,
+        );
+
+    const withdrawn = withdrawSum(['PENDING', 'APPROVED', 'SETTLED', 'RELEASED']);
+    let earned = Number(card.commissionEarned);
+    if (!Number.isFinite(earned) || earned <= 0) {
+      const baseline = Number(card.commissionBalance) + withdrawn;
+      if (baseline > 0) {
+        await this.prisma.pointCard.update({
+          where: { userId },
+          data: { commissionEarned: baseline },
+        });
+        earned = baseline;
+      } else {
+        earned = 0;
+      }
+    }
+
     return {
       balance: card.balance,
       frozen: card.frozen,
@@ -42,6 +118,12 @@ export class AccountController {
       commissionFrozen: card.commissionFrozen,
       /** 可提现余额 = 可用佣金（点卡不可提） */
       withdrawable: card.commissionBalance,
+      commissionPending: withdrawSum(['PENDING']),
+      commissionClaimed: withdrawSum(['APPROVED', 'SETTLED', 'RELEASED']),
+      /** 累计佣金：点卡字段 commissionEarned，分润入账累加、提现不扣 */
+      commissionTotal: earned,
+      commissionEarned: earned,
+      rechargeTotal: Number(rechargeAgg._sum.amount ?? 0),
     };
   }
 
@@ -100,6 +182,7 @@ export class AccountController {
     @Query('chain') chain?: string,
   ) {
     const useChain = resolveDepositChain(chain);
+    await this.wallets.ensureEnabledChainWallets(userId, { createIfMissing: true });
     const wallet = await this.wallets.ensureUserWallet(userId, useChain);
     return {
       chain: wallet.chain,

@@ -125,9 +125,9 @@ export interface QueryPositionItem {
   positionAmt?: number | string;
   liquidationPrice?: number | string;
   risk?: number | string;
+  /** 实盘：0=做多 1=做空（勿与下单 PositionSide 混用） */
   holdType?: number | string;
   holdTypeName?: string;
-  positionSide?: string;
   accountType?: string;
   /** 部分实现会回 isolatedMargin / initialMargin / margin */
   margin?: number | string;

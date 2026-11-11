@@ -4,7 +4,6 @@ import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, View
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { ScreenHeader } from '../components/ScreenHeader';
-import { PrimaryButton } from '../components/StatTile';
 import { FollowConfigSection } from '../components/FollowConfigSection';
 import { ExchangeKeyApi, ExchangeKeyItem, IpWhitelist, IpWhitelistApi } from '../api/endpoints';
 import { EXCHANGES } from '../api/exchanges';
@@ -58,7 +57,7 @@ export function TradeSettingsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
-      <ScreenHeader title="交易设置" onBack={() => navigation.goBack()} />
+      <ScreenHeader title="合约设置" onBack={() => navigation.goBack()} />
       <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }}>
         <Text style={[styles.sectionTitle, { color: theme.text }]}>交易所 API Key</Text>
         <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
@@ -157,12 +156,8 @@ export function TradeSettingsScreen() {
           </>
         )}
 
-        <Text style={[styles.sectionTitle, { color: theme.text, marginTop: 20 }]}>跟单本金与模板</Text>
+        <Text style={[styles.sectionTitle, { color: theme.text, marginTop: 20 }]}>合约模板</Text>
         <FollowConfigSection />
-
-        <View style={{ marginTop: 24 }}>
-          <PrimaryButton title="前往开始交易" onPress={() => navigation.navigate('StartTrading')} />
-        </View>
       </ScrollView>
 
       <Modal visible={copyOpen} transparent animationType="fade" onRequestClose={() => setCopyOpen(false)}>

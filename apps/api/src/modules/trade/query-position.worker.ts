@@ -150,7 +150,7 @@ export class QueryPositionWorker implements OnModuleInit, OnModuleDestroy {
     cooldown: number;
     noOpen: number;
   }> {
-    let targets = await this.trade.listOpenQueryPositionTargets(opts.userId);
+    let targets = await this.trade.listQueryPositionAlignTargets(opts.userId);
     if (opts.exchange) {
       targets = targets.filter((t) => t.exchange === opts.exchange);
     }
@@ -220,6 +220,7 @@ export class QueryPositionWorker implements OnModuleInit, OnModuleDestroy {
           const res = await this.trade.syncLocalPositionsFromQueryPosition(
             job.userId,
             job.exchange,
+            { writePostLog: job.reason === 'manual' },
           );
           const skipHit =
             res.skipped === 'pending-orders' || res.skipped === 'no-open';

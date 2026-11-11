@@ -122,7 +122,7 @@ export function MarketScreen() {
           />
         }
       >
-        {hint ? (
+        {hint && list.length === 0 ? (
           <Text style={{ color: theme.warning, fontSize: 12, marginBottom: 10 }}>{hint}</Text>
         ) : null}
         {loading && list.length === 0 ? (

@@ -58,10 +58,25 @@ export function DashboardPage() {
   const f = data?.follow || {};
   const funds = data?.funds || {};
   const p = data?.profit || {};
+  const tpl = data?.followTemplate;
 
   return (
     <div className="dashboard-page">
       {err ? <p className="err">{err}</p> : null}
+
+      {tpl && tpl.ready === false ? (
+        <div className="dashboard-alert" role="status">
+          {tpl.globalCreated
+            ? `全局模板「${tpl.globalName || '未命名'}」还没应用，合约信号配置里的「用户自选模板」也没勾选。`
+            : '还没有创建并应用全局模板，合约信号配置里的「用户自选模板」也没勾选。'}
+          请到
+          <Link to="/trade/templates">合约信号模板</Link>
+          {tpl.globalCreated ? '点「应用」' : '创建全局模板并点「应用」'}
+          ，或到
+          <Link to="/trade/config">合约信号配置</Link>
+          勾选「用户自选模板」。
+        </div>
+      ) : null}
 
       <h3>待办提醒</h3>
       <div className="grid">
@@ -92,10 +107,10 @@ export function DashboardPage() {
         <Stat label="今日新增" value={u.todayNew} />
       </div>
 
-      <h3>跟单</h3>
+      <h3>合约</h3>
       <div className="grid">
-        <Stat label="开启跟单用户" value={f.enabled} accent="green" to="/trade/followers?readyOnly=0" />
-        <Stat label="今日跟单笔数" value={f.todayFollows} />
+        <Stat label="开启合约用户" value={f.enabled} accent="green" to="/trade/followers?readyOnly=0" />
+        <Stat label="今日合约笔数" value={f.todayFollows} />
         <Stat label="累计成交" value={f.filled} accent="green" to="/trade/order-logs?status=FILLED" />
         <Stat label="累计失败" value={f.failed} accent={f.failed ? 'red' : undefined} to="/trade/order-logs?status=FAILED" />
         <Stat label="撤单失败" value={f.cancelFailed} accent={f.cancelFailed ? 'red' : undefined} to="/trade/order-logs?status=CANCEL_FAILED" />

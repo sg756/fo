@@ -35,6 +35,12 @@ export type PointCard = {
   commissionBalance?: string;
   commissionFrozen?: string;
   withdrawable?: string;
+  commissionPending?: number | string;
+  commissionClaimed?: number | string;
+  /** 累计佣金（点卡 commissionEarned，分润入账累加、提现不扣，不依赖流水） */
+  commissionTotal?: number | string;
+  commissionEarned?: number | string;
+  rechargeTotal?: number | string;
 };
 
 export type PointTx = {
@@ -160,6 +166,17 @@ export const AuthApi = {
 // ===== account =====
 export const AccountApi = {
   pointCard: () => api<PointCard>('/account/point-card'),
+  registerPushToken: (body: { token: string; platform: string }) =>
+    api<{ ok: boolean }>('/account/push-token', { method: 'POST', body }),
+  removePushToken: (token: string) =>
+    api<{ ok: boolean }>('/account/push-token', { method: 'DELETE', body: { token } }),
+  notices: () =>
+    api<{
+      unread: number;
+      items: { id: string; title: string; body: string; kind: string; read: boolean; createdAt: string }[];
+    }>('/account/notices'),
+  noticeUnread: () => api<{ unread: number }>('/account/notices/unread-count'),
+  noticeRead: (id: string) => api<{ ok: boolean }>(`/account/notices/${id}/read`, { method: 'POST' }),
   txs: (
     skip = 0,
     take = 50,
@@ -249,6 +266,8 @@ export type TradePosition = {
   pair: string;
   coinName?: string | null;
   equalCoinName?: string | null;
+  apiCode?: string | null;
+  accountType?: string | null;
   mode: string;
   side: 'long' | 'short' | string;
   amount: string;
@@ -314,7 +333,7 @@ export type TradeChecklist = {
   /** 同 pointEnough */
   canOpenFollow?: boolean;
   pointGateMessage?: string | null;
-  /** 是否已配置至少一所：模板 + 声明本金 */
+  /** 是否已配置至少一所合约模板 */
   followConfigReady?: boolean;
   followConfigCount?: number;
   followConfigHint?: string;
@@ -328,6 +347,8 @@ export type FollowTemplateOption = {
   maxPrincipal: number;
   minInvestAmount?: number;
   accountName?: string | null;
+  /** 绑定的中间件账户已删除或已切换 */
+  accountStale?: boolean;
   remark?: string | null;
 };
 
@@ -365,9 +386,9 @@ export type HomeSummary = {
   commission: string;
   /** 可领/可提佣金 */
   commissionClaimable?: string;
-  /** 待审佣金（提现冻结） */
+  /** 待审佣金（已申请、审核中的提现） */
   commissionPending?: string;
-  /** 已领佣金（累计入账 − 可领 − 待审，即已提现结算） */
+  /** 已领佣金（审核通过的提现，含已打款；未领取则为 0） */
   commissionClaimed?: string;
   assets: {
     symbol: string;
@@ -454,8 +475,9 @@ export const TradeApi = {
       ready: boolean;
       configuredCount: number;
       hint: string;
+      templateMode?: 'global' | 'custom';
     }>('/trade/follow-configs'),
-  saveFollowConfig: (body: { exchange: ExchangeCode; templateId: string; investAmount: number }) =>
+  saveFollowConfig: (body: { exchange: ExchangeCode; templateId: string }) =>
     api('/trade/follow-configs', { method: 'POST', body }),
   deleteFollowConfig: (exchange: ExchangeCode) =>
     api(`/trade/follow-configs/${exchange}`, { method: 'DELETE' }),

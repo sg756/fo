@@ -42,6 +42,108 @@ export function marketPeriodLabel(row: {
   return row.accountType || '—';
 }
 
+/** apiCode → 产品。结算币和周期分开，不能只看 equalCoinName。 */
+const API_CODE_KIND: Record<string, string> = {
+  ba: 'spot',
+  bac: 'usdt-perp',
+  bab: 'usdc-perp',
+  bap: 'coin-perp',
+  bas: 'coin-delivery',
+  ok: 'spot',
+  okp: 'usdt-perp',
+  oks: 'coin-perp',
+  oku: 'usdt-delivery',
+  okc: 'coin-delivery',
+  bg: 'spot',
+  bgu: 'usdt-perp',
+  bgc: 'usdc-perp',
+  by: 'spot',
+  byu: 'usdt-perp',
+  byp: 'usdc-perp',
+  gt: 'spot',
+  gs: 'stock-spot',
+  gtc: 'usdt-perp',
+  hb: 'spot',
+  hbp: 'usdt-perp',
+  kc: 'spot',
+  kcp: 'usdt-perp',
+  kcc: 'usdc-perp',
+  hpc: 'usdc-perp',
+  hk: 'spot',
+  bp: 'spot',
+  bpc: 'usdc-perp',
+  at: 'spot',
+  atc: 'usdt-perp',
+  ltc: 'usdc-perp',
+};
+
+type QuotePeriodRow = {
+  accountType?: string | null;
+  equalCoinName?: string | null;
+  apiCode?: string | null;
+  requestBody?: string | null;
+};
+
+function readRequestBody(row: QuotePeriodRow): Record<string, unknown> {
+  const raw = row.requestBody;
+  if (!raw) return {};
+  if (typeof raw === 'object') return raw as Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function rowApiCode(row: QuotePeriodRow): string {
+  const direct = String(row.apiCode || '').trim().toLowerCase();
+  if (direct) return direct;
+  return String(readRequestBody(row).apiCode || '').trim().toLowerCase();
+}
+
+function rowEqualCoin(row: QuotePeriodRow): string {
+  const direct = String(row.equalCoinName || '').trim().toUpperCase();
+  if (direct) return direct;
+  return String(readRequestBody(row).equalCoinName || '').trim().toUpperCase();
+}
+
+function rowAccountType(row: QuotePeriodRow): string {
+  const direct = String(row.accountType || '').trim().toLowerCase();
+  if (direct) return direct;
+  return String(readRequestBody(row).accountType || '').trim().toLowerCase();
+}
+
+function isFutureAccount(accountType: string): boolean {
+  return accountType === 'future' || accountType === 'futures' || accountType === 'swap' || accountType === 'perp' || accountType === 'perpetual';
+}
+
+/** 结算币：USDT / USDC / 币本位。现货用计价币。合约不能从 PC 猜。 */
+export function settlementCoinLabel(row: QuotePeriodRow): string {
+  const kind = API_CODE_KIND[rowApiCode(row)] || '';
+  const eq = rowEqualCoin(row);
+  if (kind === 'usdt-perp' || kind === 'usdt-delivery') return 'USDT';
+  if (kind === 'usdc-perp') return 'USDC';
+  if (kind === 'coin-perp' || kind === 'coin-delivery') return '币本位';
+  if (kind === 'spot' || kind === 'stock-spot') return eq || '—';
+  const at = rowAccountType(row);
+  if (at === 'spot' || SPOT_QUOTES.has(eq)) return eq || '—';
+  return '—';
+}
+
+/** 周期：现货 / 永续 / 交割。交割带周期码。 */
+export function contractPeriodLabel(row: QuotePeriodRow): string {
+  const kind = API_CODE_KIND[rowApiCode(row)] || '';
+  const eq = rowEqualCoin(row);
+  const at = rowAccountType(row);
+  if (kind === 'spot' || kind === 'stock-spot' || at === 'spot' || SPOT_QUOTES.has(eq)) return '现货';
+  if (kind === 'usdt-perp' || kind === 'usdc-perp' || kind === 'coin-perp' || eq === 'PC') return '永续';
+  if (kind === 'usdt-delivery' || kind === 'coin-delivery' || isFutureAccount(at)) {
+    return eq && eq !== 'PC' ? `交割(${eq})` : '交割';
+  }
+  return '—';
+}
+
 export function useCoinOptions() {
   const [options, setOptions] = useState<SearchSelectOption[]>([]);
   useEffect(() => {

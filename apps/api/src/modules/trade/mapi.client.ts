@@ -1,7 +1,8 @@
 import * as crypto from 'crypto';
-import { BadRequestException, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, OnModuleDestroy, forwardRef } from '@nestjs/common';
 import { Exchange } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { IpPoolService } from '../ippool/ippool.service';
 import { PostLogService } from '../postlog/postlog.service';
 import { runMapiOffload, shouldOffloadMapiPath, stopMapiOffload } from './mapi-offload';
 import {
@@ -22,6 +23,10 @@ export type MapiRequestOptions = {
   skipLog?: boolean;
   /** true=仅失败时写日志 */
   logFailOnly?: boolean;
+  /** true=不计入代理连续传输失败，也不因此迁人 */
+  skipProxyHealth?: boolean;
+  /** 工作线程通道。probe 与盘口、跟单信号互不排队 */
+  offloadLane?: 'heavy' | 'signal' | 'probe';
   /**
    * 在 worker_threads 里 fetch + JSON.parse。
    * 大包（GetDepth / CryptoSymbolList / MultiAccountList / PublicHttpProxyList）走 heavy 线程；
@@ -60,6 +65,7 @@ export class MapiClient implements OnModuleDestroy {
   constructor(
     private postLog: PostLogService,
     private prisma: PrismaService,
+    @Inject(forwardRef(() => IpPoolService)) private ipPool: IpPoolService,
   ) {}
 
   async onModuleDestroy() {
@@ -333,6 +339,7 @@ export class MapiClient implements OnModuleDestroy {
               : undefined,
           timeoutMs: params.timeoutMs,
           compact: params.opts.offloadCompact === 'depth-mids' ? 'depth-mids' : null,
+          lane: params.opts.offloadLane,
         });
         if (!off.ok) {
           const err = new Error(off.error || 'mapi 工作线程请求失败');
@@ -389,6 +396,8 @@ export class MapiClient implements OnModuleDestroy {
     /** 始终尽量保留「源 body」写入 PostLog：原始回包，或联不通时的错误对象 */
     let responseBody: any = null;
     let success = false;
+    /** 超时或连不上：没拿到中间件 HTTP 回包。业务拒单不算。 */
+    let transportFault = false;
 
     // 下单/请求超时 (毫秒), 默认 15s；大包 offload 另用 MAPI_OFFLOAD_TIMEOUT_MS
     const baseTimeoutMs = Number(process.env.TRADE_REQUEST_TIMEOUT_MS || 15000);
@@ -461,6 +470,7 @@ export class MapiClient implements OnModuleDestroy {
           : e?.message || String(e);
       if (!(e instanceof MapiRequestError)) {
         // 联不通 / 超时 / DNS 等：无 HTTP 回包，也要记一条可查的源记录
+        transportFault = true;
         responseBody = {
           error: msg,
           url,
@@ -471,6 +481,9 @@ export class MapiClient implements OnModuleDestroy {
           responseBody,
           url,
         });
+      }
+      if (e.responseBody?.transport === true || !(Number(e.statusCode) > 0)) {
+        transportFault = true;
       }
       // 保证 finally 落库用的是错误上的源 body（避免仍为 null）
       if (e.responseBody != null) {
@@ -484,6 +497,10 @@ export class MapiClient implements OnModuleDestroy {
       const latencyMs = Date.now() - started;
       const writeLog =
         !opts.skipLog && (!opts.logFailOnly || !success);
+      const proxyAddress = String(opts.proxyIp || '').trim();
+      if (proxyAddress && !opts.skipProxyHealth) {
+        this.ipPool.noteProxyTransport(proxyAddress, !transportFault);
+      }
       if (writeLog) {
         await this.postLog
           .record({
@@ -513,5 +530,28 @@ export class MapiClient implements OnModuleDestroy {
 
   post<T = any>(path: string, body: any, opts?: MapiRequestOptions) {
     return this.request<T>('POST', path, body, opts);
+  }
+
+  /**
+   * 代理探活。拿到 HTTP 回包即为 true（含业务 errorMsg、持仓为空）。
+   * 超时或连不上为 false。不写 PostLog，不计入传输失败。
+   */
+  async probeReached(path: string, body: any): Promise<boolean> {
+    try {
+      await this.post(path, body, {
+        skipLog: true,
+        skipProxyHealth: true,
+        offload: true,
+        offloadLane: 'probe',
+        feature: '代理探测',
+      });
+      return true;
+    } catch (e) {
+      if (e instanceof MapiRequestError) {
+        const transport = e.responseBody?.transport === true || !(Number(e.statusCode) > 0);
+        return !transport;
+      }
+      return false;
+    }
   }
 }

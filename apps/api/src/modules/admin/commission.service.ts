@@ -344,8 +344,16 @@ export class CommissionService {
     createdAt: Date;
     accountGid: string | null;
     accountName: string | null;
+    accountType?: string | null;
+    requestBody?: string | null;
     fillKind?: string;
   }) {
+    let apiCode: string | null = null;
+    try {
+      apiCode = String(JSON.parse(log.requestBody || '{}').apiCode || '').trim().toLowerCase() || null;
+    } catch {
+      apiCode = null;
+    }
     return {
       id: log.id,
       status: log.status,
@@ -355,6 +363,8 @@ export class CommissionService {
       signalKey: log.signalKey || null,
       coinName: log.coinName,
       equalCoinName: log.equalCoinName,
+      accountType: log.accountType || null,
+      apiCode,
       positionSide: log.positionSide,
       isOpen: log.isOpen,
       filledAmt: log.filledAmt != null ? String(log.filledAmt) : null,
@@ -497,7 +507,27 @@ export class CommissionService {
 
     if (type === 'COMMISSION') {
       const commissionBalance = new Prisma.Decimal(card.commissionBalance).add(amount);
-      await tx.pointCard.update({ where: { userId }, data: { commissionBalance } });
+      let earned = new Prisma.Decimal(card.commissionEarned ?? 0);
+      if (earned.lte(0)) {
+        const rows = await tx.withdrawRequest.groupBy({
+          by: ['status'],
+          where: {
+            userId,
+            status: { in: ['PENDING', 'APPROVED', 'SETTLED', 'RELEASED'] },
+          },
+          _sum: { amount: true, fee: true },
+        });
+        const withdrawn = rows.reduce(
+          (n, row) => n + Number(row._sum.amount ?? 0) + Number(row._sum.fee ?? 0),
+          0,
+        );
+        earned = new Prisma.Decimal(card.commissionBalance).add(withdrawn);
+      }
+      const commissionEarned = earned.add(amount);
+      await tx.pointCard.update({
+        where: { userId },
+        data: { commissionBalance, commissionEarned },
+      });
       await tx.pointCardTx.create({
         data: {
           userId,

@@ -20,11 +20,9 @@ export function AuthScreen() {
   const [inviteCode, setInviteCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [pendingTip, setPendingTip] = useState<string | null>(null);
 
   const submit = async () => {
     setError(null);
-    setPendingTip(null);
     const acc = account.trim();
     if (!acc || !password) {
       setError('请输入账号和密码');
@@ -51,23 +49,13 @@ export function AuthScreen() {
     setLoading(true);
     try {
       if (mode === 'register') {
-        const resp = await register({
+        await register({
           account: acc,
           password,
           confirmPassword,
           inviteCode: inviteCode.trim() || undefined,
         });
-        const tip =
-          resp.message ||
-          (resp.status === 'PENDING'
-            ? '注册成功，请等待管理员审核通过后再登录'
-            : '注册成功');
-        setPendingTip(tip);
-        setMode('login');
-        setConfirmPassword('');
-        setInviteCode('');
-        setPassword('');
-        notify('注册已提交', tip, { tone: 'success' });
+        notify('注册成功', '已为你自动登录', { tone: 'success' });
       } else {
         await login(acc, password);
       }
@@ -114,19 +102,6 @@ export function AuthScreen() {
           </>
         ) : null}
 
-        {pendingTip && mode === 'login' ? (
-          <Text
-            style={{
-              color: (theme as any).warning || '#d97706',
-              marginBottom: 12,
-              fontSize: 13,
-              lineHeight: 18,
-            }}
-          >
-            {pendingTip}
-          </Text>
-        ) : null}
-
         {error ? (
           <Text style={{ color: theme.danger, marginBottom: 12, fontSize: 13 }}>{error}</Text>
         ) : null}
@@ -142,7 +117,6 @@ export function AuthScreen() {
         <Pressable
           onPress={() => {
             setError(null);
-            setPendingTip(null);
             setConfirmPassword('');
             setMode(mode === 'login' ? 'register' : 'login');
           }}

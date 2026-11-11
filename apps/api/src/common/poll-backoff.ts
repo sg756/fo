@@ -49,6 +49,53 @@ export function parseRetryAfterMs(value: string | null | undefined, now = Date.n
   return Math.max(0, when - now);
 }
 
+function errorBlob(err: unknown): string {
+  const e = err as any;
+  return [
+    e?.message,
+    e?.shortMessage,
+    e?.bodySnippet,
+    e?.body,
+    e?.info?.responseBody,
+    e?.info?.responseStatus,
+    e?.raw?.body,
+    e?.raw?.info?.responseBody,
+    e?.raw?.info?.responseStatus,
+    e?.error?.message,
+  ]
+    .filter((v) => typeof v === 'string' && v)
+    .join('\n');
+}
+
+/**
+ * 公共 RPC 把额度写在 JSON 里，而不是 Retry-After 头。
+ * 例：{"code":-32029,"data":{"reset":1791470100,"retry_after_ms":2000,"unit":"cu_per_minute"}}
+ * 取 retry_after_ms 与 reset 里更晚的那个，避免额度窗口还没翻就再打。
+ */
+export function parseRpcQuotaWaitMs(err: unknown, now = Date.now()): number | null {
+  const raw = errorBlob(err);
+  if (!/rate.?limit|too many requests|cu_per_minute|-32029|\b429\b/i.test(raw)) return null;
+
+  let wait: number | null = null;
+  const retry = raw.match(/"retry_after_ms"\s*:\s*(\d+)/);
+  if (retry) {
+    const n = Number(retry[1]);
+    if (Number.isFinite(n) && n >= 0) wait = n;
+  }
+  const reset = raw.match(/"reset"\s*:\s*(\d{10,13})/);
+  if (reset) {
+    let n = Number(reset[1]);
+    if (Number.isFinite(n) && n > 0) {
+      if (n < 1e12) n *= 1000;
+      const delta = n - now;
+      if (delta > 0 && delta < 24 * 3600_000) {
+        wait = wait == null ? delta : Math.max(wait, delta);
+      }
+    }
+  }
+  return wait;
+}
+
 /** 从限流头解析「还要等多久」 */
 export function parseResetHeaderMs(
   headers: Record<string, string> | null | undefined,
@@ -131,16 +178,20 @@ export function resolveBackoffMs(
   const retryAfter = e?.retryAfter ?? e?.raw?.retryAfter ?? headers?.['retry-after'] ?? headers?.['Retry-After'];
   const body = String(e?.bodySnippet || e?.raw?.body || e?.message || '');
 
+  const candidates: { ms: number; reason: string }[] = [];
   const fromRetry = parseRetryAfterMs(retryAfter != null ? String(retryAfter) : null, now);
-  if (fromRetry != null) {
-    const ms = clampBackoff(fromRetry, minMs, maxMs);
-    return { ms, reason: `Retry-After→${ms}ms` };
-  }
+  if (fromRetry != null) candidates.push({ ms: fromRetry, reason: 'Retry-After' });
 
   const fromReset = parseResetHeaderMs(headers, now);
-  if (fromReset != null && fromReset > 0) {
-    const ms = clampBackoff(fromReset, minMs, maxMs);
-    return { ms, reason: `reset头→${ms}ms` };
+  if (fromReset != null && fromReset > 0) candidates.push({ ms: fromReset, reason: 'reset头' });
+
+  const fromRpc = parseRpcQuotaWaitMs(e, now);
+  if (fromRpc != null) candidates.push({ ms: fromRpc + 1000, reason: 'RPC额度' });
+
+  if (candidates.length > 0) {
+    const best = candidates.reduce((a, b) => (b.ms > a.ms ? b : a));
+    const ms = clampBackoff(best.ms, minMs, maxMs);
+    return { ms, reason: `${best.reason}→${ms}ms` };
   }
 
   const fromBanUntil = parseBannedUntilMs(body, now);
@@ -175,11 +226,7 @@ export function isAccessBlockedError(err: unknown): boolean {
   const status = Number((err as any)?.status ?? (err as any)?.statusCode ?? 0);
   if (status === 418 || status === 429) return true;
 
-  const msg = String((err as any)?.message || err || '').toLowerCase();
-  const body = String(
-    (err as any)?.bodySnippet || (err as any)?.raw?.body || (err as any)?.body || '',
-  ).toLowerCase();
-  const text = `${msg} ${body}`.trim();
+  const text = errorBlob(err).toLowerCase();
   if (!text) return false;
 
   // 错误串 / 响应体里带状态码

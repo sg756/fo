@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AdminApi } from '../api';
+import { EXCHANGES } from '../exchanges';
+import { settlementCoinLabel, contractPeriodLabel } from '../hooks/useSearchFilterOptions';
 
 type SignalRow = {
   orderGID: string;
@@ -25,7 +27,6 @@ const POLL_MS = 2000;
 const TICK_MS = 100;
 const NEW_HIGHLIGHT_MS = 8000;
 const MAX_ROWS = 200;
-const EXCHANGES = ['BINANCE', 'OKX', 'BITGET', 'BYBIT', 'GATE'];
 
 function fingerprint(s: SignalRow) {
   return `${s.orderGID}|${s.price}|${s.amount}|${s.orderSide}|${s.signalAt}`;
@@ -46,17 +47,6 @@ function formatRemain(ms: number): string {
 
 function symbolBlob(s: SignalRow) {
   return `${s.symbol || ''} ${s.coinName || ''} ${s.equalCoinName || ''} ${s.apiCode || ''}`.toUpperCase();
-}
-
-const SPOT_QUOTES = new Set(['U', 'USDT', 'USDC', 'USD', 'BTC', 'ETH', 'EUR', 'FDUSD', 'DAI', 'TUSD']);
-
-/** equalCoin：永续(PC) / USDT / 交割(CQ) 等 */
-function equalCoinDisplay(equalCoinName?: string | null): string {
-  const eq = String(equalCoinName || '').trim().toUpperCase();
-  if (!eq) return '—';
-  if (eq === 'PC') return `永续(${eq})`;
-  if (SPOT_QUOTES.has(eq)) return eq;
-  return `交割(${eq})`;
 }
 
 export function TradeSignalsPage() {
@@ -330,7 +320,8 @@ export function TradeSignalsPage() {
               <th>账户名</th>
               <th>交易所</th>
               <th>币名</th>
-              <th>计价/周期</th>
+              <th>结算币</th>
+              <th>周期</th>
               <th>账户类型</th>
               <th>方向</th>
               <th>开平</th>
@@ -377,7 +368,8 @@ export function TradeSignalsPage() {
                     <span className="hint"> / {s.apiCode}</span>
                   </td>
                   <td title={s.symbol || ''}>{s.coinName || s.symbol?.split('/')[0] || '—'}</td>
-                  <td title={s.equalCoinName || ''}>{equalCoinDisplay(s.equalCoinName)}</td>
+                  <td className="nowrap">{settlementCoinLabel(s)}</td>
+                  <td className="nowrap">{contractPeriodLabel(s)}</td>
                   <td>{s.accountType || '—'}</td>
                   <td>{s.positionSide}</td>
                   <td>{s.isOpen ? '开' : '平'}</td>

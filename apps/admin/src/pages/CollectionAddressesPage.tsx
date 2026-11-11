@@ -17,6 +17,19 @@ function fmtBal(v: unknown, digits: number) {
   return n.toFixed(digits);
 }
 
+function gasLabel(chain: string, chains: string[]) {
+  const sym = chain === 'BSC' ? 'BNB' : 'ETH';
+  const dup = chains.filter((c) => (c === 'BSC' ? 'BNB' : 'ETH') === sym).length > 1;
+  return dup ? `${sym}·${chain}` : sym;
+}
+
+function balOf(row: any, chain: string, field: 'usdt' | 'native') {
+  const hit = row?.balances?.[chain];
+  if (hit && hit[field] != null) return hit[field];
+  if (String(row?.chain || '').toUpperCase() === chain) return row[field];
+  return null;
+}
+
 function shortAddr(addr: string) {
   const s = String(addr || '');
   if (s.length < 12) return s || '—';
@@ -25,7 +38,7 @@ function shortAddr(addr: string) {
 
 /** 归集目标：外部地址（交易所/冷钱包）+ 选用平台自持钱包 */
 export function CollectionAddressesPage() {
-  const [chain, setChain] = useState('ARB');
+  const [primaryChain, setPrimaryChain] = useState('ARB');
   const [items, setItems] = useState<any[]>([]);
   const [configs, setConfigs] = useState<any[]>([]);
   const [platformWallets, setPlatformWallets] = useState<any[]>([]);
@@ -45,12 +58,14 @@ export function CollectionAddressesPage() {
   );
   const refreshCd = useRefreshCooldown();
 
-  const currentCfg = useMemo(() => configs.find((c) => c.chain === chain), [configs, chain]);
-  const singleChain = enabledChains.length <= 1;
-
   const currentTarget = useMemo(() => {
-    return currentCfg?.targetAddress ? String(currentCfg.targetAddress) : '';
-  }, [currentCfg]);
+    const usable = (addr: unknown) => {
+      const s = String(addr || '');
+      return isEvmAddress(s) && !/^0x0{40}$/i.test(s);
+    };
+    const shared = configs.find((c) => usable(c.targetAddress));
+    return shared ? String(shared.targetAddress) : '';
+  }, [configs]);
 
   const platformAddrSet = useMemo(() => {
     const s = new Set<string>();
@@ -76,10 +91,10 @@ export function CollectionAddressesPage() {
     setErr('');
     try {
       const [list, status, cfgs, gasList] = await Promise.all([
-        AdminApi.collectionAddresses(chain, { withBalance: true }),
+        AdminApi.collectionAddresses(undefined, { withBalance: true }),
         AdminApi.collectionStatus(),
         AdminApi.collectionConfigs(),
-        AdminApi.collectionGasWallets(chain),
+        AdminApi.collectionGasWallets(),
       ]);
       setItems(Array.isArray(list) ? list : []);
       const cfgList = Array.isArray(cfgs) ? cfgs : status?.configs || [];
@@ -91,15 +106,14 @@ export function CollectionAddressesPage() {
           ? status.enabledChains
           : [status?.primaryChain || 'ARB'];
       setEnabledChains(enabled);
-      const nextChain = enabled.includes(chain) ? chain : enabled[0] || 'ARB';
-      if (nextChain !== chain) setChain(nextChain);
+      setPrimaryChain(status?.primaryChain || enabled[0] || 'ARB');
     } catch (e: any) {
       if (opts?.quietRateLimit && isOnChainRateLimitError(e)) return;
       toast(e.message);
     } finally {
       setLoading(false);
     }
-  }, [chain]);
+  }, []);
 
   useEffect(() => {
     void load({ quietRateLimit: true });
@@ -146,7 +160,6 @@ export function CollectionAddressesPage() {
         toast('已更新', 'ok');
       } else {
         await AdminApi.addCollectionAddress({
-          chain,
           address: addr,
           label: formLabel.trim() || undefined,
         });
@@ -230,7 +243,7 @@ export function CollectionAddressesPage() {
     setModalErr('');
     try {
       const row = await AdminApi.createCollectionGasWallet({
-        chain,
+        chain: primaryChain,
         label: '归集收款',
         setActive: false,
       });
@@ -266,21 +279,6 @@ export function CollectionAddressesPage() {
 
       <div className="card">
         <div className="row" style={{ marginBottom: 12, gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          {singleChain ? (
-            <span className="badge ok">{chain}</span>
-          ) : (
-            <select
-              value={chain}
-              onChange={(e) => setChain(e.target.value)}
-              style={{ padding: '4px 8px', fontSize: 12 }}
-            >
-              {enabledChains.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-          )}
           <button
             type="button"
             className="ghost"
@@ -303,8 +301,12 @@ export function CollectionAddressesPage() {
             <tr>
               <th>备注</th>
               <th>地址</th>
-              <th>USDT</th>
-              <th>ETH</th>
+              {enabledChains.map((c) => (
+                <th key={`usdt-${c}`}>USDT·{c}</th>
+              ))}
+              {enabledChains.map((c) => (
+                <th key={`gas-${c}`}>{gasLabel(c, enabledChains)}</th>
+              ))}
               <th>状态</th>
               <th>操作</th>
             </tr>
@@ -312,7 +314,7 @@ export function CollectionAddressesPage() {
           <tbody>
             {items.length === 0 && !loading ? (
               <tr>
-                <td colSpan={6} style={{ textAlign: 'center', padding: 32, color: 'var(--muted)' }}>
+                <td colSpan={4 + enabledChains.length * 2} style={{ textAlign: 'center', padding: 32, color: 'var(--muted)' }}>
                   暂无地址，请点「管理归集地址」添加外部地址或选用平台钱包
                 </td>
               </tr>
@@ -335,8 +337,12 @@ export function CollectionAddressesPage() {
                     <td style={{ fontFamily: 'monospace', fontSize: 12, userSelect: 'text' }}>
                       {row.address}
                     </td>
-                    <td>{fmtBal(row.usdt, 4)}</td>
-                    <td>{fmtBal(row.native, 6)}</td>
+                    {enabledChains.map((c) => (
+                      <td key={`usdt-${c}`}>{fmtBal(balOf(row, c, 'usdt'), 4)}</td>
+                    ))}
+                    {enabledChains.map((c) => (
+                      <td key={`gas-${c}`}>{fmtBal(balOf(row, c, 'native'), 6)}</td>
+                    ))}
                     <td>{isCurrent ? <span className="badge ok">当前归集</span> : '—'}</td>
                     <td className="ops">
                       {!isCurrent ? (
@@ -374,7 +380,7 @@ export function CollectionAddressesPage() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-head">
-              <h3>管理归集地址（{chain}）</h3>
+              <h3>管理归集地址</h3>
               <ModalCloseButton
                 disabled={busy === 'save' || busy === 'pick-platform' || busy === 'create-platform'}
                 onClick={closeModal}
@@ -478,7 +484,7 @@ export function CollectionAddressesPage() {
               </button>
               {platformWallets.length === 0 ? (
                 <p className="hint" style={{ margin: '8px 0 0' }}>
-                  本链尚无平台钱包，可一键创建，或先到「平台钱包」页导入。
+                  还没有平台钱包。创建一把即可用于已开通的全部链，不必按 ARB、BSC 各建一套。
                 </p>
               ) : null}
             </div>

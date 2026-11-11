@@ -12,6 +12,12 @@ import { encrypt } from '../../common/crypto.util';
 const CFG_USERS_PER_PROXY = 'proxy_users_per_proxy';
 const CFG_IDLE_NO_FILL_DAYS = 'proxy_idle_no_fill_days';
 const CFG_IDLE_FOLLOW_OFF_DAYS = 'proxy_idle_follow_off_days';
+/** 不健康代理探活。库里没有这项时默认开启。 */
+export const CFG_PROXY_PROBE_ENABLED = 'proxy_probe_enabled';
+const CFG_APP_DOWNLOAD_URL = 'app_download_url';
+const CFG_APP_H5_URL = 'app_h5_url';
+/** 带 proxyIP 的请求连续超时/断网达到此次数，标异常并迁走用户 */
+const PROXY_TRANSPORT_FAIL_LIMIT = 5;
 
 /** 解析中间件代理 value：支持 `ip` 或 `host:port`。无端口时 port=0（PlaceOrder 须原样传 value，勿拼端口）。 */
 function parseMiddlewareProxy(value: string): { host: string; port: number; egressIp: string } {
@@ -43,12 +49,15 @@ export type ProxyCapacity = {
 @Injectable()
 export class IpPoolService {
   private readonly logger = new Logger(IpPoolService.name);
+  /** 同一代理连续传输失败次数。成功一次即清零。 */
+  private proxyTransportFails = new Map<string, number>();
+  private proxyTransportChain = new Map<string, Promise<void>>();
+  private proxyTransportMigrating = new Set<string>();
 
   constructor(private prisma: PrismaService) {}
 
   async list() {
     const items = await this.prisma.ipProxy.findMany({
-      // 含失效（刷新后中间件已无）：运维可见，便于一键清理迁绑
       orderBy: [{ active: 'desc' }, { healthy: 'desc' }, { createdAt: 'asc' }],
       include: { _count: { select: { assignments: true } } },
     });
@@ -63,7 +72,10 @@ export class IpPoolService {
   /**
    * 按中间件 PublicHttpProxyList 同步本地代理池。
    * name = 公网 IP（App 白名单展示/复制）；ip/value = 代理连接地址（host 或 host:port）。
-   * 新列表没有的 IP：标 active/healthy=false（失效），行保留不删，供运维清理。
+   * 中间件不提供健康字段。刷新成功：列表里有的留下（不改 healthy），没有的删除。
+   * 空列表视为异常回包，不删本地数据。
+   * 要删的代理先退出候选：人只换绑到本次仍在列表里、且健康未满的代理，按顺序填满再换下一台。
+   * 没有健康空位则停跟单并记已移除，等之后重新绑到新的健康地址。
    */
   async syncFromMiddleware(items: { ip?: string; name?: string }[]) {
     const seen = new Set<string>();
@@ -88,7 +100,6 @@ export class IpPoolService {
         host: parsed.host,
         port: parsed.port,
         active: true,
-        healthy: true,
       };
       if (existing) {
         await this.prisma.ipProxy.update({
@@ -99,6 +110,7 @@ export class IpPoolService {
         await this.prisma.ipProxy.create({
           data: {
             ...data,
+            healthy: true,
             egressIp,
             proxyType: 'HTTP',
           },
@@ -106,19 +118,148 @@ export class IpPoolService {
       }
     }
 
-    if (seen.size > 0) {
-      await this.prisma.ipProxy.updateMany({
-        where: { egressIp: { notIn: [...seen] } },
-        data: { active: false, healthy: false },
-      });
-    } else {
-      // 中间件无代理时，本地全部标为不可用，避免脏数据占容量
-      await this.prisma.ipProxy.updateMany({
-        data: { active: false, healthy: false },
-      });
+    if (seen.size === 0) {
+      this.logger.warn('中间件代理列表为空，未删除本地代理');
+      return this.list();
     }
 
+    const stale = await this.prisma.ipProxy.findMany({
+      where: { egressIp: { notIn: [...seen] } },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    });
+    if (stale.length === 0) {
+      await this.rebindUnassignedFollowers();
+      return this.list();
+    }
+
+    const staleIds = stale.map((p) => p.id);
+    // 先标不健康，避免把人改绑到另一台也要删的代理上
+    await this.prisma.ipProxy.updateMany({
+      where: { id: { in: staleIds } },
+      data: { healthy: false, lastCheckAt: new Date() },
+    });
+
+    const empty: typeof stale = [];
+    const occupied: typeof stale = [];
+    for (const p of stale) {
+      const n = await this.prisma.ipAssignment.count({ where: { proxyId: p.id } });
+      if (n === 0) empty.push(p);
+      else occupied.push(p);
+    }
+
+    for (const p of empty) {
+      await this.prisma.ipAssignment.deleteMany({ where: { proxyId: p.id } });
+      await this.prisma.ipProxy.delete({ where: { id: p.id } });
+      this.logger.log(`已删除中间件列表中不存在的代理 ${p.egressIp}`);
+    }
+
+    for (const p of occupied) {
+      const bound = await this.prisma.ipAssignment.count({ where: { proxyId: p.id } });
+      if (bound > 0) {
+        const ev = await this.evacuate(p.id, undefined, staleIds);
+        this.logger.log(
+          `中间件已无代理 ${p.egressIp}，疏散绑定 moved=${ev.movedUsers} paused=${ev.pausedUsers}`,
+        );
+      }
+      await this.prisma.ipAssignment.deleteMany({ where: { proxyId: p.id } });
+      await this.prisma.ipProxy.delete({ where: { id: p.id } });
+      this.logger.log(`已删除中间件列表中不存在的代理 ${p.egressIp}`);
+    }
+
+    await this.rebindUnassignedFollowers();
     return this.list();
+  }
+
+  /**
+   * 补绑：
+   * 1) 跟单开启但 IpAssignment 丢失（旧同步把绑定清掉后仍在开单）
+   * 2) 疏散无空位进「已移除」的用户
+   * 有健康空位才写绑定并计入人数；没有空位则跳过。
+   */
+  async rebindUnassignedFollowers() {
+    const { usersPerProxy } = await this.getPoolConfig();
+    const seenUser = new Set<string>();
+    let reboundOrphans = 0;
+    let reboundPaused = 0;
+
+    const orphans = await this.prisma.user.findMany({
+      where: {
+        isPlatform: false,
+        status: 'ACTIVE',
+        followEnabled: true,
+        ipAssignment: null,
+      },
+      orderBy: [{ followStartedAt: 'asc' }, { id: 'asc' }],
+      select: { id: true },
+    });
+    for (const u of orphans) {
+      if (seenUser.has(u.id)) continue;
+      seenUser.add(u.id);
+      const target = this.pickFirstWithRoom(await this.healthyWithCounts(), usersPerProxy);
+      if (!target) break;
+      await this.prisma.ipAssignment.create({
+        data: { userId: u.id, proxyId: target.id, reason: 'orphan_rebind' },
+      });
+      await this.writeReflowLog({
+        userId: u.id,
+        result: 'SUCCESS',
+        proxyId: target.id,
+        egressIp: target.egressIp,
+        wasReclaim: false,
+        message: '跟单中无绑定记录，已补绑到健康代理',
+      });
+      reboundOrphans++;
+    }
+
+    const pending = await this.prisma.proxyReclaimRecord.findMany({
+      where: { status: 'REMOVED', reason: 'evacuate_no_slot' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: { userId: true },
+    });
+    for (const rec of pending) {
+      if (seenUser.has(rec.userId)) continue;
+      seenUser.add(rec.userId);
+
+      const user = await this.prisma.user.findUnique({
+        where: { id: rec.userId },
+        select: { id: true, status: true, isPlatform: true },
+      });
+      if (!user || user.isPlatform || user.status !== 'ACTIVE') continue;
+
+      const existing = await this.prisma.ipAssignment.findUnique({
+        where: { userId: rec.userId },
+      });
+      if (existing) continue;
+
+      const target = this.pickFirstWithRoom(await this.healthyWithCounts(), usersPerProxy);
+      if (!target) break;
+
+      await this.prisma.ipAssignment.create({
+        data: { userId: rec.userId, proxyId: target.id, reason: 'sync_rebind' },
+      });
+      await this.prisma.user.update({
+        where: { id: rec.userId },
+        data: { followEnabled: true, followStoppedAt: null },
+      });
+      await this.markReflowed(rec.userId);
+      await this.writeReflowLog({
+        userId: rec.userId,
+        result: 'SUCCESS',
+        proxyId: target.id,
+        egressIp: target.egressIp,
+        wasReclaim: true,
+        message: '刷新到健康代理空位，已重新绑定并恢复跟单',
+      });
+      reboundPaused++;
+    }
+
+    const rebound = reboundOrphans + reboundPaused;
+    if (rebound > 0) {
+      this.logger.log(
+        `补绑未分配用户：跟单中丢失绑定 ${reboundOrphans}，已移除回流 ${reboundPaused}`,
+      );
+    }
+    return { rebound, reboundOrphans, reboundPaused };
   }
 
   async egressIps() {
@@ -196,19 +337,30 @@ export class IpPoolService {
     return fallback;
   }
 
+  private async getProbeEnabled(): Promise<boolean> {
+    const row = await this.prisma.systemConfig.findUnique({
+      where: { key: CFG_PROXY_PROBE_ENABLED },
+    });
+    if (!row) return true;
+    const v = String(row.value ?? '').trim().toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  }
+
   async getPoolConfig() {
-    const [usersPerProxy, idleNoFillDays, idleFollowOffDays] = await Promise.all([
+    const [usersPerProxy, idleNoFillDays, idleFollowOffDays, probeEnabled] = await Promise.all([
       this.getIntConfig(CFG_USERS_PER_PROXY, 10, 1),
       this.getIntConfig(CFG_IDLE_NO_FILL_DAYS, 14, 1),
       this.getIntConfig(CFG_IDLE_FOLLOW_OFF_DAYS, 14, 1),
+      this.getProbeEnabled(),
     ]);
-    return { usersPerProxy, idleNoFillDays, idleFollowOffDays };
+    return { usersPerProxy, idleNoFillDays, idleFollowOffDays, probeEnabled };
   }
 
   async setPoolConfig( partial: {
     usersPerProxy?: number;
     idleNoFillDays?: number;
     idleFollowOffDays?: number;
+    probeEnabled?: boolean;
   }) {
     const upsert = async (key: string, value: number, remark: string) => {
       const v = Math.max(1, Math.floor(value));
@@ -241,7 +393,65 @@ export class IpPoolService {
         '关闭跟单后仍占代理多少天可回收',
       );
     }
+    if (partial.probeEnabled != null) {
+      const on = !!partial.probeEnabled;
+      await this.prisma.systemConfig.upsert({
+        where: { key: CFG_PROXY_PROBE_ENABLED },
+        create: {
+          key: CFG_PROXY_PROBE_ENABLED,
+          value: on ? 'true' : 'false',
+          remark: '不健康代理探活：开启后每 5 分钟查持仓，查通则标健康，不迁用户',
+        },
+        update: { value: on ? 'true' : 'false' },
+      });
+      out.probeEnabled = on;
+    }
     return out;
+  }
+
+  async getAppDownloadUrl() {
+    const [apk, h5] = await Promise.all([
+      this.prisma.systemConfig.findUnique({ where: { key: CFG_APP_DOWNLOAD_URL } }),
+      this.prisma.systemConfig.findUnique({ where: { key: CFG_APP_H5_URL } }),
+    ]);
+    return {
+      url: String(apk?.value || '').trim(),
+      h5Url: String(h5?.value || '').trim(),
+    };
+  }
+
+  private normalizeHttpUrl(raw: string, label: string): string {
+    const url = String(raw || '').trim();
+    if (!url) return '';
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new BadRequestException(`${label}须是完整的 http 或 https 链接`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new BadRequestException(`${label}须是完整的 http 或 https 链接`);
+    }
+    if (url.length > 500) throw new BadRequestException(`${label}过长`);
+    return url;
+  }
+
+  async setAppDownloadUrl(rawApk: string, rawH5?: string) {
+    const url = this.normalizeHttpUrl(rawApk, 'APK 下载地址');
+    const h5Url = this.normalizeHttpUrl(rawH5 ?? '', 'Apple 地址');
+    await this.prisma.$transaction([
+      this.prisma.systemConfig.upsert({
+        where: { key: CFG_APP_DOWNLOAD_URL },
+        create: { key: CFG_APP_DOWNLOAD_URL, value: url, remark: '客户端 APK 下载地址' },
+        update: { value: url },
+      }),
+      this.prisma.systemConfig.upsert({
+        where: { key: CFG_APP_H5_URL },
+        create: { key: CFG_APP_H5_URL, value: h5Url, remark: '客户端 Apple 下载/商店地址' },
+        update: { value: h5Url, remark: '客户端 Apple 下载/商店地址' },
+      }),
+    ]);
+    return { url, h5Url };
   }
 
   // ---------- 容量 ----------
@@ -294,7 +504,9 @@ export class IpPoolService {
   }
 
   /**
-   * 解析用户对应的代理: 有绑定且健康则用绑定；否则预览「下一台未满」落点（不写库）
+   * 解析用户对应的代理。
+   * 有健康绑定则用绑定；跟单中却无绑定则补绑进未满健康代理（写入 IpAssignment，列表人数才会对上）。
+   * 非跟单用户仍只预览落点，不写库。
    */
   async resolveProxyForUser(userId: string): Promise<IpProxy | null> {
     const override = await this.prisma.ipAssignment.findUnique({
@@ -303,6 +515,16 @@ export class IpPoolService {
     });
     if (override && override.proxy.active && override.proxy.healthy) {
       return override.proxy;
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { followEnabled: true },
+    });
+    if (user?.followEnabled) {
+      const alloc = await this.allocateProxyForUser(userId, 'orphan_rebind');
+      if (!('error' in alloc)) return alloc.proxy;
+      return null;
     }
 
     const { usersPerProxy } = await this.getPoolConfig();
@@ -516,9 +738,120 @@ export class IpPoolService {
   }
 
   /**
-   * 某代理被封：标不健康，绑定用户按顺序填到仍有空位的健康代理；没位则停跟单并记回收。
+   * 带 proxyIP 的中间件请求：成功清零；超时或网络故障连续 5 次则标异常并迁用户。
+   * 交易所业务失败（有 HTTP 回包）不算。
    */
-  async evacuate(proxyId: string, toProxyId?: string) {
+  noteProxyTransport(proxyAddress: string, ok: boolean): Promise<void> {
+    const key = String(proxyAddress || '').trim();
+    if (!key) return Promise.resolve();
+    const prev = this.proxyTransportChain.get(key) ?? Promise.resolve();
+    const run = prev
+      .catch(() => undefined)
+      .then(() => this.applyProxyTransport(key, ok))
+      .catch((e) => {
+        this.logger.warn(`代理传输计数失败 ${key}: ${e?.message || e}`);
+      });
+    this.proxyTransportChain.set(key, run);
+    return run;
+  }
+
+  private async findProxyByAddress(proxyAddress: string) {
+    const parsed = parseMiddlewareProxy(proxyAddress);
+    if (!parsed.host) return null;
+    return this.prisma.ipProxy.findFirst({
+      where: { host: parsed.host, port: parsed.port, active: true },
+    });
+  }
+
+  private async applyProxyTransport(proxyAddress: string, ok: boolean) {
+    const proxy = await this.findProxyByAddress(proxyAddress);
+    if (!proxy) return;
+    if (ok) {
+      if (this.proxyTransportFails.get(proxy.id)) this.proxyTransportFails.set(proxy.id, 0);
+      return;
+    }
+    if (!proxy.healthy || this.proxyTransportMigrating.has(proxy.id)) return;
+    const n = (this.proxyTransportFails.get(proxy.id) || 0) + 1;
+    this.proxyTransportFails.set(proxy.id, n);
+    this.logger.warn(
+      `代理 ${proxy.host} 请求超时或网络故障，连续 ${n}/${PROXY_TRANSPORT_FAIL_LIMIT} 次`,
+    );
+    if (n < PROXY_TRANSPORT_FAIL_LIMIT) return;
+    this.proxyTransportFails.set(proxy.id, 0);
+    await this.markUnhealthyFromTransport(proxy.id);
+  }
+
+  /** 传输故障达到阈值：只标不健康，人迁到仍有空位的代理。列表里还在，不标失效。 */
+  private async markUnhealthyFromTransport(proxyId: string) {
+    if (this.proxyTransportMigrating.has(proxyId)) return;
+    this.proxyTransportMigrating.add(proxyId);
+    try {
+      const proxy = await this.prisma.ipProxy.findUnique({ where: { id: proxyId } });
+      if (!proxy || !proxy.active || !proxy.healthy) return;
+      const res = await this.relocateAssignees(proxyId, {
+        deactivate: false,
+        assignReason: `proxy_transport:${proxyId}`,
+        pauseReason: 'proxy_transport',
+      });
+      this.logger.warn(
+        `代理 ${proxy.egressIp || proxy.host} 连续传输失败已标异常，迁 ${res.movedUsers} 人，无空位停跟单 ${res.pausedUsers} 人`,
+      );
+    } finally {
+      this.proxyTransportMigrating.delete(proxyId);
+    }
+  }
+
+  /** 确认代理已恢复后手动标回健康，并清掉连续失败计数。不把已迁走的用户拉回来。 */
+  async restoreHealth(proxyId: string) {
+    const proxy = await this.prisma.ipProxy.findUnique({ where: { id: proxyId } });
+    if (!proxy) throw new NotFoundException('代理不存在');
+    this.proxyTransportFails.delete(proxyId);
+    const updated = await this.prisma.ipProxy.update({
+      where: { id: proxyId },
+      data: { healthy: true, lastCheckAt: new Date() },
+    });
+    this.logger.log(`代理 ${proxy.egressIp || proxy.host} 已手动恢复健康`);
+    return updated;
+  }
+
+  /**
+   * 把绑定用户迁到仍有空位的健康代理。
+   * 同步/清理会把源代理标成不健康；手动疏散 keepHealthy，健康代理保持健康。
+   * count：只迁这么多人（按绑定时间从早到晚）。不传则迁走全部。
+   * excludeProxyIds：这些代理即将删除，不能当换绑目标。
+   */
+  async evacuate(
+    proxyId: string,
+    toProxyId?: string,
+    excludeProxyIds?: string[],
+    manual?: { count?: number; keepHealthy?: boolean; strictTarget?: boolean },
+  ) {
+    return this.relocateAssignees(proxyId, {
+      toProxyId,
+      excludeProxyIds,
+      count: manual?.count,
+      keepHealthy: manual?.keepHealthy,
+      strictTarget: manual?.strictTarget,
+      deactivate: false,
+      assignReason: `evacuate:${proxyId}`,
+      pauseReason: 'evacuate_no_slot',
+    });
+  }
+
+  private async relocateAssignees(
+    proxyId: string,
+    opts: {
+      toProxyId?: string;
+      excludeProxyIds?: string[];
+      count?: number;
+      keepHealthy?: boolean;
+      /** 指定了目标时，只迁到这一台，空位不够则拒绝，不改落到其他代理 */
+      strictTarget?: boolean;
+      deactivate: boolean;
+      assignReason: string;
+      pauseReason: string;
+    },
+  ) {
     const proxy = await this.prisma.ipProxy.findUnique({ where: { id: proxyId } });
     if (!proxy) throw new NotFoundException('代理不存在');
 
@@ -528,41 +861,86 @@ export class IpPoolService {
       select: { userId: true },
       orderBy: { createdAt: 'asc' },
     });
-    const userIds = assignees.map((a) => a.userId);
+    let userIds = assignees.map((a) => a.userId);
 
-    await this.prisma.ipProxy.update({ where: { id: proxyId }, data: { healthy: false } });
+    if (opts.count != null) {
+      const count = opts.count;
+      if (!Number.isInteger(count) || count < 1) {
+        throw new BadRequestException('疏散个数至少为 1');
+      }
+      if (count > usersPerProxy) {
+        throw new BadRequestException(`疏散个数不能超过每台阈值 ${usersPerProxy}`);
+      }
+      if (count > userIds.length) {
+        throw new BadRequestException(`当前只绑定了 ${userIds.length} 人`);
+      }
+      userIds = userIds.slice(0, count);
+    }
 
-    let targetFixed = toProxyId
-      ? await this.prisma.ipProxy.findUnique({ where: { id: toProxyId } })
+    if (!opts.keepHealthy) {
+      await this.prisma.ipProxy.update({
+        where: { id: proxyId },
+        data: { healthy: false, lastCheckAt: new Date() },
+      });
+    }
+
+    let targetFixed = opts.toProxyId
+      ? await this.prisma.ipProxy.findUnique({ where: { id: opts.toProxyId } })
       : null;
-    if (toProxyId && !targetFixed) throw new BadRequestException('目标代理不存在');
+    if (opts.toProxyId && !targetFixed) throw new BadRequestException('目标代理不存在');
     if (targetFixed && (targetFixed.id === proxyId || !targetFixed.active || !targetFixed.healthy)) {
       throw new BadRequestException('目标代理不可用');
     }
+    if (opts.strictTarget && targetFixed && opts.count != null) {
+      const occupied = await this.prisma.ipAssignment.count({
+        where: { proxyId: targetFixed.id },
+      });
+      const room = usersPerProxy - occupied;
+      if (opts.count > room) {
+        throw new BadRequestException(room > 0 ? `目标代理还能再绑 ${room} 人` : '目标代理已满');
+      }
+    }
+
+    const excluded = new Set(opts.excludeProxyIds || []);
+    excluded.add(proxyId);
 
     let moved = 0;
     let paused = 0;
 
+    const stillOnSource = async (userId: string) => {
+      const row = await this.prisma.ipAssignment.findUnique({ where: { userId } });
+      return !!row && row.proxyId === proxyId;
+    };
+
     for (const userId of userIds) {
-      const rest = (await this.healthyWithCounts()).filter((p) => p.id !== proxyId);
+      const rest = (await this.healthyWithCounts()).filter(
+        (p) => p.id !== proxyId && !excluded.has(p.id),
+      );
       const withRoom = rest.filter((p) => p.assignedCount < usersPerProxy);
 
       let target: IpProxy | null = targetFixed;
+      if (target && target.id === proxyId) target = null;
       if (target) {
         const live = withRoom.find((p) => p.id === target!.id);
         if (!live) target = null;
       }
-      if (!target) {
+      if (!target && !opts.strictTarget) {
         target = this.pickFirstWithRoom(withRoom, usersPerProxy);
       }
+      if (target && target.id === proxyId) target = null;
 
       if (target) {
         await this.prisma.ipAssignment.upsert({
           where: { userId },
-          create: { userId, proxyId: target.id, reason: `evacuate:${proxyId}` },
-          update: { proxyId: target.id, reason: `evacuate:${proxyId}` },
+          create: { userId, proxyId: target.id, reason: opts.assignReason },
+          update: { proxyId: target.id, reason: opts.assignReason },
         });
+        if (await stillOnSource(userId)) {
+          throw new BadRequestException('疏散后用户仍绑在原代理上');
+        }
         moved++;
+      } else if (opts.strictTarget) {
+        break;
       } else {
         const prev = await this.prisma.ipAssignment.findUnique({
           where: { userId },
@@ -577,23 +955,37 @@ export class IpPoolService {
           userId,
           prevProxyId: prev?.proxyId || proxyId,
           prevEgress: prev?.proxy?.egressIp || proxy.egressIp,
-          reason: 'evacuate_no_slot',
+          reason: opts.pauseReason,
         });
         paused++;
       }
     }
 
-    // 源代理标失效（若尚未）
-    await this.prisma.ipProxy.update({
-      where: { id: proxyId },
-      data: { active: false, healthy: false },
-    });
+    if (opts.deactivate) {
+      await this.prisma.ipProxy.update({
+        where: { id: proxyId },
+        data: { active: false, healthy: false },
+      });
+    }
+
+    const remaining = userIds.length
+      ? await this.prisma.ipAssignment.count({
+          where: { proxyId, userId: { in: userIds } },
+        })
+      : 0;
+    if (userIds.length > 0 && moved + paused === 0) {
+      throw new BadRequestException('没有可迁入的空位，这台绑定没有变化');
+    }
+    if (remaining > 0 && !opts.strictTarget) {
+      throw new BadRequestException(`还有 ${remaining} 人留在原代理上`);
+    }
 
     return {
       proxyId,
       evacuatedTo: targetFixed?.id ?? 'sequential_fill',
       movedUsers: moved,
       pausedUsers: paused,
+      remaining,
     };
   }
 
@@ -605,8 +997,14 @@ export class IpPoolService {
     const inactive = await this.prisma.ipProxy.findMany({
       where: { active: false },
       orderBy: { createdAt: 'asc' },
-      include: { _count: { select: { assignments: true } } },
     });
+    const inactiveIds = inactive.map((p) => p.id);
+    if (inactiveIds.length > 0) {
+      await this.prisma.ipProxy.updateMany({
+        where: { id: { in: inactiveIds } },
+        data: { healthy: false, lastCheckAt: new Date() },
+      });
+    }
 
     let movedUsers = 0;
     let pausedUsers = 0;
@@ -621,11 +1019,11 @@ export class IpPoolService {
     }> = [];
 
     for (const p of inactive) {
-      const bound = p._count.assignments;
+      const bound = await this.prisma.ipAssignment.count({ where: { proxyId: p.id } });
       let moved = 0;
       let paused = 0;
       if (bound > 0) {
-        const ev = await this.evacuate(p.id);
+        const ev = await this.evacuate(p.id, undefined, inactiveIds);
         moved = ev.movedUsers;
         paused = ev.pausedUsers;
         movedUsers += moved;

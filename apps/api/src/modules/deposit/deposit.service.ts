@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { formatUnits } from 'ethers';
 import { PrismaService } from '../../prisma/prisma.service';
 import { WalletService } from './wallet.service';
 import {
@@ -39,11 +40,12 @@ export class DepositService {
    */
   async ingestTransfer(input: IngestTransferInput) {
     const cfg = DEPOSIT_CHAINS[input.chain];
-    const wallet = await this.wallets.findByAddress(input.toAddress);
+    const wallet = await this.wallets.findByAddress(input.toAddress, input.chain);
     if (!wallet) return { skipped: true, reason: 'unknown_address' as const };
 
     const uid = DepositService.transferUid(input.txHash, input.logIndex);
-    const human = Number(input.amountRaw) / 10 ** cfg.decimals;
+    const humanStr = formatUnits(input.amountRaw, cfg.decimals);
+    const human = Number(humanStr);
     if (human <= 0) return { skipped: true, reason: 'zero_amount' as const };
 
     const confirmations = Math.max(0, input.currentBlock - input.blockNumber + 1);
@@ -76,7 +78,7 @@ export class DepositService {
         chain: input.chain,
         tokenSymbol: 'USDT',
         txHash: uid,
-        amount: new Prisma.Decimal(human.toFixed(cfg.decimals)),
+        amount: new Prisma.Decimal(humanStr),
         confirmations,
         status: enough ? 'CONFIRMED' : 'PENDING',
       },

@@ -253,6 +253,65 @@ function Prepare-MobileProject {
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
+# 本机若用 npmmirror，eas-cli@latest 可能已上架而 @expo/logger 同版本未同步 → ETARGET。
+# EAS 相关命令固定走官方 registry，不影响 mobile 项目 npm ci 的镜像。
+#
+# CI=1：关掉 ora spinner，从而禁用 eas-cli 的 realtime logs（wss://logs.expo.dev）。
+# 该 WebSocket 在部分网络下会卡死：云端已 ✔ Build finished，但本机永远不打印下载链。
+function Invoke-EasCli {
+  param([Parameter(Mandatory = $true)][string[]]$CliArgs)
+  $reg = "https://registry.npmjs.org"
+  Write-Host "    eas-cli 使用官方源: $reg"
+  $prevCi = $env:CI
+  $env:CI = "1"
+  $global:LASTEXITCODE = 0
+  try {
+    & npx --yes --registry $reg eas-cli@latest @CliArgs
+  } finally {
+    if ($null -eq $prevCi) { Remove-Item Env:CI -ErrorAction SilentlyContinue }
+    else { $env:CI = $prevCi }
+  }
+  # 不 return：由调用方读 $LASTEXITCODE（PowerShell 里 return 易把成功误判成失败）
+}
+
+function Show-LatestEasAndroidArtifact {
+  param([string]$Profile)
+  Write-Host ""
+  Write-Host "==> 查询最近一次 Android 构建产物…"
+  $tmp = [System.IO.Path]::GetTempFileName()
+  try {
+    $listArgs = @("build:list", "-p", "android", "--limit", "1", "--non-interactive", "--json")
+    if ($Profile) { $listArgs += @("--build-profile", $Profile) }
+    $prevCi = $env:CI
+    $env:CI = "1"
+    try {
+      & npx --yes --registry "https://registry.npmjs.org" eas-cli@latest @listArgs 1>$tmp 2>$null
+    } finally {
+      if ($null -eq $prevCi) { Remove-Item Env:CI -ErrorAction SilentlyContinue }
+      else { $env:CI = $prevCi }
+    }
+    if (-not (Test-Path -LiteralPath $tmp)) { return }
+    $raw = Get-Content -LiteralPath $tmp -Raw -ErrorAction SilentlyContinue
+    if (-not $raw) { return }
+    $arr = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+    if (-not $arr) { return }
+    $b = if ($arr -is [System.Array]) { $arr[0] } else { $arr }
+    if (-not $b) { return }
+    $url = $b.artifacts.buildUrl
+    if (-not $url) { $url = $b.artifacts.applicationArchiveUrl }
+    Write-Host ("    status={0} profile={1} completedAt={2}" -f $b.status, $b.buildProfile, $b.completedAt)
+    if ($url) {
+      Write-Host "    APK/AAB: $url"
+    } else {
+      Write-Host "    无 artifacts URL，请打开 https://expo.dev 项目 Builds 页下载。"
+    }
+  } catch {
+    Write-Host "    自动查询失败，请打开 https://expo.dev 项目 Builds 页下载。"
+  } finally {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Invoke-EasLogin {
   param([string]$MobilePath)
   Ensure-NodeEnv
@@ -262,7 +321,7 @@ function Invoke-EasLogin {
   Write-Host ""
   Write-Host "==> Expo / EAS 登录 (浏览器或终端按提示操作)"
   Write-Host "    账号需有权访问 app.json 里的 owner / projectId"
-  npx --yes eas-cli@latest login
+  Invoke-EasCli -CliArgs @("login")
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   Write-Host ""
   Write-Host "登录完成。可用方案 B 的 build-android.ps1 或方案 C 菜单继续打包。"
@@ -283,18 +342,22 @@ function Invoke-EasAndroidBuild {
   Write-Host ""
   Write-Host "==> EAS 云构建 Android  profile=$Profile"
   Write-Host "    本机不装 Android SDK；构建在 Expo 云端，完成后给出下载链接。"
-  if ($script:EasNonInteractive) {
-    npx --yes eas-cli@latest build -p android --profile $Profile --non-interactive
-  } else {
-    npx --yes eas-cli@latest build -p android --profile $Profile
-  }
-  if ($LASTEXITCODE -ne 0) {
+  Write-Host "    已禁用 realtime logs（CI=1），避免 Build finished 后卡死。"
+  Write-Host "    若仍无下载链: Ctrl+C 后看下方自动查询，或打开 expo.dev Builds。"
+  $buildArgs = @("build", "-p", "android", "--profile", $Profile)
+  if ($script:EasNonInteractive) { $buildArgs += "--non-interactive" }
+  Invoke-EasCli -CliArgs $buildArgs
+  $code = $LASTEXITCODE
+  if ($null -eq $code) { $code = 0 }
+  Show-LatestEasAndroidArtifact -Profile $Profile
+  if ($code -ne 0) {
     Write-Host ""
-    Write-Host "若提示未登录: 先跑方案 B 的 login.ps1, 或方案 C 菜单选 1."
-    exit $LASTEXITCODE
+    Write-Host "eas-cli 退出码=$code 。若上面已出现 Build finished，云端多半已打完。"
+    Write-Host "若一开始就失败: 先登录 (方案 C 菜单 1)；@expo/logger ETARGET 则 npm cache clean --force 后重试。"
+    exit $code
   }
   Write-Host ""
-  Write-Host "构建已提交/完成。请按终端提示打开链接下载 APK/AAB。"
+  Write-Host "构建已提交/完成。请按上面的 APK/AAB 链接下载；没有链接就去 expo.dev Builds。"
 }
 
 function Invoke-EasUpdate {
@@ -321,11 +384,14 @@ function Invoke-EasUpdate {
   Write-Host "==> EAS 热更新 channel=$Channel"
   Write-Host "    只推 JS/资源；手机需已安装带 expo-updates 的 APK。"
   Write-Host "    改原生库/权限/SDK 请改用打 APK，不要走热更新。"
-  if ($script:EasNonInteractive) {
-    npx --yes eas-cli@latest update --channel $Channel --environment $Channel --message $Message --non-interactive
-  } else {
-    npx --yes eas-cli@latest update --channel $Channel --environment $Channel --message $Message
-  }
+  $updArgs = @(
+    "update",
+    "--channel", $Channel,
+    "--environment", $Channel,
+    "--message", $Message
+  )
+  if ($script:EasNonInteractive) { $updArgs += "--non-interactive" }
+  Invoke-EasCli -CliArgs $updArgs
   if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Host "若提示未登录: 先跑方案 B 的 login.ps1, 或方案 C 菜单选 1."

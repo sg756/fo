@@ -16,6 +16,7 @@ import { useSafeRefresh } from '../hooks/useSafeRefresh';
 import { useTheme } from '../theme/ThemeContext';
 import { fmtDateTimeOrDash, fmtPriceOrDash } from '../utils/format';
 import { filterPositions } from '../utils/positionFilter';
+import { positionCoin, positionProductLabel } from '../utils/positionQuote';
 
 export function PositionsScreen() {
   const { theme } = useTheme();
@@ -86,7 +87,7 @@ export function PositionsScreen() {
             <View key={p.id} style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <View style={styles.top}>
                 <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
-                  <Text style={{ color: theme.text, fontWeight: '800', fontSize: 16 }}>{p.pair}</Text>
+                  <Text style={{ color: theme.text, fontWeight: '800', fontSize: 16 }}>{positionCoin(p)}</Text>
                   <View
                     style={[
                       styles.side,
@@ -107,7 +108,7 @@ export function PositionsScreen() {
                   </View>
                 </View>
                 <Text style={{ color: theme.textSecondary, fontSize: 12 }}>
-                  {p.exchange} · {p.mode}
+                  {[p.exchange, positionProductLabel(p)].filter(Boolean).join(' · ')}
                 </Text>
               </View>
 
