@@ -7,7 +7,7 @@ Linux 服务器要跑 FlowOrder（users-manager），就从这里开始。
 CentOS 9 一键安装 / 更新（必须带数据库账号/密码；库名可选，默认 users_manager）：
   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
     | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
-  也可加 --db-name=users_manager。私有仓先 export GH_TOKEN=...
+  也可加 --db-name=users_manager。私有仓先 export GH_TOKEN=你的PAT
 装完打开 http://服务器IP/ （PORT 默认 80）。
 装完打开 http://服务器IP/ （PORT 默认 80）。
 管理员账号：首次 seed 用 configure 写入 .env 的 ADMIN_EMAIL / ADMIN_PASSWORD（模板默认见 configure.sh）。
@@ -52,7 +52,8 @@ CentOS 9 一键安装 / 更新（必须带数据库账号/密码；库名可选�
 --------------------------------------------------------------------------------
 
   空 Linux 一条命令（推荐）：
-    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=... --db-pass='...'\n    会自动：下载脚本 → 装 Node/MariaDB → 拉 GitHub dist-release.zip → configure → npm/prisma → 启动
+    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
+    会自动：下载脚本 → 装 Node/MariaDB → 拉 GitHub dist-release.zip → configure → npm/prisma → 启动
 
   已有脚本目录时：
     1. 改 floworder.conf

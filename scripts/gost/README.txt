@@ -11,8 +11,11 @@ GOST 代理（用户操作说明）
   check-gost-speed.sh       ← 查内存占用，以及经代理的延迟和下载速度
 
 一、首次安装（执行顺序）
-  1. 编辑 gost.conf，改 GOST_USER / GOST_PASS / GOST_PORT
-  2. sudo bash install-gost-centos9.sh
+  服务器一条命令（不用先上传文件，端口默认 1080）：
+    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh \
+      | sudo bash -s -- --user='你的账号' --pass='你的密码'
+  本机已放下脚本时，仍可编辑 gost.conf 后：
+    sudo bash install-gost-centos9.sh
   3. 看屏幕打印：
        局域网 IP:端口  → 填中间件 / 业务侧的 proxyIP（同内网）
        公网 IP         → 填交易所白名单

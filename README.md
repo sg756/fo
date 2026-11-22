@@ -38,15 +38,21 @@
    ---本机发版---
    本机 build.ps1 → 生成 dist-release\ 与 dist-release.zip → 上传 zip 到 Release tag=dist，
    或把 dist-release\ 内容覆盖到服务器 APP_ROOT 后再 apply-dist / fetch-dist。
-1.2.1 手机版发布
-    方式：Expo EAS 云构建（本机 Windows，无需 Android SDK）
-    一键正式 APK：
-      powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -ApiBase http://服务器IP/api
-    首次每台电脑先登录：
-      powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action login
-    其它：-Profile preview|store ；热更新 -Action update ；H5 -Action web
+1.2.1 手机版一键打包
+    方式：Expo EAS 云构建（本机 Windows，无需 Android SDK）。本机已有仓库。
+    必填缺一个就退出，不开始打包：-ApiBase -AppName -PackageName
+      powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 `
+        -ApiBase http://服务器IP/api `
+        -AppName "你的应用名" `
+        -PackageName com.example.app
+    -Icon 可不填，用仓库默认图标。要换图再加 -Icon D:\你的图标.png（必须是已存在的 .png）
+    -ExpoToken 可不填。没登录会打开浏览器；已有 Token 再加 -ExpoToken "你的ExpoToken"
+    换 Expo 账号加 -sw（仍要带上面三个必填，浏览器里登录新账号）：
+      powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -sw `
+        -ApiBase http://服务器IP/api -AppName "你的应用名" -PackageName com.example.app
+    内测加 -Profile preview；上架加 -Profile store
+    热更新：powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action update -ApiBase http://服务器IP/api
     菜单版：scripts\mobile\C\build.ps1
-    没有 Expo 账号先注册；项目首次需在 apps\mobile 执行 npx eas-cli init（写 owner/projectId）。
 
    改应用名 / 包名 / 图标（都在 apps\mobile）
    没有 app.json 时，把 app.json.example 复制为 app.json（打包脚本也会自动复制）。
@@ -70,8 +76,12 @@
      apps\mobile\assets\favicon.png                      H5 网页图标
      换图后重新 .\build.ps1 打 APK。只改 JS 的热更新不会换图标。
 
-1.4 linux代理安装
-      上传 `scripts/gost 目录下的 gost.conf  install-gost-contos9.sh  这两文件在服务器需同一目录 建议 /opt/gost。gost.conf 中需要指定代理的账号密码和端口 ，可先windows改在上传,上传完成请在linux上 输入命令: sudo bash /opt/gost/install-gost-centos9.sh。
+1.4 linux 代理一键安装（GOST，CentOS 9）
+      不用先上传文件。账号密码写在命令里，端口默认 1080。文档里不写真实密码：
+      curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh \
+        | sudo bash -s -- --user='你的账号' --pass='你的密码'
+      换端口再加 --port=1080。云安全组也要放行这个端口。
+      装完屏幕会打印局域网 IP:端口（填中间件 proxyIP）和公网 IP（填交易所白名单）。
 
  1.5 开发环境搭建
    本机 Windows 改代码调试用这一节。和上面 1.1 / 1.2 的「只编译再上传 Linux」不是同一条路。

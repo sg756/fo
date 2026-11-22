@@ -15,8 +15,16 @@ FlowOrder / users-manager 运维脚本总说明
   scripts/h5-nginx/         → 另一台机 nginx 托管 H5 + /api 反代
   scripts/dev/              → 本机 Windows 开发环境（Node / env / 建库）
 
-空机一键（CentOS 9）：
-  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=... --db-pass='...'
+空机一键（CentOS 9，密码用占位，不要把真密码写进说明）：
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
+  私有仓先 export GH_TOKEN=你的PAT
+
+GOST 代理一键（CentOS 9，端口默认 1080）：
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh | sudo bash -s -- --user='你的账号' --pass='你的密码'
+
+手机版一键打包（本机已有仓库，三个必填；Token 可不填）：
+  powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -ApiBase http://服务器IP/api -AppName "你的应用名" -PackageName com.example.app
+  换 Expo 账号在前面加 -sw。已有 Token 再加 -ExpoToken "你的ExpoToken"
 
 配置文件（脚本执行前先改）：
   服务器：install-env/floworder.conf

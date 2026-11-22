@@ -17,6 +17,8 @@ apps/api/.env.dev
 # 本机 App / 编译路径与 Expo 账号（从同目录 *.example 复制）
 apps/mobile/app.json
 scripts/mobile/mobile.conf
+scripts/mobile/.expo-token
+scripts/mobile/eas.local.json
 scripts/deploy-windows/build.conf
 
 # 含本机号码等约定，不进 GitHub

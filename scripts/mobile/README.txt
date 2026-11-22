@@ -17,15 +17,19 @@ App（Expo）打包脚本总说明
 
 
 选哪个？
-  一键命令（推荐熟练后）→ one-click.ps1
-       正式 APK：
-         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -ApiBase http://服务器IP/api
-       内测 APK：
-         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Profile preview -ApiBase http://服务器IP/api
-       热更新：
+  用户自己打包 → one-click.ps1
+       必填缺一即报错退出：-ApiBase -AppName -PackageName
+       -Icon 可不填、"" 或空格，此时用仓库默认图标
+       -ExpoToken 可不填：未登录会打开浏览器，成功后登录态和 projectId 记在本机
+       换账号加 -sw：退出旧账号、清空旧 projectId，再登录新账号并继续打包
+         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 `
+           -ApiBase http://服务器IP/api -AppName "你的应用名" -PackageName com.example.app `
+           -ExpoToken "你的ExpoToken"
+         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -sw `
+           -ApiBase http://服务器IP/api -AppName "你的应用名" -PackageName com.example.app
+       内测加 -Profile preview；上架加 -Profile store
+       热更新仍只需 -ApiBase：
          powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action update -ApiBase http://服务器IP/api
-       首次登录：
-         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action login
   给不熟命令的人 → 方案 C 菜单
        powershell -ExecutionPolicy Bypass -File scripts\mobile\C\build.ps1
   喜欢分步 → 方案 B

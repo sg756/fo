@@ -1,23 +1,54 @@
 #!/usr/bin/env bash
 # ============================================================
 #  GOST 安装脚本（CentOS 9 / RHEL 9）
-#  1) 编辑同目录 gost.conf（账号/密码/端口）
-#  2) sudo bash install-gost-centos9.sh
+#  一键（账号密码写在命令里，端口可省略，默认 1080）：
+#    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh \
+#      | sudo bash -s -- --user='你的账号' --pass='你的密码'
+#  本机已有同目录 gost.conf 时，仍可：sudo bash install-gost-centos9.sh
+#  命令行参数会覆盖 gost.conf。
 # ============================================================
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF_FILE="${SCRIPT_DIR}/gost.conf"
+GOST_USER_CLI=""
+GOST_PASS_CLI=""
+GOST_PORT_CLI=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user=*) GOST_USER_CLI="${1#*=}" ;;
+    --pass=*) GOST_PASS_CLI="${1#*=}" ;;
+    --port=*) GOST_PORT_CLI="${1#*=}" ;;
+    --user) shift; GOST_USER_CLI="${1:-}" ;;
+    --pass) shift; GOST_PASS_CLI="${1:-}" ;;
+    --port) shift; GOST_PORT_CLI="${1:-}" ;;
+    -h|--help)
+      echo "用法: curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh | sudo bash -s -- --user='你的账号' --pass='你的密码' [--port=1080]"
+      exit 0
+      ;;
+    *)
+      echo "未知参数: $1（需要 --user / --pass，端口可选 --port）" >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
-if [[ ! -f "${CONF_FILE}" ]]; then
-  echo "找不到配置文件: ${CONF_FILE}" >&2
-  echo "请先编辑同目录下的 gost.conf" >&2
-  exit 1
+CONF_FILE=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "${SCRIPT_DIR}/gost.conf" ]]; then
+    CONF_FILE="${SCRIPT_DIR}/gost.conf"
+  fi
 fi
 
-# shellcheck disable=SC1090
-source "${CONF_FILE}"
+if [[ -n "${CONF_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONF_FILE}"
+fi
+
+if [[ -n "${GOST_USER_CLI}" ]]; then GOST_USER="${GOST_USER_CLI}"; fi
+if [[ -n "${GOST_PASS_CLI}" ]]; then GOST_PASS="${GOST_PASS_CLI}"; fi
+if [[ -n "${GOST_PORT_CLI}" ]]; then GOST_PORT="${GOST_PORT_CLI}"; fi
 
 GOST_VERSION="${GOST_VERSION:-3.0.0-rc10}"
 GOST_LISTEN="${GOST_LISTEN:-0.0.0.0}"
@@ -26,20 +57,30 @@ CONFIG_DIR="/etc/gost"
 SERVICE_NAME="gost"
 
 if [[ "$(id -u)" -ne 0 ]]; then
-  echo "请用 root 执行：sudo bash $0" >&2
-  exit 1
-fi
-
-if [[ -z "${GOST_PORT:-}" ]]; then
-  echo "请在 gost.conf 中填写 GOST_PORT" >&2
+  echo "请用 root 执行：curl ... | sudo bash -s -- --user='你的账号' --pass='你的密码'" >&2
   exit 1
 fi
 
 GOST_USER="${GOST_USER:-}"
 GOST_PASS="${GOST_PASS:-}"
-# 账号/密码：都空=无鉴权；只填一项不允许
+GOST_PORT="${GOST_PORT:-}"
+
+if [[ -z "${CONF_FILE}" ]]; then
+  if [[ -z "${GOST_USER}" || -z "${GOST_PASS}" ]]; then
+    echo "一键安装必须带 --user 与 --pass。" >&2
+    echo "示例: curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh | sudo bash -s -- --user='你的账号' --pass='你的密码'" >&2
+    exit 1
+  fi
+  GOST_PORT="${GOST_PORT:-1080}"
+fi
+
+if [[ -z "${GOST_PORT}" ]]; then
+  echo "请在命令里加 --port，或在 gost.conf 中填写 GOST_PORT" >&2
+  exit 1
+fi
+
 if [[ -n "${GOST_USER}" && -z "${GOST_PASS}" ]] || [[ -z "${GOST_USER}" && -n "${GOST_PASS}" ]]; then
-  echo "GOST_USER / GOST_PASS 需同时填写，或同时留空（无鉴权）" >&2
+  echo "账号和密码必须同时填写，或同时留空（无鉴权）" >&2
   exit 1
 fi
 
@@ -70,7 +111,11 @@ trap cleanup EXIT
 ASSET="gost_${GOST_VERSION}_linux_${GOST_ARCH}.tar.gz"
 URL="https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/${ASSET}"
 
-echo "==> 读取配置 ${CONF_FILE}"
+if [[ -n "${CONF_FILE}" ]]; then
+  echo "==> 读取配置 ${CONF_FILE}"
+else
+  echo "==> 使用命令行账号密码"
+fi
 if [[ -n "${GOST_USER}" && -n "${GOST_PASS}" ]]; then
   echo "    鉴权=有 用户=${GOST_USER} 端口=${GOST_PORT}"
 else
