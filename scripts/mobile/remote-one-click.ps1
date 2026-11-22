@@ -117,7 +117,18 @@ function Expand-Repo {
   if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
   Move-Item -LiteralPath $root -Destination $dest
   Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+  Add-Ps1Utf8Bom -Root $dest
   return $dest
+}
+
+function Add-Ps1Utf8Bom {
+  param([string]$Root)
+  $utf8 = New-Object System.Text.UTF8Encoding $true
+  Get-ChildItem -LiteralPath $Root -Recurse -Filter *.ps1 -File | ForEach-Object {
+    $text = [IO.File]::ReadAllText($_.FullName)
+    if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+    [IO.File]::WriteAllText($_.FullName, $text, $utf8)
+  }
 }
 
 Test-RemoteParams
