@@ -39,21 +39,14 @@
    本机 build.ps1 → 生成 dist-release\ 与 dist-release.zip → 上传 zip 到 Release tag=dist，
    或把 dist-release\ 内容覆盖到服务器 APP_ROOT 后再 apply-dist / fetch-dist。
 1.2.1 手机版发布
-    方式：Expo EAS 云构建 
-  - 需要：能跑 Node（可自动下便携版）+ Expo 账号登录 + 能上网
-    在源码目录找到build.ps1,   一般路径scripts\mobile\C\build.ps1
-    打开powershell 中 命令 cd  盘符:\\源码目录\scripts\mobile\C  进入到当前目录 再执行.\build.ps1，命令会列出 
-    1) 登录 Expo / EAS (每台电脑首次必做)
-    2) 打内测 APK (profile=preview)
-    3) 打正式 APK (profile=production)
-    4) 打上架 AAB (profile=store, 仅 Google Play)
-    5) 导出 Web H5
-    6) 热更新正式包 (channel=production, 只改 JS)
-    7) 热更新内测包 (channel=preview, 只改 JS)
-    0) 退出
-   没有账号 先选1登录expo 去注册账号，注册成功后。第一登录需要执行一次命令初始化,在命令行中执行 
-    npx eas-cli init 。按提示用当前账号新建或关联项目，它会改 app.json 的 owner、projectId。 
-   再执行一次.\build.ps1 选3确定就行 ，如果有交互然后一路yes确认.
+    方式：Expo EAS 云构建（本机 Windows，无需 Android SDK）
+    一键正式 APK：
+      powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -ApiBase http://服务器IP/api
+    首次每台电脑先登录：
+      powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action login
+    其它：-Profile preview|store ；热更新 -Action update ；H5 -Action web
+    菜单版：scripts\mobile\C\build.ps1
+    没有 Expo 账号先注册；项目首次需在 apps\mobile 执行 npx eas-cli init（写 owner/projectId）。
 
    改应用名 / 包名 / 图标（都在 apps\mobile）
    没有 app.json 时，把 app.json.example 复制为 app.json（打包脚本也会自动复制）。

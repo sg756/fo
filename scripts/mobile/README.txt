@@ -17,14 +17,22 @@ App（Expo）打包脚本总说明
 
 
 选哪个？
-  给不熟命令的人 → 方案 C
+  一键命令（推荐熟练后）→ one-click.ps1
+       正式 APK：
+         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -ApiBase http://服务器IP/api
+       内测 APK：
+         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Profile preview -ApiBase http://服务器IP/api
+       热更新：
+         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action update -ApiBase http://服务器IP/api
+       首次登录：
+         powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 -Action login
+  给不熟命令的人 → 方案 C 菜单
        powershell -ExecutionPolicy Bypass -File scripts\mobile\C\build.ps1
-       （脚本为 UTF-8 BOM，避免中文乱码解析失败）
-  喜欢分步、可写进文档清单 → 方案 B
+  喜欢分步 → 方案 B
        先 B\login.ps1 ，再 B\build-android.ps1
-       只改 JS 发热更新：B\update.ps1
+       热更新：B\update.ps1
 
-两套功能等价，共用 mobile.conf。
+共用 mobile.conf。一键脚本会把 -ApiBase 写进 conf 并默认非交互。
 
 
 首次注意

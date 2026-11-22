@@ -38,6 +38,32 @@ function Expand-ConfPath {
   return [Environment]::ExpandEnvironmentVariables($Value)
 }
 
+function Set-MobileConfValue {
+  param(
+    [Parameter(Mandatory = $true)][string]$Key,
+    [Parameter(Mandatory = $true)][string]$Value
+  )
+  if (-not (Test-Path -LiteralPath $ConfFile)) {
+    Write-Error "找不到配置: $ConfFile"
+  }
+  $lines = Get-Content -LiteralPath $ConfFile -Encoding UTF8
+  $done = $false
+  $out = foreach ($line in $lines) {
+    if ($line -match "^\s*$([regex]::Escape($Key))\s*=") {
+      $done = $true
+      "$Key=$Value"
+    } else {
+      $line
+    }
+  }
+  if (-not $done) {
+    $out = @($out) + "$Key=$Value"
+  }
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllLines($ConfFile, $out, $utf8)
+  $script:MobileConf[$Key] = $Value
+}
+
 $script:MobileConf = Read-MobileConf -Path $ConfFile
 $script:SkipConfirm = $false
 if ($script:MobileConf["SKIP_CONFIRM"] -match '^(true|1|yes)$') { $script:SkipConfirm = $true }
