@@ -80,6 +80,10 @@ echo
 echo "【bootstrap】完成。"
 echo "  APP_ROOT: ${APP_ROOT}"
 echo "  管理端: http://服务器IP:${PORT:-80}/"
+echo "  H5:     http://服务器IP:${PORT:-80}/h5/"
 echo "  API:    http://服务器IP:${PORT:-80}/api"
+if [[ ! -f "${APP_ROOT}/apps/h5/index.html" ]]; then
+  echo "  警告: 发布包里没有 apps/h5/index.html，H5 页面不会出现。" >&2
+fi
 echo "  业务库: ${DB_NAME} / ${DB_USER}"
 echo "  管理员账号见 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（seed 首次写入）。"
