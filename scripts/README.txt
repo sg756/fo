@@ -16,7 +16,7 @@ FlowOrder / users-manager 运维脚本总说明
   scripts/dev/              → 本机 Windows 开发环境（Node / env / 建库）
 
 空机一键（CentOS 9）：
-  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=... --db-pass='...'
 
 配置文件（脚本执行前先改）：
   服务器：install-env/floworder.conf

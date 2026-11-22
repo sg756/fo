@@ -22,8 +22,9 @@
    推 main 时 Actions 会自动编包，或本机 build.ps1 生成 zip 后手动挂到 Release）。
 
    空机器一条命令（不用先改配置、不用先上传代码）：
-   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
-   私有仓先 export GH_TOKEN=你的PAT 再执行。
+   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
+     | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
+   库名可加 --db-name=users_manager（默认即此）。私有仓先 export GH_TOKEN=你的PAT。
    装完打开 http://服务器IP/ 。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567）。
    以后更新程序可再跑同一条，或：
    sudo bash /opt/dist-release/scripts/install-env/fetch-dist.sh

@@ -64,8 +64,8 @@ jobs:
           name: dist-release
           body: |
             Linux 一键安装用的发布包（不含 node_modules、不含 .env）。
-            空机器：
-            `curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash`
+            空机器（必须带数据库账号密码）：
+            `curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'`
           files: dist-release.zip
           make_latest: true
           overwrite: true

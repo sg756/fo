@@ -19,6 +19,74 @@ source_conf() {
   source /dev/stdin <<< "$(tr -d '\r' < "$f")"
 }
 
+# 一键安装参数：--db-user= --db-pass= 必填；--db-name= 可选（默认 users_manager）
+# 也可用环境变量 DB_USER / DB_PASS / DB_NAME
+parse_bootstrap_args() {
+  FO_DB_USER="${DB_USER:-}"
+  FO_DB_PASS="${DB_PASS:-}"
+  FO_DB_NAME="${DB_NAME:-}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --db-user=*) FO_DB_USER="${1#*=}" ;;
+      --db-pass=*) FO_DB_PASS="${1#*=}" ;;
+      --db-name=*) FO_DB_NAME="${1#*=}" ;;
+      --db-user) shift; FO_DB_USER="${1:-}" ;;
+      --db-pass) shift; FO_DB_PASS="${1:-}" ;;
+      --db-name) shift; FO_DB_NAME="${1:-}" ;;
+      -h|--help)
+        echo "用法: ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名]"
+        echo "  库名默认 users_manager。也可用环境变量 DB_USER / DB_PASS / DB_NAME。"
+        exit 0
+        ;;
+      *)
+        echo "未知参数: $1" >&2
+        echo "需要: --db-user=... --db-pass=... [--db-name=users_manager]" >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+  FO_DB_NAME="${FO_DB_NAME:-users_manager}"
+}
+
+require_db_creds() {
+  if [[ -z "${FO_DB_USER:-}" || -z "${FO_DB_PASS:-}" ]]; then
+    echo "一键安装必须指定数据库账号和密码。" >&2
+    echo "示例:" >&2
+    echo "  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'" >&2
+    echo "  可选 --db-name=users_manager（默认就是这个库名）" >&2
+    exit 1
+  fi
+  if [[ "${FO_DB_PASS}" == "ChangeMe_DbPass_2026" ]]; then
+    echo "请不要使用模板占位密码 ChangeMe_DbPass_2026，请换成你自己的 DB 密码。" >&2
+    exit 1
+  fi
+}
+
+# 把账号/密码/库名写回 floworder.conf（供 install/configure 读取）
+write_db_creds_conf() {
+  local file=${1:-./floworder.conf}
+  local tmp
+  tmp="$(mktemp)"
+  awk -v u="${FO_DB_USER}" -v p="${FO_DB_PASS}" -v n="${FO_DB_NAME}" '
+    BEGIN { fu=0; fp=0; fn=0 }
+    /^DB_USER=/ { print "DB_USER=" u; fu=1; next }
+    /^DB_PASS=/ { print "DB_PASS=" p; fp=1; next }
+    /^DB_NAME=/ { print "DB_NAME=" n; fn=1; next }
+    { print }
+    END {
+      if (!fu) print "DB_USER=" u
+      if (!fp) print "DB_PASS=" p
+      if (!fn) print "DB_NAME=" n
+    }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  DB_USER="${FO_DB_USER}"
+  DB_PASS="${FO_DB_PASS}"
+  DB_NAME="${FO_DB_NAME}"
+  export DB_USER DB_PASS DB_NAME
+}
+
 # 发布根：脚本在仓库 scripts/install-env 下且已有产物时，优先用上两级。
 # 空机 curl 一键（脚本在 /tmp）时，仍用 conf 的 APP_ROOT。
 resolve_app_root() {

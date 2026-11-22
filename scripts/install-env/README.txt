@@ -4,8 +4,11 @@ install-env/ · 服务器装环境 + GitHub 一键安装
 Linux 服务器要跑 FlowOrder（users-manager），就从这里开始。
 编译在 Windows 本机（../deploy-windows/）或 GitHub Actions；本目录负责装环境、拉包、写配置、应用产物。
 
-CentOS 9 一键安装 / 更新（推荐，不用先改配置、不用先上传代码）：
-  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
+CentOS 9 一键安装 / 更新（必须带数据库账号/密码；库名可选，默认 users_manager）：
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
+    | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
+  也可加 --db-name=users_manager。私有仓先 export GH_TOKEN=...
+装完打开 http://服务器IP/ （PORT 默认 80）。
 装完打开 http://服务器IP/ （PORT 默认 80）。
 管理员账号：首次 seed 用 configure 写入 .env 的 ADMIN_EMAIL / ADMIN_PASSWORD（模板默认见 configure.sh）。
 同一条命令可用来更新程序：覆盖发布包，保留 apps/api/.env、logs/、backup/。
@@ -39,7 +42,8 @@ CentOS 9 一键安装 / 更新（推荐，不用先改配置、不用先上传�
   编辑 floworder.conf（至少）：
     APP_ROOT     推荐 /opt/dist-release（不要放 /root 下）
     PORT         对外端口
-    DB_PASS      库密码（生产务必改；一键安装后也可在服务器 conf 里改再 configure）
+    DB_USER/DB_PASS  一键安装必须用命令行传入；会写进本 conf
+    DB_NAME     默认 users_manager
     GITHUB_REPO / GITHUB_RELEASE_TAG  默认 sg756/fo + dist
 
 
@@ -48,8 +52,7 @@ CentOS 9 一键安装 / 更新（推荐，不用先改配置、不用先上传�
 --------------------------------------------------------------------------------
 
   空 Linux 一条命令（推荐）：
-    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
-    会自动：下载脚本 → 装 Node/MariaDB → 拉 GitHub dist-release.zip → configure → npm/prisma → 启动
+    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=... --db-pass='...'\n    会自动：下载脚本 → 装 Node/MariaDB → 拉 GitHub dist-release.zip → configure → npm/prisma → 启动
 
   已有脚本目录时：
     1. 改 floworder.conf
