@@ -39,8 +39,14 @@
    本机 build.ps1 → 生成 dist-release\ 与 dist-release.zip → 上传 zip 到 Release tag=dist，
    或把 dist-release\ 内容覆盖到服务器 APP_ROOT 后再 apply-dist / fetch-dist。
 1.2.1 手机版一键打包
-    方式：Expo EAS 云构建（本机 Windows，无需 Android SDK）。本机已有仓库。
+    方式：Expo EAS 云构建。空 Windows 不用先装 Node、不用先下代码、不用 Android SDK。
     必填缺一个就退出，不开始打包：-ApiBase -AppName -PackageName
+    一条命令（第一次没登录会打开浏览器）：
+      powershell -NoProfile -ExecutionPolicy Bypass -Command '& { $d = Join-Path $env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile $d; & $d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'
+    私有仓再加 -GhToken '你的PAT'。图标可不填，要换图再加 -Icon D:\你的图标.png
+    -ExpoToken 可不填；已有 Token 再加 -ExpoToken "你的ExpoToken"
+    换 Expo 账号在 -ApiBase 前加 -sw。
+    本机已经有仓库时，也可以：
       powershell -ExecutionPolicy Bypass -File scripts\mobile\one-click.ps1 `
         -ApiBase http://服务器IP/api `
         -AppName "你的应用名" `

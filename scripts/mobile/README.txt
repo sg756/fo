@@ -17,7 +17,10 @@ App（Expo）打包脚本总说明
 
 
 选哪个？
-  用户自己打包 → one-click.ps1
+  用户什么都没装 → remote-one-click.ps1（一条命令下载源码、装 Node、云端打包）
+       powershell -NoProfile -ExecutionPolicy Bypass -Command '& { $d = Join-Path $env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile $d; & $d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'
+       私有仓加 -GhToken '你的PAT'
+  本机已有仓库 → one-click.ps1
        必填缺一即报错退出：-ApiBase -AppName -PackageName
        -Icon 可不填、"" 或空格，此时用仓库默认图标
        -ExpoToken 可不填：未登录会打开浏览器，成功后登录态和 projectId 记在本机
