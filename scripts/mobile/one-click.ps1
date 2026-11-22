@@ -136,6 +136,7 @@ function Invoke-EasDirect {
   $prevCi = $env:CI
   if ($AllowPrompt) { Remove-Item Env:CI -ErrorAction SilentlyContinue }
   else { $env:CI = "1" }
+  $env:EAS_NO_VCS = "1"
   $global:LASTEXITCODE = 0
   $old = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
@@ -317,6 +318,8 @@ $MobileRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $MobileRoot "common.ps1")
 $script:SkipConfirm = $true
 $script:EasNonInteractive = $true
+# 下载的是 zip，没有 .git。不让 eas 停下来要求 git init / 提交。
+$env:EAS_NO_VCS = "1"
 
 Write-Host ""
 Write-Host "========================================"

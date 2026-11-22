@@ -296,6 +296,7 @@ function Invoke-EasCli {
   Write-Host "    eas-cli 使用官方源: $reg"
   $prevCi = $env:CI
   $env:CI = "1"
+  $env:EAS_NO_VCS = "1"
   $global:LASTEXITCODE = 0
   try {
     & npx --yes --registry $reg eas-cli@latest @CliArgs
