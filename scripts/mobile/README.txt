@@ -18,7 +18,7 @@ App（Expo）打包脚本总说明
 
 选哪个？
   用户什么都没装 → remote-one-click.ps1（一条命令下载源码、装 Node、云端打包）
-       powershell -NoProfile -ExecutionPolicy Bypass -Command '& { $d = Join-Path $env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile $d; & $d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'
+       Set-ExecutionPolicy Bypass -Scope Process -Force; $d = Join-Path $env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile $d; & $d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'
        私有仓加 -GhToken '你的PAT'
   本机已有仓库 → one-click.ps1
        必填缺一即报错退出：-ApiBase -AppName -PackageName

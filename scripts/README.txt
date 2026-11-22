@@ -23,7 +23,7 @@ GOST 代理一键（CentOS 9，端口默认 1080）：
   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh | sudo bash -s -- --user='你的账号' --pass='你的密码'
 
 手机版一键打包（空 Windows，不用先装 Node、不用先下代码）：
-  powershell -NoProfile -ExecutionPolicy Bypass -Command '& { $d = Join-Path $env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile $d; & $d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'
+  Set-ExecutionPolicy Bypass -Scope Process -Force; $d = Join-Path $env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile $d; & $d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'
   私有仓加 -GhToken '你的PAT'。换 Expo 账号加 -sw。已有 Token 再加 -ExpoToken "你的ExpoToken"
 
 配置文件（脚本执行前先改）：

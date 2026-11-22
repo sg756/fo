@@ -42,7 +42,7 @@
     方式：Expo EAS 云构建。空 Windows 不用先装 Node、不用先下代码、不用 Android SDK。
     必填缺一个就退出，不开始打包：-ApiBase -AppName -PackageName
     一条命令（第一次没登录会打开浏览器）：
-      powershell -NoProfile -ExecutionPolicy Bypass -Command '& { $d = Join-Path $env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile $d; & $d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'
+      Set-ExecutionPolicy Bypass -Scope Process -Force; $d = Join-Path $env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile $d; & $d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'
     私有仓再加 -GhToken '你的PAT'。图标可不填，要换图再加 -Icon D:\你的图标.png
     -ExpoToken 可不填；已有 Token 再加 -ExpoToken "你的ExpoToken"
     换 Expo 账号在 -ApiBase 前加 -sw。

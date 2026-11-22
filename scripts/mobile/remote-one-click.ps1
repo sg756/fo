@@ -5,7 +5,7 @@
 # 必填：-ApiBase -AppName -PackageName
 # 可选：-Icon -ExpoToken -sw -Profile -GhToken（私有仓才需要）
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command '& { $d = Join-Path $env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile $d; & $d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'
+#   Set-ExecutionPolicy Bypass -Scope Process -Force; $d = Join-Path $env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile $d; & $d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'
 # =============================================================================
 
 param(
@@ -33,7 +33,7 @@ $ProgressPreference = "SilentlyContinue"
 
 function Show-RemoteUsage {
   Write-Host "空机器一条命令（必填三个，缺一个就退出）：" -ForegroundColor Yellow
-  Write-Host "  powershell -NoProfile -ExecutionPolicy Bypass -Command '& { `$d = Join-Path `$env:TEMP ''fo-app.ps1''; irm ''https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1'' -OutFile `$d; & `$d -ApiBase ''http://服务器IP/api'' -AppName ''你的应用名'' -PackageName ''com.example.app'' }'"
+  Write-Host "  Set-ExecutionPolicy Bypass -Scope Process -Force; `$d = Join-Path `$env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile `$d; & `$d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'"
   Write-Host "私有仓再加 -GhToken '你的PAT'。图标可不填。没登录 Expo 会打开浏览器。"
 }
 
