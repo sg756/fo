@@ -222,7 +222,10 @@ function Ensure-EasProject {
     $projectId = [string]$cfg.expo.extra.eas.projectId
   }
   if (-not $projectId) {
-    Write-Host "==> app.json 还没有 projectId，正在创建并写入 owner / projectId"
+    Write-Host "==> app.json 还没有 projectId，先安装依赖再创建项目"
+    Ensure-NodeEnv
+    Prepare-MobileProject -MobilePath $MobilePath
+    Write-Host "==> 正在创建并写入 owner / projectId"
     Push-Location $MobilePath
     try {
       Invoke-EasDirect -CliArgs @("init", "--non-interactive", "--force")

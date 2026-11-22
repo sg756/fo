@@ -273,6 +273,12 @@ export const PACKAGED_WEB_API_BASE = '$web';
 function Prepare-MobileProject {
   param([string]$MobilePath)
   Set-MobileApiEndpoint -MobilePath $MobilePath
+  $plugin = Join-Path $MobilePath "node_modules\expo-build-properties\package.json"
+  if (Test-Path -LiteralPath $plugin) {
+    Write-Host "==> 依赖已安装，跳过 npm ci"
+    Set-Location $MobilePath
+    return
+  }
   Write-Host "==> 安装依赖 npm ci ($MobilePath)"
   Set-Location $MobilePath
   npm ci
