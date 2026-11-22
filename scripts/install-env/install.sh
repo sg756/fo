@@ -38,19 +38,27 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
 [[ -n "${FO_DB_PASS:-}" ]] && DB_PASS="${FO_DB_PASS}"
 [[ -n "${FO_DB_NAME:-}" ]] && DB_NAME="${FO_DB_NAME}"
 
-# 优先：已配置密码的 TCP；否则：本机 socket（系统 root 常见免密）
+# 探测用：强制 </dev/null，避免偶发从 stdin 读 SQL
+mysql_ping_socket() {
+  mysql -uroot -e "SELECT 1" </dev/null >/dev/null 2>&1
+}
+
+mysql_ping_tcp() {
+  local pass=$1
+  mysql -uroot -p"${pass}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" </dev/null >/dev/null 2>&1
+}
+
+# 执行 SQL：不要在函数里重定向 stdin，否则 <<SQL heredoc 会被吃掉（曾导致 ALTER 没执行）
 mysql_root() {
-  # </dev/null：避免 curl|bash 场景下 mysql 继续读 stdin 把后续脚本吃掉
-  if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] \
-    && mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" </dev/null >/dev/null 2>&1; then
-    mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 "$@" </dev/null
+  if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] && mysql_ping_tcp "${MYSQL_ROOT_PASSWORD}"; then
+    mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 "$@"
     return
   fi
-  mysql -uroot "$@" </dev/null
+  mysql -uroot "$@"
 }
 
 mysql_socket() {
-  mysql -uroot "$@" </dev/null
+  mysql -uroot "$@"
 }
 
 # 注意：不能用 tr|head（pipefail 下 head 提前关闭管道会使 tr 以 141 失败，脚本会静默退出）
@@ -94,13 +102,12 @@ ensure_mysql_root_password() {
   local sql_esc
   local via_socket=0
 
-  if mysql_socket -e "SELECT 1" >/dev/null 2>&1; then
+  if mysql_ping_socket; then
     via_socket=1
   fi
 
   if [[ "${via_socket}" -eq 0 ]]; then
-    if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] \
-      && mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" >/dev/null 2>&1; then
+    if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] && mysql_ping_tcp "${MYSQL_ROOT_PASSWORD}"; then
       echo "    MariaDB root 已可用（密码登录），保留现有 MYSQL_ROOT_PASSWORD"
       return 0
     fi
@@ -120,16 +127,27 @@ ensure_mysql_root_password() {
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${sql_esc}';
 CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY '${sql_esc}';
 ALTER USER 'root'@'127.0.0.1' IDENTIFIED BY '${sql_esc}';
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
 
   save_mysql_root_password_to_conf "${MYSQL_ROOT_PASSWORD}"
 
-  if ! mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" >/dev/null 2>&1; then
-    echo "已写 root 密码，但 TCP 校验失败。请检查 MariaDB 认证插件。" >&2
-    exit 1
+  # 等认证生效再测 TCP；失败不阻断（业务库走业务账号，后续仍可用 socket 建库）
+  local tcp_ok=0
+  local i
+  for i in 1 2 3 4 5; do
+    if mysql_ping_tcp "${MYSQL_ROOT_PASSWORD}"; then
+      tcp_ok=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${tcp_ok}" -eq 1 ]]; then
+    echo "    MariaDB root 密码已就绪（TCP + socket 可用）"
+  else
+    echo "    警告: root 的 TCP(127.0.0.1) 校验未通过，将继续用 socket 建业务库（一般可忽略）" >&2
   fi
-  echo "    MariaDB root 密码已就绪（可用 TCP + MYSQL_ROOT_PASSWORD）"
 }
 
 setup_mysql() {
@@ -157,12 +175,11 @@ setup_mysql() {
   # 启动等待：先试 socket，再试 conf 密码（避免「conf 填了错密码却挡住 socket」）
   local ok=0
   for _ in $(seq 1 30); do
-    if mysql_socket -e "SELECT 1" >/dev/null 2>&1; then
+    if mysql_ping_socket; then
       ok=1
       break
     fi
-    if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] \
-      && mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" >/dev/null 2>&1; then
+    if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] && mysql_ping_tcp "${MYSQL_ROOT_PASSWORD}"; then
       ok=1
       break
     fi
