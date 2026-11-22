@@ -19,19 +19,24 @@ if [[ ! -f "${CONF_FILE}" ]]; then
   exit 1
 fi
 
+# 去 Windows 回车后再 source；命令行/环境里的 DB_* 优先于 conf 占位
 # shellcheck disable=SC1090
-source "${CONF_FILE}"
+source /dev/stdin <<< "$(tr -d '\r' < "${CONF_FILE}")"
 
-APP_ROOT="${APP_ROOT:-/opt/users-manager}"
+APP_ROOT="${APP_ROOT:-/opt/dist-release}"
 PORT="${PORT:-80}"
 RUN_USER="${RUN_USER:-users-manager}"
 MYSQL_AUTO="${MYSQL_AUTO:-true}"
 DB_HOST="${DB_HOST:-127.0.0.1}"
 DB_PORT="${DB_PORT:-3306}"
 DB_NAME="${DB_NAME:-users_manager}"
-DB_USER="${DB_USER:-users_manager}"
+DB_USER="${DB_USER:-users_flow}"
 DB_PASS="${DB_PASS:-ChangeMe_DbPass_2026}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
+# 一键传入的库账号覆盖 conf（bootstrap 已写回 conf，这里再兜底）
+[[ -n "${FO_DB_USER:-}" ]] && DB_USER="${FO_DB_USER}"
+[[ -n "${FO_DB_PASS:-}" ]] && DB_PASS="${FO_DB_PASS}"
+[[ -n "${FO_DB_NAME:-}" ]] && DB_NAME="${FO_DB_NAME}"
 
 # 优先：已配置密码的 TCP；否则：本机 socket（系统 root 常见免密）
 mysql_root() {
@@ -176,14 +181,32 @@ SQL
 }
 
 echo "==> 【install-env】装服务器环境（CentOS 9 / RHEL 9）"
+if ! command -v dnf >/dev/null 2>&1; then
+  echo "未找到 dnf。一键安装面向 CentOS 9 / RHEL 9。" >&2
+  exit 1
+fi
+
+echo "==> 检测并安装基础工具（curl / unzip / find / tar 等）"
+dnf -y install curl ca-certificates unzip findutils tar gzip which shadow-utils procps-ng >/dev/null
+
 echo "==> APP_ROOT=${APP_ROOT}（仅创建目录，不要求已有代码）"
 mkdir -p "${APP_ROOT}"
 
-echo "==> 安装 Node.js 20（NodeSource）"
+echo "==> 安装 Node.js 20"
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/^v//' | cut -d. -f1)" -lt 20 ]]; then
-  dnf -y module reset nodejs >/dev/null 2>&1 || true
-  curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-  dnf -y install nodejs
+  if curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - \
+    && dnf -y install nodejs; then
+    echo "    已用 NodeSource 安装"
+  else
+    echo "    NodeSource 失败，改试 dnf module nodejs:20"
+    dnf -y module reset nodejs >/dev/null 2>&1 || true
+    dnf -y module enable nodejs:20 >/dev/null 2>&1 || true
+    dnf -y install nodejs
+  fi
+fi
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js 安装失败" >&2
+  exit 1
 fi
 echo "    node=$(node -v) npm=$(npm -v)"
 

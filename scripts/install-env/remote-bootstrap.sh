@@ -21,19 +21,22 @@ FO_DB_USER="${DB_USER:-}"
 FO_DB_PASS="${DB_PASS:-}"
 FO_DB_NAME="${DB_NAME:-}"
 FO_APP_ROOT="${FO_APP_ROOT:-${APP_ROOT:-}}"
+FO_GH_TOKEN="${FO_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --db-user=*) FO_DB_USER="${1#*=}" ;;
     --db-pass=*) FO_DB_PASS="${1#*=}" ;;
     --db-name=*) FO_DB_NAME="${1#*=}" ;;
     --app-root=*) FO_APP_ROOT="${1#*=}" ;;
+    --gh-token=*) FO_GH_TOKEN="${1#*=}" ;;
     --db-user) shift; FO_DB_USER="${1:-}" ;;
     --db-pass) shift; FO_DB_PASS="${1:-}" ;;
     --db-name) shift; FO_DB_NAME="${1:-}" ;;
     --app-root) shift; FO_APP_ROOT="${1:-}" ;;
+    --gh-token) shift; FO_GH_TOKEN="${1:-}" ;;
     -h|--help)
-      echo "用法: curl ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名]"
-      echo "  APP_ROOT 解压后自动扫描填写，一般不用传 --app-root。"
+      echo "用法: curl ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名] [--gh-token=PAT]"
+      echo "  APP_ROOT 解压后自动扫描。私有仓加 --gh-token 或环境变量 GH_TOKEN。"
       exit 0
       ;;
     *)
@@ -48,6 +51,10 @@ if [[ -z "${FO_DB_USER}" || -z "${FO_DB_PASS}" ]]; then
   echo "一键安装必须指定 --db-user 与 --db-pass。" >&2
   echo "示例: curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'" >&2
   exit 1
+fi
+if [[ -n "${FO_GH_TOKEN}" ]]; then
+  export GH_TOKEN="${FO_GH_TOKEN}"
+  export GITHUB_TOKEN="${FO_GH_TOKEN}"
 fi
 
 REPO="${GITHUB_REPO:-sg756/fo}"
@@ -100,12 +107,18 @@ BOOT_ARGS=(
 if [[ -n "${FO_APP_ROOT}" ]]; then
   BOOT_ARGS+=(--app-root="${FO_APP_ROOT}")
 fi
+if [[ -n "${FO_GH_TOKEN}" ]]; then
+  BOOT_ARGS+=(--gh-token="${FO_GH_TOKEN}")
+fi
 exec env FLOWORDER_UNIX=1 \
   GITHUB_REPO="${REPO}" \
   GITHUB_RELEASE_TAG="${GITHUB_RELEASE_TAG:-dist}" \
-  GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
+  GH_TOKEN="${FO_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}" \
   DB_USER="${FO_DB_USER}" \
   DB_PASS="${FO_DB_PASS}" \
   DB_NAME="${FO_DB_NAME}" \
+  FO_DB_USER="${FO_DB_USER}" \
+  FO_DB_PASS="${FO_DB_PASS}" \
+  FO_DB_NAME="${FO_DB_NAME}" \
   FO_APP_ROOT="${FO_APP_ROOT}" \
   bash "${WORKDIR}/bootstrap.sh" "${BOOT_ARGS[@]}"

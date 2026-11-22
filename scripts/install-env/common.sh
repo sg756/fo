@@ -26,19 +26,22 @@ parse_bootstrap_args() {
   FO_DB_PASS="${DB_PASS:-}"
   FO_DB_NAME="${DB_NAME:-}"
   FO_APP_ROOT="${FO_APP_ROOT:-${APP_ROOT:-}}"
+  FO_GH_TOKEN="${FO_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --db-user=*) FO_DB_USER="${1#*=}" ;;
       --db-pass=*) FO_DB_PASS="${1#*=}" ;;
       --db-name=*) FO_DB_NAME="${1#*=}" ;;
       --app-root=*) FO_APP_ROOT="${1#*=}" ;;
+      --gh-token=*) FO_GH_TOKEN="${1#*=}" ;;
       --db-user) shift; FO_DB_USER="${1:-}" ;;
       --db-pass) shift; FO_DB_PASS="${1:-}" ;;
       --db-name) shift; FO_DB_NAME="${1:-}" ;;
       --app-root) shift; FO_APP_ROOT="${1:-}" ;;
+      --gh-token) shift; FO_GH_TOKEN="${1:-}" ;;
       -h|--help)
-        echo "用法: ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名]"
-        echo "  库名默认 users_manager。APP_ROOT 解压后自动扫描填写，一般不用传。"
+        echo "用法: ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名] [--gh-token=PAT]"
+        echo "  库名默认 users_manager。APP_ROOT 解压后自动扫描。私有仓加 --gh-token。"
         exit 0
         ;;
       *)
@@ -50,6 +53,10 @@ parse_bootstrap_args() {
     shift
   done
   FO_DB_NAME="${FO_DB_NAME:-users_manager}"
+  if [[ -n "${FO_GH_TOKEN}" ]]; then
+    export GH_TOKEN="${FO_GH_TOKEN}"
+    export GITHUB_TOKEN="${FO_GH_TOKEN}"
+  fi
 }
 
 require_db_creds() {

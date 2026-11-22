@@ -27,7 +27,9 @@ sync_app_root_conf "${APP_ROOT}"
 
 echo "==> 【bootstrap】下载/覆盖目标 STAGE=${STAGE_ROOT}（完成后会扫描真实 APP_ROOT）"
 echo "==> 数据库 DB_NAME=${DB_NAME} DB_USER=${DB_USER}"
-echo "==> 1/3 安装服务器环境（Node、运行用户、MariaDB、防火墙）"
+echo "==> 1/3 检测并安装服务器环境（Node、MariaDB、防火墙等）"
+export FO_DB_USER="${FO_DB_USER}" FO_DB_PASS="${FO_DB_PASS}" FO_DB_NAME="${FO_DB_NAME}"
+export DB_USER="${DB_USER}" DB_PASS="${DB_PASS}" DB_NAME="${DB_NAME}" APP_ROOT="${APP_ROOT}"
 bash "${SCRIPT_DIR}/install.sh"
 
 echo
@@ -55,11 +57,19 @@ done
 sync_app_root_conf "${APP_ROOT}"
 
 echo
+SERVICE_NAME="${SERVICE_NAME:-users-manager}"
+NEED_CONFIGURE=0
 if [[ ! -f "${APP_ROOT}/apps/api/.env" ]]; then
+  NEED_CONFIGURE=1
   echo "==> 3/3 写 .env + systemd（首次）APP_ROOT=${APP_ROOT}"
-  bash "${SCRIPT_DIR}/configure.sh"
+elif [[ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
+  NEED_CONFIGURE=1
+  echo "==> 3/3 已有 .env 但缺少 systemd，补跑 configure APP_ROOT=${APP_ROOT}"
 else
-  echo "==> 3/3 已有 apps/api/.env，跳过 configure（密钥保留）APP_ROOT=${APP_ROOT}"
+  echo "==> 3/3 已有 .env 与 systemd，跳过 configure（密钥保留）APP_ROOT=${APP_ROOT}"
+fi
+if [[ "${NEED_CONFIGURE}" -eq 1 ]]; then
+  bash "${SCRIPT_DIR}/configure.sh"
 fi
 
 echo
