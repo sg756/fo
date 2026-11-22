@@ -12,22 +12,30 @@
 1 Windows只编译 
 1.1 服务端源码编译
    本机只要能编译。现成的就是：
-   进入到源码目录 : 打开 powershell  
-   输入命令 :cd  d:\floworder\scripts\deploy-windows 
-   进入目录后在执行命令:  .\build.ps1
+   打开 powershell，进入仓库里的 scripts\deploy-windows，执行 .\build.ps1
    没有 Node 20+ 时，它会下便携 Node 再编。不用 MySQL、不用 .env.dev。
    编完得到 dist-release\（管理端静态资源 + API 的 dist）。
 1.2 发布流程（推荐：GitHub 一键）
    服务器系统选择 linux centos9。仓库需已有 GitHub Release（tag=dist，资产名 dist-release.zip；
    推 main 时 Actions 会自动编包，或本机 build.ps1 生成 zip 后手动挂到 Release）。
 
-   空机器一条命令（不用先改配置、不用先上传代码）：
-   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
-     | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
+   下面三条命令里的账号、密码、地址都是占位，换成自己的再执行，不要把真密码写进仓库。
+
+   服务器安装 / 更新（CentOS 9，一条命令。H5 跟后台在同一进程，不用另装 nginx）：
+   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
    库名可加 --db-name=users_manager（默认即此）。私有仓先 export GH_TOKEN=你的PAT。
-   MariaDB 的 root 密码必须在命令里自己填，脚本不自动生成。
-   装完打开 http://服务器IP/ 。H5 在同一台机器的 http://服务器IP/h5/ ，不用另装 nginx。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567，仅首次写入）。
-   以后更新再跑同一条命令（同一组密码）。程序会换成新发布包；.env 里的私钥、助记词、JWT、ENC_KEY、管理员密码保持不变。也可以只拉包：
+   --db-pass 是业务库 users_flow 的密码。--mysql-root-pass 是 MariaDB 的 root 密码，必须自己填，脚本不自动生成。
+   装完：管理端 http://服务器IP/ ，H5 http://服务器IP/h5/ ，接口 http://服务器IP/api 。
+   管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（模板默认 admin / 1234567，只在首次写入）。
+   更新再跑同一条命令，密码填同一组。新发布包会盖上；.env 里的私钥、助记词、JWT、ENC_KEY、管理员密码保持不变。
+
+   代理（GOST，CentOS 9，端口默认 1080）：
+   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh | sudo bash -s -- --user='你的账号' --pass='你的密码'
+
+   手机 APK（在已经打开的 PowerShell 里粘贴，不要再套一层 powershell -Command）：
+   Set-ExecutionPolicy Bypass -Scope Process -Force; $d = Join-Path $env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile $d; & $d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'
+
+   也可以只拉包、不重装环境：
    sudo bash /opt/dist-release/scripts/install-env/fetch-dist.sh
 
    ---手工分步（与一键等价）---
@@ -84,11 +92,8 @@
      换图后重新 .\build.ps1 打 APK。只改 JS 的热更新不会换图标。
 
 1.4 linux 代理一键安装（GOST，CentOS 9）
-      不用先上传文件。账号密码写在命令里，端口默认 1080。文档里不写真实密码：
-      curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh \
-        | sudo bash -s -- --user='你的账号' --pass='你的密码'
-      换端口再加 --port=1080。云安全组也要放行这个端口。
-      装完屏幕会打印局域网 IP:端口（填中间件 proxyIP）和公网 IP（填交易所白名单）。
+      命令见上面 1.2。换端口再加 --port=1080。云安全组也要放行这个端口。
+      装完屏幕会打印局域网地址和端口（填中间件 proxyIP）以及公网地址（填交易所白名单）。
 
  1.5 开发环境搭建
    本机 Windows 改代码调试用这一节。和上面 1.1 / 1.2 的「只编译再上传 Linux」不是同一条路。
@@ -175,12 +180,14 @@
 
 编辑：`scripts/install-env/floworder.conf`
 
-至少确认：
+一键安装不用先改这个文件。业务库账号、业务库密码、MariaDB root 密码都在命令里传。
+
+手工分步时至少确认：
 
 - `APP_ROOT` — 代码最终目录（上传必须进这里）
 - `PORT` — 对外端口（常用 80）
-- `DB_PASS` — 数据库密码（生产务必改）
-- `MYSQL_*` — 本机建库相关；外部库则 `MYSQL_AUTO=false` 并稍后在 `.env` 写 `DATABASE_URL`
+- `DB_USER` / `DB_PASS` — 业务库账号和密码
+- `MYSQL_ROOT_PASSWORD` — MariaDB root 密码。留空时安装脚本不会自动生成，命令里要带 `--mysql-root-pass`
 
 本机 Windows 再改：`scripts/deploy-windows/build.conf`  
 `SOURCE_ROOT`（本机源码）、`RELEASE_DIR`（上传包，默认 `dist-release`）、`NODE_HOME`

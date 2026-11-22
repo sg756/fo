@@ -15,14 +15,17 @@ FlowOrder / users-manager 运维脚本总说明
   scripts/h5-nginx/         → 另一台机 nginx 托管 H5 + /api 反代
   scripts/dev/              → 本机 Windows 开发环境（Node / env / 建库）
 
-空机一键（CentOS 9，密码用占位，不要把真密码写进说明）：
+下面命令里的账号、密码、地址都是占位。不要把真密码、Token、服务器地址写进仓库。
+
+服务器安装 / 更新（CentOS 9。H5 与后台同一进程，打开 http://服务器IP/h5/ ）：
   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
   私有仓先 export GH_TOKEN=你的PAT
+  更新再跑同一条，密码填同一组。不改 .env 里的私钥、助记词、JWT、ENC_KEY、管理员密码。
 
-GOST 代理一键（CentOS 9，端口默认 1080）：
+GOST 代理（CentOS 9，端口默认 1080）：
   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/gost/install-gost-centos9.sh | sudo bash -s -- --user='你的账号' --pass='你的密码'
 
-手机版一键打包（空 Windows，不用先装 Node、不用先下代码）：
+手机版打包（空 Windows，在已打开的 PowerShell 里粘贴）：
   Set-ExecutionPolicy Bypass -Scope Process -Force; $d = Join-Path $env:TEMP 'fo-app.ps1'; irm 'https://raw.githubusercontent.com/sg756/fo/main/scripts/mobile/remote-one-click.ps1' -OutFile $d; & $d -ApiBase 'http://服务器IP/api' -AppName '你的应用名' -PackageName 'com.example.app'
   私有仓加 -GhToken '你的PAT'。换 Expo 账号加 -sw。已有 Token 再加 -ExpoToken "你的ExpoToken"
 
@@ -41,11 +44,13 @@ GOST 代理一键（CentOS 9，端口默认 1080）：
 
   编辑：scripts/install-env/floworder.conf
 
-  至少确认：
-    APP_ROOT      代码最终目录（上传必须进这里）
-    PORT          对外端口（常用 80）
-    DB_PASS       数据库密码（生产务必改）
-    MYSQL_*       本机建库相关；外部库则 MYSQL_AUTO=false 并稍后在 .env 写 DATABASE_URL
+  一键安装不用先改这个文件。业务库账号、业务库密码、MariaDB root 密码都在命令里传。
+
+  手工分步时至少确认：
+    APP_ROOT              代码最终目录（上传必须进这里）
+    PORT                  对外端口（常用 80）
+    DB_USER / DB_PASS     业务库账号和密码
+    MYSQL_ROOT_PASSWORD   MariaDB root 密码，命令行用 --mysql-root-pass，脚本不自动生成
 
   本机 Windows 再改：deploy-windows/build.conf
     SOURCE_ROOT（本机源码）、RELEASE_DIR（上传包，默认 dist-release）、NODE_HOME
