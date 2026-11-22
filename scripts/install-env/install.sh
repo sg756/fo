@@ -40,20 +40,30 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
 
 # 优先：已配置密码的 TCP；否则：本机 socket（系统 root 常见免密）
 mysql_root() {
+  # </dev/null：避免 curl|bash 场景下 mysql 继续读 stdin 把后续脚本吃掉
   if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] \
-    && mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" >/dev/null 2>&1; then
-    mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 "$@"
+    && mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 -e "SELECT 1" </dev/null >/dev/null 2>&1; then
+    mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" --protocol=TCP -h127.0.0.1 "$@" </dev/null
     return
   fi
-  mysql -uroot "$@"
+  mysql -uroot "$@" </dev/null
 }
 
 mysql_socket() {
-  mysql -uroot "$@"
+  mysql -uroot "$@" </dev/null
 }
 
+# 注意：不能用 tr|head（pipefail 下 head 提前关闭管道会使 tr 以 141 失败，脚本会静默退出）
 gen_db_password() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 12
+    return 0
+  fi
+  # 兜底：一次读够字节再过滤，避免 SIGPIPE
+  local raw
+  raw="$(dd if=/dev/urandom bs=64 count=1 status=none 2>/dev/null | base64 2>/dev/null | tr -d '\n+/=' )"
+  printf '%s' "${raw:0:24}"
+  echo
 }
 
 # 写回 floworder.conf（值用单引号，密码仅字母数字故安全）
