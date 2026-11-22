@@ -2,17 +2,21 @@
 FlowOrder / users-manager 运维脚本总说明
 ================================================================================
 
-本机 Windows 编译，再把产物上传到 Linux 服务器。
+本机 Windows 编译（或 GitHub Actions），Linux 一键拉包安装。
 
 目录分工（名字一眼秒懂）：
 
-  scripts/install-env/      → 服务器先装环境，再 apply-dist
+  scripts/install-env/      → 服务器装环境；空机 curl remote-bootstrap 一键
   scripts/deploy/           → Linux 上日常启停（start / restart / stop）
-  scripts/deploy-windows/   → Windows：本机编译
+  scripts/deploy-windows/   → Windows：本机编译 → dist-release + zip
+  scripts/pack-dist-release.sh → 把 dist-release/ 打成 zip（CI / Linux）
   scripts/mobile/           → App（Expo）打包
   scripts/gost/             → GOST 代理
   scripts/h5-nginx/         → 另一台机 nginx 托管 H5 + /api 反代
   scripts/dev/              → 本机 Windows 开发环境（Node / env / 建库）
+
+空机一键（CentOS 9）：
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
 
 配置文件（脚本执行前先改）：
   服务器：install-env/floworder.conf

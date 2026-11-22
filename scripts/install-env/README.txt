@@ -1,18 +1,35 @@
-install-env/ · 服务器先装环境（一眼：装环境）
+install-env/ · 服务器装环境 + GitHub 一键安装
 ============================================================
 
-Linux 服务器要跑 users-manager，就必须先来这里。
-编译在 Windows 本机（../deploy-windows/），本目录负责装环境、写配置、应用产物。
+Linux 服务器要跑 FlowOrder（users-manager），就从这里开始。
+编译在 Windows 本机（../deploy-windows/）或 GitHub Actions；本目录负责装环境、拉包、写配置、应用产物。
+
+CentOS 9 一键安装 / 更新（推荐，不用先改配置、不用先上传代码）：
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
+装完打开 http://服务器IP/ （PORT 默认 80）。
+管理员账号：首次 seed 用 configure 写入 .env 的 ADMIN_EMAIL / ADMIN_PASSWORD（模板默认见 configure.sh）。
+同一条命令可用来更新程序：覆盖发布包，保留 apps/api/.env、logs/、backup/。
+
+私有仓库先：
+  export GH_TOKEN=你的GitHub_PAT
+  再执行上面的 curl | sudo bash
+
 
 文件：
-  floworder.conf   ← 只改这个（APP_ROOT / 端口 / 库）
-  install.sh       ← ① 装 Node、用户、MariaDB、防火墙（可以还没有代码）
-  configure.sh     ← ③ 有代码或 dist 后：写完整 .env（无 example 也内嵌同键模板）、systemd
-  apply-dist.sh    ← Windows 产物上传后：npm ci + prisma + 重启（读同级 floworder.conf）
-  export-db.sh     ← 备份业务库（mysqldump，读同级 floworder.conf 的 DB_*）
-  README.txt       ← 本说明
+  floworder.conf       ← 只改这个（APP_ROOT / 端口 / 库 / GITHUB_*）
+  remote-bootstrap.sh  ← 空机器 curl | sudo bash 一键
+  bootstrap.sh         ← 首次一键：install + 拉 GitHub zip + configure + apply-dist
+  fetch-dist.sh        ← 从 GitHub Release 覆盖 zip 并重启
+  install.sh           ← 只装 Node、用户、MariaDB、防火墙
+  configure.sh         ← 写 .env + systemd
+  apply-dist.sh        ← npm ci + prisma + 重启
+  export-db.sh         ← 备份业务库
+  common.sh            ← 内部公用，不要单独跑
+  README.txt           ← 本说明
 
-总览：../README.txt
+必须用：
+  sudo bash scripts/install-env/bootstrap.sh
+不要用 ./bootstrap.sh（从 Windows 上传时 shebang 可能带回车）。
 
 
 --------------------------------------------------------------------------------
@@ -20,52 +37,57 @@ Linux 服务器要跑 users-manager，就必须先来这里。
 --------------------------------------------------------------------------------
 
   编辑 floworder.conf（至少）：
-    APP_ROOT     代码目录
+    APP_ROOT     推荐 /opt/dist-release（不要放 /root 下）
     PORT         对外端口
-    DB_PASS      库密码（生产改掉）
-    MYSQL_* / DB_*   本机建库；MYSQL_ROOT_PASSWORD 可留空（install 自动生成写回）
-                     外部库则 MYSQL_AUTO=false
+    DB_PASS      库密码（生产务必改；一键安装后也可在服务器 conf 里改再 configure）
+    GITHUB_REPO / GITHUB_RELEASE_TAG  默认 sg756/fo + dist
 
 
 --------------------------------------------------------------------------------
 脚本执行顺序
 --------------------------------------------------------------------------------
 
-  1. 改 floworder.conf
-  2. sudo bash scripts/install-env/install.sh
-  3. 把代码上传/同步到 APP_ROOT
-  4. sudo bash scripts/install-env/configure.sh
-  5. 本机 ../deploy-windows/build.ps1 → 本目录 apply-dist.sh
-     （apply-dist 末尾自动 seed）
+  空 Linux 一条命令（推荐）：
+    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
+    会自动：下载脚本 → 装 Node/MariaDB → 拉 GitHub dist-release.zip → configure → npm/prisma → 启动
+
+  已有脚本目录时：
+    1. 改 floworder.conf
+    2. sudo bash scripts/install-env/bootstrap.sh
+
+  以后发版（只更新程序）：
+    sudo bash scripts/install-env/fetch-dist.sh
+    或本机 build.ps1 覆盖 APP_ROOT 后再 apply-dist.sh
+
   日常启停：../deploy/run/start.sh | restart.sh | stop.sh
 
 
 --------------------------------------------------------------------------------
-备份业务库（Linux 服务器上执行）
+本机打 zip / 挂 Release
 --------------------------------------------------------------------------------
 
-  账号密码读同目录 floworder.conf 的 DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASS。
-  默认写到 ${APP_ROOT}/backup/库名-时间戳.sql（目录权限 700，文件 600）。
+  Windows：scripts\deploy-windows\build.ps1
+    → 生成 dist-release\ 与仓库根 dist-release.zip
 
-    cd ${APP_ROOT}   # 例 /opt/dist-release
-    sudo bash scripts/install-env/export-db.sh
+  把 dist-release.zip 上传到 GitHub Release：
+    tag = dist
+    资产名必须为 dist-release.zip
 
-  指定目录 / 压缩：
+  推 main 时 .github/workflows/release-dist.yml 也会自动编包并覆盖 tag=dist。
 
-    sudo OUT_DIR=/root/db-backup bash scripts/install-env/export-db.sh
-    sudo GZIP=1 bash scripts/install-env/export-db.sh
 
-  拷回 Windows 导入本机测试库：
+--------------------------------------------------------------------------------
+备份业务库
+--------------------------------------------------------------------------------
 
-    powershell -ExecutionPolicy Bypass -File scripts\dev\import-linux-db.ps1 -Dump D:\path\to\xxx.sql
-
-  不要把 .sql / 密码提交进 Git。
+  cd ${APP_ROOT}
+  sudo bash scripts/install-env/export-db.sh
 
 
 别搞混：
-  install.sh    = 只装系统环境
-  configure.sh  = 有代码后写配置；不编译、不 start
-                  服务器写 apps/api/.env（兼容旧 .env.production 自动迁移）
-                  本地开发请用 apps/api/.env.dev，发布包不要带本机密文
-  apply-dist.sh = 应用本机编好的 dist，装依赖并重启
-  export-db.sh  = 只导出库，不改服务、不改配置
+  remote-bootstrap.sh = 空机 curl 一键
+  bootstrap.sh        = 首次一键（install + 拉包 + configure + apply）
+  fetch-dist.sh       = 拉最新 zip 并重启
+  install.sh          = 只装系统环境
+  configure.sh        = 写 .env / systemd
+  apply-dist.sh       = 应用产物并重启

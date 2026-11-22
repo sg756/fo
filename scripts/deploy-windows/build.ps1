@@ -272,15 +272,34 @@ function Publish-ReleaseBundle {
     Write-Error "发布包校验失败（需 admin/dist/index.html、api/dist/main.js、api/package-lock.json、api/scripts/fix-user-no.js、api/scripts/backfill-position-api-code.js）"
   }
 
+  # 一键安装脚本一并打进发布包
+  $installEnvSrc = Join-Path $SourceRoot "scripts\install-env"
+  $installEnvDst = Join-Path $OutDir "scripts\install-env"
+  if (Test-Path -LiteralPath $installEnvSrc) {
+    New-Item -ItemType Directory -Path $installEnvDst -Force | Out-Null
+    Copy-Item -Path (Join-Path $installEnvSrc "*") -Destination $installEnvDst -Recurse -Force
+  }
+
+  # 与 OutDir 同级：…\dist-release → …\dist-release.zip（供 GitHub Release / 一键安装）
+  $zipPath = Join-Path (Split-Path -Parent $OutDir) "dist-release.zip"
+  if (Test-Path -LiteralPath $zipPath) {
+    Remove-Item -LiteralPath $zipPath -Force
+  }
+  Write-Host "    打包 zip: $zipPath"
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::CreateFromDirectory($OutDir, $zipPath)
+
   Write-Host "    已生成:"
   Write-Host "      apps\admin\dist\"
   Write-Host "      apps\api\dist\"
   Write-Host "      apps\api\package.json / package-lock.json / prisma\"
   Write-Host "      apps\api\scripts\fix-user-no.js"
   Write-Host "      apps\api\scripts\backfill-position-api-code.js"
+  Write-Host "      scripts\install-env\"
+  Write-Host "      $zipPath"
   Write-Host "    （含 prisma/seed.js；服务器 apply-dist 会自动 seed）"
   Write-Host "    （不打包 .env / .env.dev；服务器密钥由 install-env/configure.sh 写 .env）"
-  Write-Host "    上传方式：把「$OutDir 目录内的内容」覆盖到服务器 APP_ROOT（不要传 node_modules）"
+  Write-Host "    上传方式：把「$OutDir 目录内的内容」覆盖到服务器 APP_ROOT；或把 zip 挂到 GitHub Release tag=dist"
 }
 
 # ---- 0) 读配置 ----

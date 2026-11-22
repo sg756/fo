@@ -33,22 +33,18 @@ Linux 上应用产物 = ../install-env/apply-dist.sh（与 install / floworder.c
   —— 本机每次发版 ——
   5. （可选）改 build.conf
   6. powershell -ExecutionPolicy Bypass -File scripts\deploy-windows\build.ps1
-     编完后会生成发布包（默认仓库根下 dist-release\），结构与 Linux APP_ROOT 一致：
+     编完后会生成：
        dist-release\apps\admin\dist\
-       dist-release\apps\api\dist\
-       dist-release\apps\api\package.json
-       dist-release\apps\api\package-lock.json
-       dist-release\apps\api\prisma\
+       dist-release\apps\api\dist\ …
+       dist-release\scripts\install-env\
+       仓库根 dist-release.zip（上传到 GitHub Release tag=dist，资产名必须一致）
 
   —— 再回服务器 ——
-  7. 把 dist-release\ 里的内容覆盖到服务器 APP_ROOT（不要传 node_modules）
-     例：rsync / scp / 面板上传，使服务器出现：
-       APP_ROOT/apps/admin/dist/...
-       APP_ROOT/apps/api/dist/...
-       APP_ROOT/apps/api/package.json 等
-     无需改名。
-  8. sudo bash scripts/install-env/apply-dist.sh
-     （与 install.sh、floworder.conf 同一目录，只读同级 conf）
+  推荐：sudo bash scripts/install-env/fetch-dist.sh（从 Release 拉 zip）
+  或把 dist-release\ 内容覆盖到 APP_ROOT 后再：
+     sudo bash scripts/install-env/apply-dist.sh
+  空机器首次也可：
+     curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
 
 
 目录文件：

@@ -1,0 +1,73 @@
+name: Publish dist-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            apps/admin/package-lock.json
+            apps/api/package-lock.json
+
+      - name: Build admin
+        working-directory: apps/admin
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build api
+        working-directory: apps/api
+        run: |
+          npm ci
+          npx prisma generate
+          npm run build
+
+      - name: Assemble dist-release
+        run: |
+          set -euo pipefail
+          OUT=dist-release
+          rm -rf "$OUT"
+          mkdir -p "$OUT/apps/admin/dist" "$OUT/apps/api/dist" "$OUT/apps/api/scripts" "$OUT/scripts/install-env"
+          cp -a apps/admin/dist/. "$OUT/apps/admin/dist/"
+          cp -a apps/api/dist/. "$OUT/apps/api/dist/"
+          cp apps/api/package.json apps/api/package-lock.json "$OUT/apps/api/"
+          cp -a apps/api/prisma "$OUT/apps/api/"
+          cp apps/api/scripts/fix-user-no.js apps/api/scripts/backfill-position-api-code.js "$OUT/apps/api/scripts/"
+          cp -a scripts/install-env/. "$OUT/scripts/install-env/"
+          test -f "$OUT/apps/admin/dist/index.html"
+          test -f "$OUT/apps/api/dist/main.js"
+          test -f "$OUT/apps/api/prisma/schema.prisma"
+
+      - name: Pack dist-release.zip
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y zip
+          bash scripts/pack-dist-release.sh
+
+      - name: Upload GitHub Release (tag dist)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dist
+          name: dist-release
+          body: |
+            Linux 一键安装用的发布包（不含 node_modules、不含 .env）。
+            空机器：
+            `curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash`
+          files: dist-release.zip
+          make_latest: true
+          overwrite: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

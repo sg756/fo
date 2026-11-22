@@ -17,49 +17,26 @@
    进入目录后在执行命令:  .\build.ps1
    没有 Node 20+ 时，它会下便携 Node 再编。不用 MySQL、不用 .env.dev。
    编完得到 dist-release\（管理端静态资源 + API 的 dist）。
-1.2 发布流程
-   服务器系统选择linux centos9  
-   首先把源码上传到Linux服务器 一般上传到 opt 文件夹下 .  上传后代码目录应该是这样 /opt/dist-release，（不要传 node_modules）
-   上传脚本scripts/install-env文件夹下 三个脚本和一个配置文件 , 
-   服务器上要先有  （install.sh、configure.sh、apply-dist.sh、floworder.conf）。
-   可以在服务器上的opt文件夹上单独创建一个文件夹放这些脚本 linux命令:mkdir /opt/scripts创建成功后, 把这几个脚本配置文件上传在此目录下
-   dist-release 是不含这些脚本的.这些工作完成 
-   首次：
-   改 floworder.conf  （重要 ）
-   floworder.conf里面的 APP_ROOT 是必须要指向发布执行文件的目录 举例的执行文件的目录是/opt/dist-release   那么 app_root  = /opt/dist-release
-   数据库账号密码和端口设置
-   MYSQL_AUTO=true
-   DB_HOST=127.0.0.1
-   //端口
-   DB_PORT=3306
-   //数据库名称(可自己改名 )
-   DB_NAME=users_manager
-   //连接用户名(可自己改名)
-   DB_USER=
-   //密码
-   DB_PASS= 
-   数据库一定要配置好，不然后面步骤全错。
+1.2 发布流程（推荐：GitHub 一键）
+   服务器系统选择 linux centos9。仓库需已有 GitHub Release（tag=dist，资产名 dist-release.zip；
+   推 main 时 Actions 会自动编包，或本机 build.ps1 生成 zip 后手动挂到 Release）。
 
-   设置好后执行命令:  sudo bash ./install.sh 
-   自动安装  Node、库、设置数据库连接用户
+   空机器一条命令（不用先改配置、不用先上传代码）：
+   curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash
+   私有仓先 export GH_TOKEN=你的PAT 再执行。
+   装完打开 http://服务器IP/ 。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567）。
+   以后更新程序可再跑同一条，或：
+   sudo bash /opt/dist-release/scripts/install-env/fetch-dist.sh
 
-   上面执行安装完成后 在执行命令: sudo bash ./configure.sh
-   configure.sh会生成 .env文件 和创建systemd 服务.
-   APP_ROOT/apps/api/.env 里的管理员密码等.
-   configure.sh 必须在 apply-dist.sh 之前（后者要 systemd 单元已经在）。
-   需要改默认密码 请在安装之前 打开configure.sh 
-   找到这个键值改了就行
-   # ===== 初始平台管理员 (seed) =====
-   ADMIN_EMAIL="admin"
-   ADMIN_PASSWORD="1234567"
+   ---手工分步（与一键等价）---
+   改 scripts/install-env/floworder.conf（APP_ROOT / 库密码等），把 dist-release 内容放到 APP_ROOT，然后：
+   sudo bash scripts/install-env/install.sh
+   sudo bash scripts/install-env/configure.sh
+   sudo bash scripts/install-env/apply-dist.sh
 
-   完成这部份安装后 装依赖、同步库、启动,  执行命令: sudo bash./apply-dist.sh 
-   如果有询问就是一直yes 如果提示让你设置app_root 如果配置文件设置了，直接enter回车.
-
-   ---以后重新再发版---
-   不用再跑 install.sh / configure.sh，只要：
-   本机 build.ps1 → 上传编译好的执行文件覆盖就行 →然后 Linux 上再执行一次 apply-dist.sh。
-
+   ---本机发版---
+   本机 build.ps1 → 生成 dist-release\ 与 dist-release.zip → 上传 zip 到 Release tag=dist，
+   或把 dist-release\ 内容覆盖到服务器 APP_ROOT 后再 apply-dist / fetch-dist。
 1.2.1 手机版发布
     方式：Expo EAS 云构建 
   - 需要：能跑 Node（可自动下便携版）+ Expo 账号登录 + 能上网
