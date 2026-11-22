@@ -319,6 +319,12 @@ fi
 ensure_jwt_and_enc_key
 # 首次配置生成生产助记词；已有真实值则永不覆盖
 ensure_hd_mnemonic
+if [[ -n "$(get_env_val WITHDRAW_HOT_PRIVATE_KEY)" ]]; then
+  echo "==> WITHDRAW_HOT_PRIVATE_KEY 已存在，保留"
+fi
+if [[ -n "$(get_env_val ADMIN_PASSWORD)" ]]; then
+  echo "==> ADMIN_PASSWORD 已存在，保留（更新不会改管理员密码）"
+fi
 
 echo "==> 日志目录: ${LOG_DIR}（按天 api-YYYY-MM-DD.log）"
 mkdir -p "${LOG_DIR}" "${APP_ROOT}/bin"

@@ -37,6 +37,7 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
 [[ -n "${FO_DB_USER:-}" ]] && DB_USER="${FO_DB_USER}"
 [[ -n "${FO_DB_PASS:-}" ]] && DB_PASS="${FO_DB_PASS}"
 [[ -n "${FO_DB_NAME:-}" ]] && DB_NAME="${FO_DB_NAME}"
+[[ -n "${FO_MYSQL_ROOT_PASS:-}" ]] && MYSQL_ROOT_PASSWORD="${FO_MYSQL_ROOT_PASS}"
 
 # 探测用：强制 </dev/null，避免偶发从 stdin 读 SQL
 mysql_ping_socket() {
@@ -50,36 +51,13 @@ mysql_ping_socket() {
   return 1
 }
 
-# 上次安装把 root 密码写在服务器上的 floworder.conf，这次空机脚本不会带着它
-load_saved_root_password() {
-  local f line val
-  for f in \
-    "${APP_ROOT}/scripts/install-env/floworder.conf" \
-    /opt/dist-release/scripts/install-env/floworder.conf \
-    /opt/FlowOrder/scripts/install-env/floworder.conf
-  do
-    [[ -f "${f}" ]] || continue
-    line="$(grep -E '^MYSQL_ROOT_PASSWORD=' "${f}" | tail -n 1 || true)"
-    val="${line#MYSQL_ROOT_PASSWORD=}"
-    val="${val#\'}"
-    val="${val%\'}"
-    if [[ -n "${val}" ]]; then
-      MYSQL_ROOT_PASSWORD="${val}"
-      echo "    使用已保存的 MariaDB root 密码: ${f}"
-      return 0
-    fi
-  done
-  return 1
-}
-
-# 已装过 MariaDB 且 root 不再免密时，重置密码，不删除已有库
+# 命令里的 root 密码登不上时，改成用户这次填写的密码。不删库，不改 .env。
 reset_mysql_root_password() {
   local unit=$1
-  local pass sql_esc sock pid i
-  pass="$(gen_db_password)"
-  sql_esc=${pass//\'/\'\'}
+  local sql_esc sock pid i
+  sql_esc=${MYSQL_ROOT_PASSWORD//\'/\'\'}
   sock="/tmp/mysql-reset.sock"
-  echo "==> 无法登录现有 MariaDB，重置 root 密码（保留已有数据库）"
+  echo "==> 命令中的 MariaDB root 密码目前登不上，将改成你这次填写的密码（不删库，不改 .env 私钥）"
   systemctl stop "${unit}" || true
   rm -f "${sock}"
   mysqld --user=mysql --datadir=/var/lib/mysql --skip-grant-tables --skip-networking --socket="${sock}" >/tmp/mysql-reset.log 2>&1 &
@@ -108,9 +86,8 @@ SQL
   wait "${pid}" >/dev/null 2>&1 || true
   rm -f "${sock}"
   systemctl start "${unit}"
-  MYSQL_ROOT_PASSWORD="${pass}"
   save_mysql_root_password_to_conf "${MYSQL_ROOT_PASSWORD}"
-  echo "    已重置 MariaDB root 密码并写入 ${CONF_FILE}"
+  echo "    MariaDB root 已改为命令中的密码，并写入 ${CONF_FILE}"
 }
 
 mysql_ping_tcp() {
@@ -131,67 +108,38 @@ mysql_socket() {
   mysql -uroot "$@"
 }
 
-# 注意：不能用 tr|head（pipefail 下 head 提前关闭管道会使 tr 以 141 失败，脚本会静默退出）
-gen_db_password() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 12
-    return 0
-  fi
-  # 兜底：一次读够字节再过滤，避免 SIGPIPE
-  local raw
-  raw="$(dd if=/dev/urandom bs=64 count=1 status=none 2>/dev/null | base64 2>/dev/null | tr -d '\n+/=' )"
-  printf '%s' "${raw:0:24}"
-  echo
-}
-
-# 写回 floworder.conf（值用单引号，密码仅字母数字故安全）
+# 写回 floworder.conf。%q 保证密码里的特殊字符可以被 source。
 save_mysql_root_password_to_conf() {
   local pass=$1
   local tmp
   tmp="$(mktemp)"
-  if grep -qE '^MYSQL_ROOT_PASSWORD=' "${CONF_FILE}"; then
-    awk -v p="${pass}" '
-      BEGIN { done=0 }
-      /^MYSQL_ROOT_PASSWORD=/ && !done {
-        printf "MYSQL_ROOT_PASSWORD='\''%s'\''\n", p
-        done=1
-        next
-      }
-      { print }
-    ' "${CONF_FILE}" > "${tmp}"
-    mv "${tmp}" "${CONF_FILE}"
-  else
-    printf '\nMYSQL_ROOT_PASSWORD='\''%s'\''\n' "${pass}" >> "${CONF_FILE}"
-    rm -f "${tmp}"
-  fi
+  grep -vE '^MYSQL_ROOT_PASSWORD=' "${CONF_FILE}" > "${tmp}" || true
+  printf 'MYSQL_ROOT_PASSWORD=%q\n' "${pass}" >> "${tmp}"
+  mv "${tmp}" "${CONF_FILE}"
   chmod 600 "${CONF_FILE}" || true
 }
 
-# 确保 MariaDB root 有密码：空则生成；经 socket 写入库并写回 conf
+# 使用命令里的 root 密码：已经一致则不改；仅 socket 免密时写入该密码
 ensure_mysql_root_password() {
   local sql_esc
-  local via_socket=0
 
-  if mysql_ping_socket; then
-    via_socket=1
-  fi
-
-  if [[ "${via_socket}" -eq 0 ]]; then
-    if [[ -n "${MYSQL_ROOT_PASSWORD}" ]] && mysql_ping_tcp "${MYSQL_ROOT_PASSWORD}"; then
-      echo "    MariaDB root 已可用（密码登录），保留现有 MYSQL_ROOT_PASSWORD"
-      return 0
-    fi
-    echo "无法连接 MariaDB root（socket 与密码均失败）" >&2
+  if [[ -z "${MYSQL_ROOT_PASSWORD}" ]]; then
+    echo "必须在命令中指定 --mysql-root-pass。脚本不会自动生成 MariaDB root 密码。" >&2
     exit 1
   fi
 
-  if [[ -z "${MYSQL_ROOT_PASSWORD}" ]]; then
-    MYSQL_ROOT_PASSWORD="$(gen_db_password)"
-    echo "    已自动生成 MariaDB root 密码并写入 ${CONF_FILE}"
-  else
-    echo "    通过 socket 将 conf 中的 MYSQL_ROOT_PASSWORD 应用到 MariaDB root"
+  if mysql_ping_tcp "${MYSQL_ROOT_PASSWORD}"; then
+    echo "    MariaDB root 与命令中的密码一致，不修改"
+    save_mysql_root_password_to_conf "${MYSQL_ROOT_PASSWORD}"
+    return 0
   fi
 
+  if ! mysql_ping_socket; then
+    echo "无法连接 MariaDB root（socket 与命令中的密码均失败）" >&2
+    exit 1
+  fi
+
+  echo "    首次把命令中的 MariaDB root 密码写入数据库"
   sql_esc=${MYSQL_ROOT_PASSWORD//\'/\'\'}
   mysql_socket <<SQL
 ALTER USER 'root'@'localhost' IDENTIFIED BY '${sql_esc}';
@@ -221,7 +169,11 @@ SQL
 }
 
 setup_mysql() {
-  echo "==> 本机数据库（MariaDB/MySQL）— 建库建用户；root 密码由脚本保证"
+  echo "==> 本机数据库（MariaDB/MySQL）— 建库建用户；root 密码用命令中的 --mysql-root-pass"
+  if [[ -z "${MYSQL_ROOT_PASSWORD}" ]]; then
+    echo "必须在命令中指定 --mysql-root-pass。脚本不会自动生成 MariaDB root 密码。" >&2
+    exit 1
+  fi
   if ! rpm -q mariadb-server >/dev/null 2>&1 && ! rpm -q mysql-server >/dev/null 2>&1; then
     echo "    安装 mariadb-server"
     dnf -y install mariadb-server mariadb
@@ -242,11 +194,7 @@ setup_mysql() {
 
   systemctl enable --now "${unit}"
 
-  if [[ -z "${MYSQL_ROOT_PASSWORD}" ]]; then
-    load_saved_root_password || true
-  fi
-
-  # 启动等待：先试 socket，再试 conf 密码（避免「conf 填了错密码却挡住 socket」）
+  # 启动等待：命令中的 root 密码，或全新安装时的 socket 免密
   local ok=0
   for _ in $(seq 1 30); do
     if mysql_ping_socket; then

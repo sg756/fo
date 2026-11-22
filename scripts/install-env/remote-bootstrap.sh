@@ -3,8 +3,8 @@
 #  空 Linux 一键：拉安装脚本 + 拉 dist-release.zip + 装环境 + 启动
 #  必须带数据库账号/密码（库名可选，默认 users_manager）：
 #    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
-#      | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
-#    curl ... | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --db-name=users_manager
+#      | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
+#    再跑同一条即更新程序，不改 .env 里的私钥、助记词、JWT、管理员密码。
 #  私有仓加：-H "Authorization: Bearer $GH_TOKEN"
 # ============================================================
 set -euo pipefail
@@ -20,6 +20,7 @@ fi
 FO_DB_USER="${DB_USER:-}"
 FO_DB_PASS="${DB_PASS:-}"
 FO_DB_NAME="${DB_NAME:-}"
+FO_MYSQL_ROOT_PASS="${MYSQL_ROOT_PASSWORD:-}"
 FO_APP_ROOT="${FO_APP_ROOT:-${APP_ROOT:-}}"
 FO_GH_TOKEN="${FO_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
 while [[ $# -gt 0 ]]; do
@@ -27,29 +28,35 @@ while [[ $# -gt 0 ]]; do
     --db-user=*) FO_DB_USER="${1#*=}" ;;
     --db-pass=*) FO_DB_PASS="${1#*=}" ;;
     --db-name=*) FO_DB_NAME="${1#*=}" ;;
+    --mysql-root-pass=*) FO_MYSQL_ROOT_PASS="${1#*=}" ;;
     --app-root=*) FO_APP_ROOT="${1#*=}" ;;
     --gh-token=*) FO_GH_TOKEN="${1#*=}" ;;
     --db-user) shift; FO_DB_USER="${1:-}" ;;
     --db-pass) shift; FO_DB_PASS="${1:-}" ;;
     --db-name) shift; FO_DB_NAME="${1:-}" ;;
+    --mysql-root-pass) shift; FO_MYSQL_ROOT_PASS="${1:-}" ;;
     --app-root) shift; FO_APP_ROOT="${1:-}" ;;
     --gh-token) shift; FO_GH_TOKEN="${1:-}" ;;
     -h|--help)
-      echo "用法: curl ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名] [--gh-token=PAT]"
-      echo "  APP_ROOT 解压后自动扫描。私有仓加 --gh-token 或环境变量 GH_TOKEN。"
+      echo "用法: curl ... | sudo bash -s -- --db-user=账号 --db-pass=密码 --mysql-root-pass=root密码 [--db-name=库名]"
+      echo "  APP_ROOT 解压后自动扫描。root 密码必须自己填。再跑同一条即更新，不改私钥。"
       exit 0
       ;;
     *)
-      echo "未知参数: $1（需要 --db-user / --db-pass）" >&2
+      echo "未知参数: $1（需要 --db-user / --db-pass / --mysql-root-pass）" >&2
       exit 1
       ;;
   esac
   shift
 done
 FO_DB_NAME="${FO_DB_NAME:-users_manager}"
-if [[ -z "${FO_DB_USER}" || -z "${FO_DB_PASS}" ]]; then
-  echo "一键安装必须指定 --db-user 与 --db-pass。" >&2
-  echo "示例: curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'" >&2
+missing=()
+[[ -z "${FO_DB_USER}" ]] && missing+=("--db-user")
+[[ -z "${FO_DB_PASS}" ]] && missing+=("--db-pass")
+[[ -z "${FO_MYSQL_ROOT_PASS}" ]] && missing+=("--mysql-root-pass")
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "一键安装缺少: ${missing[*]}" >&2
+  echo "示例: curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'" >&2
   exit 1
 fi
 if [[ -n "${FO_GH_TOKEN}" ]]; then
@@ -103,6 +110,7 @@ BOOT_ARGS=(
   --db-user="${FO_DB_USER}"
   --db-pass="${FO_DB_PASS}"
   --db-name="${FO_DB_NAME}"
+  --mysql-root-pass="${FO_MYSQL_ROOT_PASS}"
 )
 if [[ -n "${FO_APP_ROOT}" ]]; then
   BOOT_ARGS+=(--app-root="${FO_APP_ROOT}")
@@ -117,8 +125,10 @@ exec env FLOWORDER_UNIX=1 \
   DB_USER="${FO_DB_USER}" \
   DB_PASS="${FO_DB_PASS}" \
   DB_NAME="${FO_DB_NAME}" \
+  MYSQL_ROOT_PASSWORD="${FO_MYSQL_ROOT_PASS}" \
   FO_DB_USER="${FO_DB_USER}" \
   FO_DB_PASS="${FO_DB_PASS}" \
   FO_DB_NAME="${FO_DB_NAME}" \
+  FO_MYSQL_ROOT_PASS="${FO_MYSQL_ROOT_PASS}" \
   FO_APP_ROOT="${FO_APP_ROOT}" \
   bash "${WORKDIR}/bootstrap.sh" "${BOOT_ARGS[@]}"

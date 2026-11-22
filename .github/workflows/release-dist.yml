@@ -72,7 +72,7 @@ jobs:
             Linux 一键安装用的发布包（不含 node_modules、不含 .env）。
             装完后管理端 http://服务器IP/ ，H5 http://服务器IP/h5/ （同一进程，不用另装 nginx）。
             空机器（必须带数据库账号密码）：
-            `curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'`
+            `curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'`
           files: dist-release.zip
           make_latest: true
           overwrite: true

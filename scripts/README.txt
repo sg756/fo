@@ -16,7 +16,7 @@ FlowOrder / users-manager 运维脚本总说明
   scripts/dev/              → 本机 Windows 开发环境（Node / env / 建库）
 
 空机一键（CentOS 9，密码用占位，不要把真密码写进说明）：
-  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
+  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
   私有仓先 export GH_TOKEN=你的PAT
 
 GOST 代理一键（CentOS 9，端口默认 1080）：

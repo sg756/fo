@@ -23,10 +23,11 @@
 
    空机器一条命令（不用先改配置、不用先上传代码）：
    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
-     | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
+     | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
    库名可加 --db-name=users_manager（默认即此）。私有仓先 export GH_TOKEN=你的PAT。
-   装完打开 http://服务器IP/ 。H5 在同一台机器的 http://服务器IP/h5/ ，不用另装 nginx。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567）。
-   以后更新程序可再跑同一条，或：
+   MariaDB 的 root 密码必须在命令里自己填，脚本不自动生成。
+   装完打开 http://服务器IP/ 。H5 在同一台机器的 http://服务器IP/h5/ ，不用另装 nginx。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567，仅首次写入）。
+   以后更新再跑同一条命令（同一组密码）。程序会换成新发布包；.env 里的私钥、助记词、JWT、ENC_KEY、管理员密码保持不变。也可以只拉包：
    sudo bash /opt/dist-release/scripts/install-env/fetch-dist.sh
 
    ---手工分步（与一键等价）---

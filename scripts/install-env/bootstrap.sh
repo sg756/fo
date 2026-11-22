@@ -2,7 +2,7 @@
 # ============================================================
 #  一键：装环境 → 拉 GitHub dist-release.zip → 扫描 APP_ROOT → configure → apply-dist
 #  必须带数据库账号/密码；APP_ROOT 解压后自动扫描填写：
-#    sudo bash scripts/install-env/bootstrap.sh --db-user=users_flow --db-pass='你的密码'
+#    sudo bash scripts/install-env/bootstrap.sh --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'
 # ============================================================
 [ "${FLOWORDER_UNIX:-0}" = 1 ] || { _d="$(cd "$(dirname "$0")" && pwd)"; for _f in "$_d"/*.sh "$_d"/*.conf; do [ -f "$_f" ] && sed -i 's/\r$//' "$_f" 2>/dev/null || true; done; exec env FLOWORDER_UNIX=1 bash "$0" "$@"; } #
 
@@ -28,8 +28,8 @@ sync_app_root_conf "${APP_ROOT}"
 echo "==> 【bootstrap】下载/覆盖目标 STAGE=${STAGE_ROOT}（完成后会扫描真实 APP_ROOT）"
 echo "==> 数据库 DB_NAME=${DB_NAME} DB_USER=${DB_USER}"
 echo "==> 1/3 检测并安装服务器环境（Node、MariaDB、防火墙等）"
-export FO_DB_USER="${FO_DB_USER}" FO_DB_PASS="${FO_DB_PASS}" FO_DB_NAME="${FO_DB_NAME}"
-export DB_USER="${DB_USER}" DB_PASS="${DB_PASS}" DB_NAME="${DB_NAME}" APP_ROOT="${APP_ROOT}"
+export FO_DB_USER="${FO_DB_USER}" FO_DB_PASS="${FO_DB_PASS}" FO_DB_NAME="${FO_DB_NAME}" FO_MYSQL_ROOT_PASS="${FO_MYSQL_ROOT_PASS}"
+export DB_USER="${DB_USER}" DB_PASS="${DB_PASS}" DB_NAME="${DB_NAME}" MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}" APP_ROOT="${APP_ROOT}"
 bash "${SCRIPT_DIR}/install.sh"
 
 echo
@@ -58,19 +58,12 @@ sync_app_root_conf "${APP_ROOT}"
 
 echo
 SERVICE_NAME="${SERVICE_NAME:-users-manager}"
-NEED_CONFIGURE=0
 if [[ ! -f "${APP_ROOT}/apps/api/.env" ]]; then
-  NEED_CONFIGURE=1
-  echo "==> 3/3 写 .env + systemd（首次）APP_ROOT=${APP_ROOT}"
-elif [[ ! -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
-  NEED_CONFIGURE=1
-  echo "==> 3/3 已有 .env 但缺少 systemd，补跑 configure APP_ROOT=${APP_ROOT}"
+  echo "==> 3/3 首次写入 .env + systemd APP_ROOT=${APP_ROOT}"
 else
-  echo "==> 3/3 已有 .env 与 systemd，跳过 configure（密钥保留）APP_ROOT=${APP_ROOT}"
+  echo "==> 3/3 更新：保留 .env 里的 JWT、ENC_KEY、HD_MNEMONIC、热钱包私钥、管理员密码，只刷新数据库连接"
 fi
-if [[ "${NEED_CONFIGURE}" -eq 1 ]]; then
-  bash "${SCRIPT_DIR}/configure.sh"
-fi
+bash "${SCRIPT_DIR}/configure.sh"
 
 echo
 echo "==> 应用发布包：npm + prisma + 重启"
@@ -86,4 +79,5 @@ if [[ ! -f "${APP_ROOT}/apps/h5/index.html" ]]; then
   echo "  警告: 发布包里没有 apps/h5/index.html，H5 页面不会出现。" >&2
 fi
 echo "  业务库: ${DB_NAME} / ${DB_USER}"
-echo "  管理员账号见 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（seed 首次写入）。"
+echo "  管理员账号见 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（仅首次 seed 写入，更新不改）。"
+echo "  再跑同一条命令即更新程序，不改私钥、助记词、JWT、ENC_KEY。"

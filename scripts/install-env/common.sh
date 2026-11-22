@@ -19,12 +19,13 @@ source_conf() {
   source /dev/stdin <<< "$(tr -d '\r' < "$f")"
 }
 
-# 一键安装参数：--db-user= --db-pass= 必填；--db-name= 可选；--app-root= 可选（一般不用，解压后自动扫描）
-# 也可用环境变量 DB_USER / DB_PASS / DB_NAME / APP_ROOT
+# 一键安装参数：--db-user= --db-pass= --mysql-root-pass= 必填；--db-name= 可选
+# 也可用环境变量 DB_USER / DB_PASS / DB_NAME / MYSQL_ROOT_PASSWORD / APP_ROOT
 parse_bootstrap_args() {
   FO_DB_USER="${DB_USER:-}"
   FO_DB_PASS="${DB_PASS:-}"
   FO_DB_NAME="${DB_NAME:-}"
+  FO_MYSQL_ROOT_PASS="${MYSQL_ROOT_PASSWORD:-${FO_MYSQL_ROOT_PASS:-}}"
   FO_APP_ROOT="${FO_APP_ROOT:-${APP_ROOT:-}}"
   FO_GH_TOKEN="${FO_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   while [[ $# -gt 0 ]]; do
@@ -32,21 +33,24 @@ parse_bootstrap_args() {
       --db-user=*) FO_DB_USER="${1#*=}" ;;
       --db-pass=*) FO_DB_PASS="${1#*=}" ;;
       --db-name=*) FO_DB_NAME="${1#*=}" ;;
+      --mysql-root-pass=*) FO_MYSQL_ROOT_PASS="${1#*=}" ;;
       --app-root=*) FO_APP_ROOT="${1#*=}" ;;
       --gh-token=*) FO_GH_TOKEN="${1#*=}" ;;
       --db-user) shift; FO_DB_USER="${1:-}" ;;
       --db-pass) shift; FO_DB_PASS="${1:-}" ;;
       --db-name) shift; FO_DB_NAME="${1:-}" ;;
+      --mysql-root-pass) shift; FO_MYSQL_ROOT_PASS="${1:-}" ;;
       --app-root) shift; FO_APP_ROOT="${1:-}" ;;
       --gh-token) shift; FO_GH_TOKEN="${1:-}" ;;
       -h|--help)
-        echo "用法: ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名] [--gh-token=PAT]"
-        echo "  库名默认 users_manager。APP_ROOT 解压后自动扫描。私有仓加 --gh-token。"
+        echo "用法: ... | sudo bash -s -- --db-user=账号 --db-pass=密码 --mysql-root-pass=root密码 [--db-name=库名]"
+        echo "  库名默认 users_manager。MariaDB root 密码必须自己填，脚本不自动生成。"
+        echo "  再跑同一条即更新程序，不改 .env 里的私钥、助记词、JWT、管理员密码。"
         exit 0
         ;;
       *)
         echo "未知参数: $1" >&2
-        echo "需要: --db-user=... --db-pass=... [--db-name=users_manager]" >&2
+        echo "需要: --db-user=... --db-pass=... --mysql-root-pass=... [--db-name=users_manager]" >&2
         exit 1
         ;;
     esac
@@ -57,14 +61,20 @@ parse_bootstrap_args() {
     export GH_TOKEN="${FO_GH_TOKEN}"
     export GITHUB_TOKEN="${FO_GH_TOKEN}"
   fi
+  export FO_MYSQL_ROOT_PASS
 }
 
 require_db_creds() {
-  if [[ -z "${FO_DB_USER:-}" || -z "${FO_DB_PASS:-}" ]]; then
-    echo "一键安装必须指定数据库账号和密码。" >&2
+  local missing=()
+  [[ -z "${FO_DB_USER:-}" ]] && missing+=("--db-user")
+  [[ -z "${FO_DB_PASS:-}" ]] && missing+=("--db-pass")
+  [[ -z "${FO_MYSQL_ROOT_PASS:-}" ]] && missing+=("--mysql-root-pass")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "一键安装缺少: ${missing[*]}" >&2
     echo "示例:" >&2
-    echo "  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'" >&2
+    echo "  curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh | sudo bash -s -- --db-user=users_flow --db-pass='你的密码' --mysql-root-pass='你的root密码'" >&2
     echo "  可选 --db-name=users_manager（默认就是这个库名）" >&2
+    echo "  更新时再执行同一条，填写同一组密码。不会改 .env 里的私钥、助记词、JWT。" >&2
     exit 1
   fi
   if [[ "${FO_DB_PASS}" == "ChangeMe_DbPass_2026" ]]; then
@@ -73,28 +83,25 @@ require_db_creds() {
   fi
 }
 
-# 把账号/密码/库名写回 floworder.conf（供 install/configure 读取）
+# 把账号/密码/库名/MariaDB root 密码写回 floworder.conf（供 install/configure 读取）
 write_db_creds_conf() {
   local file=${1:-./floworder.conf}
   local tmp
   tmp="$(mktemp)"
-  awk -v u="${FO_DB_USER}" -v p="${FO_DB_PASS}" -v n="${FO_DB_NAME}" '
-    BEGIN { fu=0; fp=0; fn=0 }
-    /^DB_USER=/ { print "DB_USER=" u; fu=1; next }
-    /^DB_PASS=/ { print "DB_PASS=" p; fp=1; next }
-    /^DB_NAME=/ { print "DB_NAME=" n; fn=1; next }
-    { print }
-    END {
-      if (!fu) print "DB_USER=" u
-      if (!fp) print "DB_PASS=" p
-      if (!fn) print "DB_NAME=" n
-    }
-  ' "$file" > "$tmp"
+  grep -vE '^(DB_USER|DB_PASS|DB_NAME|MYSQL_ROOT_PASSWORD)=' "$file" > "$tmp" || true
+  {
+    printf 'DB_USER=%q\n' "${FO_DB_USER}"
+    printf 'DB_PASS=%q\n' "${FO_DB_PASS}"
+    printf 'DB_NAME=%q\n' "${FO_DB_NAME}"
+    printf 'MYSQL_ROOT_PASSWORD=%q\n' "${FO_MYSQL_ROOT_PASS}"
+  } >> "$tmp"
   mv "$tmp" "$file"
+  chmod 600 "$file" || true
   DB_USER="${FO_DB_USER}"
   DB_PASS="${FO_DB_PASS}"
   DB_NAME="${FO_DB_NAME}"
-  export DB_USER DB_PASS DB_NAME
+  MYSQL_ROOT_PASSWORD="${FO_MYSQL_ROOT_PASS}"
+  export DB_USER DB_PASS DB_NAME MYSQL_ROOT_PASSWORD FO_MYSQL_ROOT_PASS
 }
 
 fo_dist_ok() {
