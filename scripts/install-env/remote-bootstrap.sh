@@ -20,16 +20,20 @@ fi
 FO_DB_USER="${DB_USER:-}"
 FO_DB_PASS="${DB_PASS:-}"
 FO_DB_NAME="${DB_NAME:-}"
+FO_APP_ROOT="${FO_APP_ROOT:-${APP_ROOT:-}}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --db-user=*) FO_DB_USER="${1#*=}" ;;
     --db-pass=*) FO_DB_PASS="${1#*=}" ;;
     --db-name=*) FO_DB_NAME="${1#*=}" ;;
+    --app-root=*) FO_APP_ROOT="${1#*=}" ;;
     --db-user) shift; FO_DB_USER="${1:-}" ;;
     --db-pass) shift; FO_DB_PASS="${1:-}" ;;
     --db-name) shift; FO_DB_NAME="${1:-}" ;;
+    --app-root) shift; FO_APP_ROOT="${1:-}" ;;
     -h|--help)
       echo "用法: curl ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名]"
+      echo "  APP_ROOT 解压后自动扫描填写，一般不用传 --app-root。"
       exit 0
       ;;
     *)
@@ -88,6 +92,14 @@ for f in "${files[@]}"; do
 done
 
 echo "==> 执行 bootstrap（装环境、拉发布包、启动）DB_USER=${FO_DB_USER} DB_NAME=${FO_DB_NAME}"
+BOOT_ARGS=(
+  --db-user="${FO_DB_USER}"
+  --db-pass="${FO_DB_PASS}"
+  --db-name="${FO_DB_NAME}"
+)
+if [[ -n "${FO_APP_ROOT}" ]]; then
+  BOOT_ARGS+=(--app-root="${FO_APP_ROOT}")
+fi
 exec env FLOWORDER_UNIX=1 \
   GITHUB_REPO="${REPO}" \
   GITHUB_RELEASE_TAG="${GITHUB_RELEASE_TAG:-dist}" \
@@ -95,7 +107,5 @@ exec env FLOWORDER_UNIX=1 \
   DB_USER="${FO_DB_USER}" \
   DB_PASS="${FO_DB_PASS}" \
   DB_NAME="${FO_DB_NAME}" \
-  bash "${WORKDIR}/bootstrap.sh" \
-  --db-user="${FO_DB_USER}" \
-  --db-pass="${FO_DB_PASS}" \
-  --db-name="${FO_DB_NAME}"
+  FO_APP_ROOT="${FO_APP_ROOT}" \
+  bash "${WORKDIR}/bootstrap.sh" "${BOOT_ARGS[@]}"

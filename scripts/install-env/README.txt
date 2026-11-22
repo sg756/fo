@@ -40,7 +40,7 @@ CentOS 9 一键安装 / 更新（必须带数据库账号/密码；库名可选�
 --------------------------------------------------------------------------------
 
   编辑 floworder.conf（至少）：
-    APP_ROOT     推荐 /opt/dist-release（不要放 /root 下）
+    APP_ROOT     一键解压后自动扫描；空机默认先下到 /opt/dist-release
     PORT         对外端口
     DB_USER/DB_PASS  一键安装必须用命令行传入；会写进本 conf
     DB_NAME     默认 users_manager

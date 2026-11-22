@@ -19,23 +19,26 @@ source_conf() {
   source /dev/stdin <<< "$(tr -d '\r' < "$f")"
 }
 
-# 一键安装参数：--db-user= --db-pass= 必填；--db-name= 可选（默认 users_manager）
-# 也可用环境变量 DB_USER / DB_PASS / DB_NAME
+# 一键安装参数：--db-user= --db-pass= 必填；--db-name= 可选；--app-root= 可选（一般不用，解压后自动扫描）
+# 也可用环境变量 DB_USER / DB_PASS / DB_NAME / APP_ROOT
 parse_bootstrap_args() {
   FO_DB_USER="${DB_USER:-}"
   FO_DB_PASS="${DB_PASS:-}"
   FO_DB_NAME="${DB_NAME:-}"
+  FO_APP_ROOT="${FO_APP_ROOT:-${APP_ROOT:-}}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --db-user=*) FO_DB_USER="${1#*=}" ;;
       --db-pass=*) FO_DB_PASS="${1#*=}" ;;
       --db-name=*) FO_DB_NAME="${1#*=}" ;;
+      --app-root=*) FO_APP_ROOT="${1#*=}" ;;
       --db-user) shift; FO_DB_USER="${1:-}" ;;
       --db-pass) shift; FO_DB_PASS="${1:-}" ;;
       --db-name) shift; FO_DB_NAME="${1:-}" ;;
+      --app-root) shift; FO_APP_ROOT="${1:-}" ;;
       -h|--help)
         echo "用法: ... | sudo bash -s -- --db-user=账号 --db-pass=密码 [--db-name=库名]"
-        echo "  库名默认 users_manager。也可用环境变量 DB_USER / DB_PASS / DB_NAME。"
+        echo "  库名默认 users_manager。APP_ROOT 解压后自动扫描填写，一般不用传。"
         exit 0
         ;;
       *)
@@ -87,27 +90,95 @@ write_db_creds_conf() {
   export DB_USER DB_PASS DB_NAME
 }
 
-# 发布根：脚本在仓库 scripts/install-env 下且已有产物时，优先用上两级。
-# 空机 curl 一键（脚本在 /tmp）时，仍用 conf 的 APP_ROOT。
+fo_dist_ok() {
+  local root=$1
+  [[ -n "$root" \
+    && -f "${root}/apps/api/dist/main.js" \
+    && -f "${root}/apps/admin/dist/index.html" \
+    && -f "${root}/apps/api/package.json" \
+    && -f "${root}/apps/api/prisma/schema.prisma" ]]
+}
+
+# 在 start 下扫描到「解压后的发布根」（含 apps/api/dist/main.js）
+find_fo_app_root() {
+  local start=$1
+  local maxdepth=${2:-5}
+  [[ -n "$start" && -d "$start" ]] || return 1
+  if fo_dist_ok "$start"; then
+    echo "$start"
+    return 0
+  fi
+  local hit root
+  hit="$(find "$start" -maxdepth "$maxdepth" -type f -path '*/apps/api/dist/main.js' 2>/dev/null | head -n 1 || true)"
+  [[ -n "$hit" ]] || return 1
+  root="$(cd "$(dirname "$hit")/../../.." && pwd)"
+  if fo_dist_ok "$root"; then
+    echo "$root"
+    return 0
+  fi
+  return 1
+}
+
+# 空机默认落点；已有解压包则扫描定位，并写回 conf
+default_install_root() {
+  echo "/opt/dist-release"
+}
+
+# 决定安装/覆盖目标目录（解压前）：显式 --app-root > 已扫描到的源码根 > conf > 默认
 resolve_app_root() {
   local conf_root=${1:-}
+  local found=""
+  if [[ -n "${FO_APP_ROOT:-}" ]]; then
+    echo "${FO_APP_ROOT}"
+    return 0
+  fi
   local script_root
-  script_root="$(cd "$(pwd)/../.." && pwd)"
-  if [[ -f "${script_root}/apps/api/dist/main.js" \
-    && -f "${script_root}/apps/admin/dist/index.html" ]]; then
-    if [[ -n "${conf_root}" && "${conf_root}" != "${script_root}" ]]; then
-      echo "==> APP_ROOT=${script_root}（按脚本位置；conf 里是 ${conf_root}）" >&2
+  script_root="$(cd "$(pwd)/../.." 2>/dev/null && pwd || true)"
+  if found="$(find_fo_app_root "${script_root}" 2)"; then
+    echo "$found"
+    return 0
+  fi
+  if [[ -n "$conf_root" ]] && found="$(find_fo_app_root "$conf_root" 3)"; then
+    echo "$found"
+    return 0
+  fi
+  local c
+  for c in /opt/dist-release /opt/FlowOrder /opt/users-manager /opt/fo; do
+    if found="$(find_fo_app_root "$c" 3)"; then
+      echo "$found"
+      return 0
     fi
-    echo "${script_root}"
+  done
+  if found="$(find_fo_app_root /opt 5)"; then
+    echo "==> 在 /opt 扫描到已有发布包: ${found}" >&2
+    echo "$found"
     return 0
   fi
-  if [[ -n "${conf_root}" \
-    && -f "${conf_root}/apps/api/dist/main.js" \
-    && -f "${conf_root}/apps/admin/dist/index.html" ]]; then
-    echo "${conf_root}"
+  # 空机：还没有解压产物，用 conf 或默认目录作为下载目标
+  if [[ -n "$conf_root" ]]; then
+    echo "$conf_root"
     return 0
   fi
-  echo "${conf_root}"
+  default_install_root
+}
+
+# 解压/覆盖完成后：扫描真实源码根并写回 APP_ROOT
+finalize_app_root_after_extract() {
+  local stage=$1
+  local found
+  if ! found="$(find_fo_app_root "$stage" 5)"; then
+    echo "解压后未找到完整发布根（需要 apps/api/dist/main.js 等）: ${stage}" >&2
+    return 1
+  fi
+  if [[ "$found" != "$stage" ]]; then
+    echo "==> 解压目录有嵌套，APP_ROOT 自动定为: ${found}（扫描自 ${stage}）" >&2
+  else
+    echo "==> APP_ROOT 已自动填写: ${found}" >&2
+  fi
+  APP_ROOT="$found"
+  export APP_ROOT
+  sync_app_root_conf "$APP_ROOT"
+  echo "$APP_ROOT"
 }
 
 # 把实际安装目录写回服务器上的 floworder.conf（不改 GitHub 仓库模板语义）。
@@ -123,6 +194,8 @@ sync_app_root_conf() {
       printf '\nAPP_ROOT=%s\n' "$root" >> "$f"
     fi
   done
+  APP_ROOT="$root"
+  export APP_ROOT
 }
 
 github_release_zip_url() {
@@ -144,14 +217,6 @@ curl_github() {
     args+=(-H "Authorization: Bearer ${GH_TOKEN:-${GITHUB_TOKEN}}")
   fi
   curl "${args[@]}" "$url"
-}
-
-fo_dist_ok() {
-  local root=$1
-  [[ -f "${root}/apps/api/dist/main.js" \
-    && -f "${root}/apps/admin/dist/index.html" \
-    && -f "${root}/apps/api/package.json" \
-    && -f "${root}/apps/api/prisma/schema.prisma" ]]
 }
 
 # 从 GitHub Release 把 dist-release.zip 覆盖到 dest
@@ -243,8 +308,11 @@ fetch_github_dist() {
 
   rm -rf "$tmp"
   if ! fo_dist_ok "$dest"; then
-    echo "覆盖后 ${dest} 仍不完整" >&2
-    return 1
+    # 允许 zip 多裹一层目录：扫描后再由调用方 finalize APP_ROOT
+    if ! find_fo_app_root "$dest" 5 >/dev/null; then
+      echo "覆盖后 ${dest} 仍不完整" >&2
+      return 1
+    fi
   fi
   echo "==> 发布包已放到 ${dest}"
 }
