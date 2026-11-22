@@ -307,6 +307,88 @@ function Invoke-EasCli {
   # 不 return：由调用方读 $LASTEXITCODE（PowerShell 里 return 易把成功误判成失败）
 }
 
+function Invoke-EasJson {
+  param([Parameter(Mandatory = $true)][string[]]$CliArgs)
+  $reg = "https://registry.npmjs.org"
+  $prevCi = $env:CI
+  $env:CI = "1"
+  $env:EAS_NO_VCS = "1"
+  $old = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $lines = & npx --yes --registry $reg eas-cli@latest @CliArgs 2>&1
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $old
+    if ($null -eq $prevCi) { Remove-Item Env:CI -ErrorAction SilentlyContinue }
+    else { $env:CI = $prevCi }
+  }
+  $raw = (($lines | ForEach-Object { "$_" }) -join "`n")
+  $json = $null
+  $startObj = $raw.IndexOf("{")
+  $startArr = $raw.IndexOf("[")
+  $start = $startObj
+  $endCh = "}"
+  if ($startArr -ge 0 -and ($startObj -lt 0 -or $startArr -lt $startObj)) {
+    $start = $startArr
+    $endCh = "]"
+  }
+  if ($start -ge 0) {
+    $end = $raw.LastIndexOf($endCh)
+    if ($end -gt $start) {
+      try { $json = $raw.Substring($start, $end - $start + 1) | ConvertFrom-Json } catch { $json = $null }
+    }
+  }
+  return @{ Code = $code; Raw = $raw; Json = $json }
+}
+
+function Show-ApkUrl {
+  param([string]$Url)
+  Write-Host ""
+  Write-Host "========================================"
+  Write-Host " APK 下载地址"
+  Write-Host " $Url"
+  Write-Host "========================================"
+  $out = Join-Path $env:USERPROFILE "fo-apk-url.txt"
+  $utf8 = New-Object System.Text.UTF8Encoding $true
+  [IO.File]::WriteAllText($out, $Url + [Environment]::NewLine, $utf8)
+  Write-Host "地址已写入 $out"
+}
+
+function Wait-EasAndroidArtifact {
+  param([string]$BuildId)
+  $started = Get-Date
+  $deadline = $started.AddMinutes(50)
+  while ((Get-Date) -lt $deadline) {
+    $view = Invoke-EasJson -CliArgs @("build:view", $BuildId, "--json")
+    $b = $view.Json
+    if ($b) {
+      $status = [string]$b.status
+      $mins = [int]((Get-Date) - $started).TotalMinutes
+      Write-Host "==> 云端状态 $status （已等 $mins 分钟）。完成后会在这里打印 APK 地址。"
+      if ($status -eq "FINISHED") {
+        $url = [string]$b.artifacts.buildUrl
+        if (-not $url) { $url = [string]$b.artifacts.applicationArchiveUrl }
+        if ($url) {
+          Show-ApkUrl -Url $url
+          return
+        }
+        Write-Host "构建已完成，但没有下载地址。请打开 expo.dev 的 Builds 页面。" -ForegroundColor Red
+        exit 1
+      }
+      if ($status -eq "ERRORED" -or $status -eq "CANCELED") {
+        Write-Host "云端构建结束: $status" -ForegroundColor Red
+        exit 1
+      }
+    } else {
+      Write-Host "==> 正在查询云端结果…"
+    }
+    Start-Sleep -Seconds 25
+  }
+  Write-Host "等了 50 分钟还没有 APK 地址。请打开 expo.dev 的 Builds 页面查看。" -ForegroundColor Red
+  exit 1
+}
+
 function Show-LatestEasAndroidArtifact {
   param([string]$Profile)
   Write-Host ""
@@ -374,23 +456,22 @@ function Invoke-EasAndroidBuild {
   Prepare-MobileProject -MobilePath $MobilePath
   Write-Host ""
   Write-Host "==> EAS 云构建 Android  profile=$Profile"
-  Write-Host "    本机不装 Android SDK；构建在 Expo 云端，完成后给出下载链接。"
-  Write-Host "    已禁用 realtime logs（CI=1），避免 Build finished 后卡死。"
-  Write-Host "    若仍无下载链: Ctrl+C 后看下方自动查询，或打开 expo.dev Builds。"
-  $buildArgs = @("build", "-p", "android", "--profile", $Profile)
+  Write-Host "    本机不装 Android SDK。提交后由脚本查询结果，并直接打印 APK 地址。"
+  $buildArgs = @("build", "-p", "android", "--profile", $Profile, "--no-wait", "--json")
   if ($script:EasNonInteractive) { $buildArgs += "--non-interactive" }
-  Invoke-EasCli -CliArgs $buildArgs
-  $code = $LASTEXITCODE
-  if ($null -eq $code) { $code = 0 }
-  Show-LatestEasAndroidArtifact -Profile $Profile
-  if ($code -ne 0) {
-    Write-Host ""
-    Write-Host "eas-cli 退出码=$code 。若上面已出现 Build finished，云端多半已打完。"
-    Write-Host "若一开始就失败: 先登录 (方案 C 菜单 1)；@expo/logger ETARGET 则 npm cache clean --force 后重试。"
-    exit $code
+  $submitted = Invoke-EasJson -CliArgs $buildArgs
+  $build = $submitted.Json
+  if ($build -is [System.Array]) { $build = $build[0] }
+  $buildId = ""
+  if ($build) { $buildId = [string]$build.id }
+  if (-not $buildId) {
+    Write-Host "没有拿到云端构建编号，已停止。" -ForegroundColor Red
+    if ($submitted.Raw) { Write-Host $submitted.Raw }
+    exit 1
   }
-  Write-Host ""
-  Write-Host "构建已提交/完成。请按上面的 APK/AAB 链接下载；没有链接就去 expo.dev Builds。"
+  Write-Host "==> 已提交，构建编号 $buildId"
+  Write-Host "    云端编译通常要十几分钟。地址出来之前不要关窗口。"
+  Wait-EasAndroidArtifact -BuildId $buildId
 }
 
 function Invoke-EasUpdate {
