@@ -263,6 +263,15 @@ function Publish-ReleaseBundle {
   Copy-Item -Path $apiFixUserNo -Destination (Join-Path $apiScriptsDst "fix-user-no.js") -Force
   Copy-Item -Path $apiPosKey -Destination (Join-Path $apiScriptsDst "backfill-position-api-code.js") -Force
 
+  $h5Src = Join-Path $SourceRoot "apps\mobile\dist"
+  $h5Dst = Join-Path $OutDir "apps\h5"
+  if (Test-Path (Join-Path $h5Src "index.html")) {
+    New-Item -ItemType Directory -Path $h5Dst -Force | Out-Null
+    Copy-Item -Path (Join-Path $h5Src "*") -Destination $h5Dst -Recurse -Force
+  } else {
+    Write-Host "    未找到 apps\mobile\dist\index.html，发布包不含 H5"
+  }
+
   $okAdmin = Test-Path (Join-Path $adminDst "index.html")
   $okApi = Test-Path (Join-Path $apiDst "dist\main.js")
   $okLock = Test-Path (Join-Path $apiDst "package-lock.json")
@@ -295,6 +304,7 @@ function Publish-ReleaseBundle {
   Write-Host "      apps\api\package.json / package-lock.json / prisma\"
   Write-Host "      apps\api\scripts\fix-user-no.js"
   Write-Host "      apps\api\scripts\backfill-position-api-code.js"
+  Write-Host "      apps\h5\   （有导出时）"
   Write-Host "      scripts\install-env\"
   Write-Host "      $zipPath"
   Write-Host "    （含 prisma/seed.js；服务器 apply-dist 会自动 seed）"
@@ -369,6 +379,49 @@ npm run build
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if (-not (Test-Path (Join-Path $ApiDir "dist\main.js"))) {
   Write-Error "api 构建失败：找不到 dist\main.js"
+}
+
+Write-Host "==> 导出 H5（与后台同机，路径 /h5/）"
+$MobileDir = Join-Path $SourceRoot "apps\mobile"
+$endpoint = Join-Path $MobileDir "src\api\api.endpoint.ts"
+$endpointBackup = $null
+if (Test-Path -LiteralPath $endpoint) {
+  $endpointBackup = [IO.File]::ReadAllText($endpoint)
+}
+try {
+  if (-not (Test-Path (Join-Path $MobileDir "app.json"))) {
+    Copy-Item (Join-Path $MobileDir "app.json.example") (Join-Path $MobileDir "app.json")
+  }
+  $appJsonPath = Join-Path $MobileDir "app.json"
+  $appCfg = Get-Content -LiteralPath $appJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  if (-not $appCfg.expo.experiments) {
+    $appCfg.expo | Add-Member -NotePropertyName experiments -NotePropertyValue ([pscustomobject]@{ baseUrl = "/h5" }) -Force
+  } else {
+    $appCfg.expo.experiments | Add-Member -NotePropertyName baseUrl -NotePropertyValue "/h5" -Force
+  }
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [IO.File]::WriteAllText($appJsonPath, ($appCfg | ConvertTo-Json -Depth 30), $utf8)
+  $utf8 = New-Object System.Text.UTF8Encoding $false
+  [IO.File]::WriteAllText($endpoint, @"
+/**
+ * 发布包 H5 与后台同一台机器，接口用当前网站的 /api。
+ */
+export const PACKAGED_API_BASE = '/api';
+export const PACKAGED_WEB_API_BASE = '/api';
+"@, $utf8)
+  Set-Location $MobileDir
+  npm ci
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  npx expo export --platform web --output-dir dist
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if (-not (Test-Path (Join-Path $MobileDir "dist\index.html"))) {
+    Write-Error "H5 导出失败：找不到 apps\mobile\dist\index.html"
+  }
+} finally {
+  if ($null -ne $endpointBackup) {
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText($endpoint, $endpointBackup, $utf8)
+  }
 }
 
 Write-Host "==> 数据库同步 (PRISMA_MODE=$PrismaMode)"

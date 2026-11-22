@@ -25,7 +25,7 @@
    curl -fsSL https://raw.githubusercontent.com/sg756/fo/main/scripts/install-env/remote-bootstrap.sh \
      | sudo bash -s -- --db-user=users_flow --db-pass='你的密码'
    库名可加 --db-name=users_manager（默认即此）。私有仓先 export GH_TOKEN=你的PAT。
-   装完打开 http://服务器IP/ 。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567）。
+   装完打开 http://服务器IP/ 。H5 在同一台机器的 http://服务器IP/h5/ ，不用另装 nginx。管理员见服务器 apps/api/.env 的 ADMIN_EMAIL / ADMIN_PASSWORD（默认 admin / 1234567）。
    以后更新程序可再跑同一条，或：
    sudo bash /opt/dist-release/scripts/install-env/fetch-dist.sh
 
