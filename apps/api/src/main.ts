@@ -51,14 +51,17 @@ async function bootstrap() {
   const http = app.getHttpAdapter().getInstance();
   const h5Dist = resolveH5Dist();
   if (h5Dist) {
-    app.useStaticAssets(h5Dist, { prefix: '/h5', index: false });
-    http.get('/h5', (_req: any, res: any) => res.redirect(301, '/h5/'));
-    http.get(/^\/h5\/.*/, (req: any, res: any, next: any) => {
+    app.useStaticAssets(h5Dist, { prefix: '/h5', index: false, redirect: false });
+    const sendH5Index = (req: any, res: any, next: any) => {
       if (req.method !== 'GET' && req.method !== 'HEAD') return next();
       res.sendFile(join(h5Dist, 'index.html'), (err: any) => {
         if (err) next(err);
       });
-    });
+    };
+    // /h5 与 /h5/ 是同一条路由。再 301 到 /h5/ 会自己跳自己，浏览器打不开。
+    http.get('/h5', sendH5Index);
+    http.get('/h5/', sendH5Index);
+    http.get(/^\/h5\/.+/, sendH5Index);
     Logger.log(`H5 静态目录: ${h5Dist}  →  /h5/`, 'Bootstrap');
   } else {
     Logger.warn('未找到 apps/h5（发布包未带 H5 时管理端仍可用）', 'Bootstrap');
